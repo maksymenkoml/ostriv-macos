@@ -11,6 +11,8 @@ backed up to *.bak.
 
 import os
 import sys
+import re
+import plistlib
 import subprocess
 import shutil
 
@@ -28,6 +30,32 @@ BOTTLES_ROOT = os.path.expanduser("~/Library/Application Support/CrossOver/Bottl
 CROSSOVER = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
 
 APPID = "773790"
+TESTED_CROSSOVER = "26.2"
+TESTED_OSTRIV = "0.5.9.58"
+
+
+def crossover_version():
+    """Installed CrossOver version, or None."""
+    try:
+        with open(os.path.join(CROSSOVER.split("/SharedSupport")[0], "Info.plist"), "rb") as f:
+            d = plistlib.load(f)
+        return d.get("CFBundleShortVersionString") or d.get("CFBundleVersion")
+    except Exception:
+        return None
+
+
+def ostriv_version(bottle):
+    """Ostriv version parsed from its log (only exists after the game has run once), or None.
+    Log line 3 looks like: 'Alpha 5 patch 9 hotfix 58 (0.5.9.58 Jun  4 2026 ...)'."""
+    log = os.path.join(BOTTLES_ROOT, bottle, "drive_c", "users", "crossover",
+                       "Saved Games", "Ostriv", "log.txt")
+    try:
+        with open(log, errors="ignore") as f:
+            head = f.read(400)
+        m = re.search(r"\((\d+\.\d+\.\d+\.\d+)", head)
+        return m.group(1) if m else None
+    except Exception:
+        return None
 
 # Bottle environment the game needs (GL 4.3 via d3d12, visible via gdi present, fast via async present).
 # NOTE: do NOT put SteamAppId/SteamGameId here — bottle env is applied to *every* process in the
@@ -311,10 +339,15 @@ def is_installed(game_dir):
     return os.path.isfile(os.path.join(game_dir, "libgallium_wgl.dll"))
 
 
-def print_status(game_dir):
+def print_status(game_dir, bottle):
     print("Game:")
     print(f"  {green('✓')} ostriv.exe" +
           (yellow("  (driver already installed)") if is_installed(game_dir) else ""))
+    cv = crossover_version()
+    ov = ostriv_version(bottle)
+    print(f"  CrossOver {bold(cv or 'unknown')}   Ostriv "
+          f"{bold(ov) if ov else yellow('unknown (run the game once)')}")
+    print(f"  {cyan(f'tested with CrossOver {TESTED_CROSSOVER} · Ostriv {TESTED_OSTRIV}')}")
 
 
 def select(prompt, options):
@@ -378,7 +411,6 @@ def select(prompt, options):
 def main():
     print(cyan(bold("=================================================")))
     print(cyan(bold("  Ostriv — macOS / Wine GPU-acceleration installer")))
-    print(cyan(bold("  Tested: CrossOver 26 · Ostriv 0.5.9.58")))
     print(cyan(bold("=================================================")))
     print()
 
@@ -416,7 +448,7 @@ def main():
         sys.exit(1)
 
     print()
-    print_status(game_dir)
+    print_status(game_dir, bottle)
     print()
 
     # ── Step 2: choose action ────────────────────────────────────────────────
