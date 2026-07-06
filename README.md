@@ -32,7 +32,9 @@ python3 patch.py
 
 1. **Fully quit CrossOver and reopen it.** *(required once, to load the new bottle settings)*
 2. Start **Steam** inside the bottle (it just needs to be running, for the Steam API).
-3. **Launch the game via CrossOver "Run Command" → `ostriv.exe`** (or save that as a launcher).
+3. **Launch the game via CrossOver "Run Command"** with the **quoted** exe path — quotes are
+   required because the path has spaces:
+   `"C:\Program Files (x86)\Steam\steamapps\common\Ostriv\ostriv.exe"` (or save it as a launcher).
    Use *this*, not Steam's **Play** button — the Play button injects the Steam overlay, which
    conflicts with the Mesa driver and crashes the game at startup. Launching via CrossOver keeps the
    Steam client running in the background, so achievements/cloud saves still work.
@@ -73,7 +75,7 @@ Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoe
 - **If Play launches the game but it closes after ~2 seconds** (Steam shows it "running" briefly):
   the **Steam in-game overlay** conflicts with the custom Mesa `opengl32` and crashes it at startup.
   Fix: Steam → **Library → right-click Ostriv → Properties → General → uncheck "Enable the Steam
-  Overlay while in-game"**, then Play. (Launching directly via CrossOver "Run Command" → `ostriv.exe`
+  Overlay while in-game"**, then Play. (Launching directly via CrossOver "Run Command" with the quoted `ostriv.exe` path
   also works — the overlay only injects on a Steam-Play launch.)
 - **If Steam's Play button does nothing / Steam keeps crashing** (`crash_steam.exe` dumps, the
   browser UI restarting): that's a Steam-under-Wine issue, not the patch. Quit Steam, delete these

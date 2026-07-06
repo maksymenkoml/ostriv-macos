@@ -90,7 +90,9 @@ and crashes at window creation — the file must exist with MSAA off.
 
 - Start **Steam** in the bottle first — the Steam **client** only needs to be *running* (for
   `SteamAPI_Init`). You do not launch the game through it.
-- **Launch the game via CrossOver "Run Command" → `ostriv.exe`** (or save that as a launcher).
+- **Launch the game via CrossOver "Run Command"** with the **quoted** exe path (quotes required —
+  the path has spaces): `"C:\Program Files (x86)\Steam\steamapps\common\Ostriv\ostriv.exe"` (or save
+  that as a launcher).
 - **Do NOT use Steam's Play button.** Play injects the Steam in-game overlay
   (`gameoverlayrenderer64.dll`), whose GL hooks conflict with the Mesa `opengl32` and crash the game
   ~2s after launch (before it even writes its log). If you must use Play: disable the overlay for

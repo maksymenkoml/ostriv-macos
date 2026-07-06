@@ -484,8 +484,9 @@ def main():
 
     # ── Step 4: summary + next steps ─────────────────────────────────────────
     if ok:
-        game_win = windows_path(game_dir, "ostriv.exe")
-        settings_win = windows_path(game_dir, "ostriv_settings.exe")
+        # Quoted — CrossOver's Run Command requires quotes because of the spaces in the path.
+        game_win = f'"{windows_path(game_dir, "ostriv.exe")}"'
+        settings_win = f'"{windows_path(game_dir, "ostriv_settings.exe")}"'
         print(green(bold("Reinstalled!" if installed else "Installed!")) + "\n")
         print("How to launch:\n")
         print(f"  1. {bold('Fully quit CrossOver and reopen it')} "
@@ -493,7 +494,8 @@ def main():
         print(f"  2. Start {bold('Steam')} in the bottle — it just needs to be "
               f"{bold('running')} (for the Steam API).")
         print(f"  3. In CrossOver, select the {bold(bottle)} bottle → "
-              f"{bold('Run Command')}, and run the game with this path:\n")
+              f"{bold('Run Command')}, and run the game with this path "
+              f"({bold('quotes included')}):\n")
         print(f"        {cyan(game_win)}\n")
         print(f"     {bold('Do NOT use the Steam Play button')} — it injects the Steam overlay, "
               f"which crashes the game.\n")
