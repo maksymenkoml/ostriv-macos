@@ -66,6 +66,11 @@ Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoe
 - **If the game ever renders tiny (e.g. 1024×768) on a big screen:** winemac's display state got
   confused (usually after changing your Mac's resolution). **Fully quit CrossOver and reopen it** —
   do *not* use display-resolution tools to force fullscreen, they corrupt winemac's state.
+- **If Steam's Play button does nothing / Steam keeps crashing** (`crash_steam.exe` dumps, the
+  browser UI restarting): that's a Steam-under-Wine issue, not the patch. Quit Steam, delete these
+  folders in the bottle, and relaunch Steam: `…/Steam/appcache/httpcache`,
+  `…/AppData/Local/Steam/htmlcache`, and any `GPUCache`. (A bottle-wide `SteamAppId` env var also
+  causes this — `patch.py` deliberately avoids it, using a game-scoped `steam_appid.txt` instead.)
 
 ## Performance / fullscreen
 
