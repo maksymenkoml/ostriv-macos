@@ -24,29 +24,33 @@ Tested on **Apple M5 Max**, macOS, **CrossOver 26.2**, Ostriv **Alpha 5 patch 9 
 ```bash
 git clone https://github.com/<you>/ostriv-macos
 cd ostriv-macos
-./scripts/install.sh
+python3 patch.py
 ```
-The script auto-detects your Ostriv bottle, drops in the Mesa driver, and configures the bottle.
-Then:
+`patch.py` auto-detects your Ostriv bottle, installs the Mesa driver, and configures everything
+(Python 3, stdlib only — no dependencies). It's interactive; you can also pass the game dir directly:
+`python3 patch.py "/path/to/…/steamapps/common/Ostriv"`. Then:
 
-1. In the game's settings tool (`ostriv_settings.exe`), turn **Multisampling OFF**. *(required — see below)*
+1. If it says so, run the game's **`ostriv_settings`** tool and set **Multisampling OFF** *(required —
+   see below; `patch.py` does this automatically if `settings.data` already exists)*.
 2. **Fully quit CrossOver and reopen it.** *(required once, to load the new bottle settings)*
 3. Start **Steam** inside the bottle, then launch **Ostriv**.
 
-That's it — the game runs GPU-accelerated and fullscreen.
+That's it — the game runs GPU-accelerated and fullscreen. To undo, re-run `python3 patch.py` and
+choose **Restore**.
 
 ---
 
-## What the installer does
+## What `patch.py` does
 
 | Step | Detail |
 |---|---|
 | Mesa driver | Copies `opengl32.dll`, `libgallium_wgl.dll`, `dxil.dll`, `libwinpthread-1.dll` next to `ostriv.exe` |
 | DLL override | `HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides` → `opengl32=native` (scoped to Ostriv only — a *global* override breaks Steam) |
 | Bottle env | `GALLIUM_DRIVER=d3d12`, `wgl_require_gdi_compat=true`, `MESA_D3D12_ASYNC_PRESENT=1`, `MESA_GL_VERSION_OVERRIDE=4.3`, `MESA_GLSL_VERSION_OVERRIDE=430`, `SteamAppId=773790` |
+| Multisampling | Sets it off in `settings.data` (if the file exists) so the game doesn't crash |
 
-Nothing is overwritten without a `.bak` backup. See **[docs/technical.md](docs/technical.md)** for the
-full explanation of every bug and fix.
+Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoes it all. See
+**[docs/technical.md](docs/technical.md)** for the full explanation of every bug and fix.
 
 ---
 

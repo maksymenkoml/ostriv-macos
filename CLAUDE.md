@@ -31,8 +31,11 @@ IL to patch; the whole fix is driver + Wine config.
 
 ## Layout
 
-- `scripts/install.sh` — auto-detects the Ostriv bottle, installs the driver (with `.bak` backups),
-  sets the per-app override and bottle env vars. Idempotent.
+- `patch.py` — the user entry point (Python 3, stdlib only). Auto-detects the Ostriv bottle across
+  CrossOver bottles, installs the driver (with `.bak` backups), sets the per-app override, bottle env
+  vars, and multisampling-off. Interactive Install/Restore, or `python3 patch.py <game-dir>`.
+  Idempotent. Modeled on `cs2-macos-patcher/patch.py` for a consistent UX (same colours, banner,
+  locator, restore instructions).
 - `scripts/build-driver.sh` — clones Mesa `mesa-26.1.3`, applies the patch, cross-compiles
   `libgallium_wgl.dll`+`opengl32.dll` with mingw. Output → `prebuilt/`.
 - `patches/mesa-26.1.3-winemac-async-present.patch` — the two-file source patch (d3d12 async present +
@@ -44,7 +47,7 @@ IL to patch; the whole fix is driver + Wine config.
 ## Commands
 
 ```bash
-./scripts/install.sh        # install into the detected bottle
+python3 patch.py            # interactive install/restore into the detected bottle
 ./scripts/build-driver.sh   # rebuild the patched driver from source (needs mingw-w64, meson, ninja, bison)
 ```
 There are no unit tests. Verify by launching the game and reading its log at
