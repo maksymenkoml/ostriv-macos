@@ -31,7 +31,11 @@ python3 patch.py
 `python3 patch.py "/path/to/…/steamapps/common/Ostriv"`. Then:
 
 1. **Fully quit CrossOver and reopen it.** *(required once, to load the new bottle settings)*
-2. Start **Steam** inside the bottle, then launch **Ostriv**.
+2. Start **Steam** inside the bottle (it just needs to be running, for the Steam API).
+3. **Launch the game via CrossOver "Run Command" → `ostriv.exe`** (or save that as a launcher).
+   Use *this*, not Steam's **Play** button — the Play button injects the Steam overlay, which
+   conflicts with the Mesa driver and crashes the game at startup. Launching via CrossOver keeps the
+   Steam client running in the background, so achievements/cloud saves still work.
 
 `patch.py` installs a `settings.data` with **multisampling off + borderless fullscreen** for fresh
 installs, so there's no manual settings step. *(If you already had a `settings.data`, it just flips
