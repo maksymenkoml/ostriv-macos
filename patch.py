@@ -264,11 +264,15 @@ def shorten(path):
     return "~" + path[len(home):] if path.startswith(home) else path
 
 
+def is_installed(game_dir):
+    """True if the Mesa driver is already present next to ostriv.exe."""
+    return os.path.isfile(os.path.join(game_dir, "libgallium_wgl.dll"))
+
+
 def print_status(game_dir):
-    installed = os.path.isfile(os.path.join(game_dir, "libgallium_wgl.dll"))
     print("Game:")
     print(f"  {green('✓')} ostriv.exe" +
-          (yellow("  (driver already installed)") if installed else ""))
+          (yellow("  (driver already installed)") if is_installed(game_dir) else ""))
 
 
 def select(prompt, options):
@@ -374,8 +378,12 @@ def main():
     print()
 
     # ── Step 2: choose action ────────────────────────────────────────────────
+    installed = is_installed(game_dir)
+    install_label = ("Reinstall  — re-apply driver + config (e.g. after a game update)"
+                     if installed else
+                     "Install  — GPU driver + bottle config (fullscreen, ~30-60 fps)")
     sel = select("Choose action:", [
-        "Install  — GPU driver + bottle config (fullscreen, ~30-60 fps)",
+        install_label,
         "Restore  — undo: put back the original driver",
     ])
     if sel is None:
@@ -387,7 +395,7 @@ def main():
         return
 
     # ── Step 3: install ──────────────────────────────────────────────────────
-    print("Installing...\n")
+    print(("Reinstalling...\n" if installed else "Installing...\n"))
     ok = install_driver(game_dir)
     if ok:
         write_appid_file(game_dir)
@@ -400,7 +408,7 @@ def main():
     if ok:
         game_win = windows_path(game_dir, "ostriv.exe")
         settings_win = windows_path(game_dir, "ostriv_settings.exe")
-        print(green(bold("Installed!")) + "\n")
+        print(green(bold("Reinstalled!" if installed else "Installed!")) + "\n")
         print("How to launch:\n")
         print(f"  1. {bold('Fully quit CrossOver and reopen it')} "
               f"(loads the new bottle settings).")
