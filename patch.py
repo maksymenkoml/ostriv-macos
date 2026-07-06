@@ -260,23 +260,27 @@ def restore(game_dir, bottle):
         os.remove(appid)
         print(f"  {green('OK')}    removed steam_appid.txt")
 
-    # 3. opengl32=native override
-    wine_reg(bottle, "delete", r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides",
-             "/v", "opengl32", "/f")
-    print(f"  {green('OK')}    removed opengl32 override")
+    # 3. opengl32=native override — only if actually set
+    key = r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides"
+    _, out = wine_reg(bottle, "query", key, "/v", "opengl32")
+    if "native" in out.lower():
+        wine_reg(bottle, "delete", key, "/v", "opengl32", "/f")
+        print(f"  {green('OK')}    removed opengl32 override")
 
-    # 4. bottle env vars we added (leaves any other bottle env untouched)
+    # 4. bottle env vars we added — only if any are present (leaves other env untouched)
     conf = os.path.join(BOTTLES_ROOT, bottle, "cxbottle.conf")
     if os.path.isfile(conf):
         with open(conf) as f:
             s = f.read()
+        new = s
         for k in BOTTLE_ENV:
-            s = re.sub(rf'^"{re.escape(k)}"\s*=\s*"[^"]*"\n', "", s, flags=re.M)
-        with open(conf, "w") as f:
-            f.write(s)
+            new = re.sub(rf'^"{re.escape(k)}"\s*=\s*"[^"]*"\n', "", new, flags=re.M)
+        if new != s:
+            with open(conf, "w") as f:
+                f.write(new)
+            print(f"  {green('OK')}    removed bottle env vars")
         if os.path.isfile(conf + ".bak"):
             os.remove(conf + ".bak")
-        print(f"  {green('OK')}    removed bottle env vars")
 
     # 5. settings.data — restore the backup, or remove the template we dropped in
     settings = os.path.join(BOTTLES_ROOT, bottle, "drive_c", "users", "crossover",
@@ -417,18 +421,22 @@ def main():
 
     # ── Step 2: choose action ────────────────────────────────────────────────
     installed = is_installed(game_dir)
-    install_label = ("Reinstall  — re-apply driver + config (e.g. after a game update)"
-                     if installed else
-                     "Install  — GPU driver + bottle config (fullscreen, ~30-60 fps)")
-    sel = select("Choose action:", [
-        install_label,
-        "Restore  — undo: put back the original driver",
-    ])
+    if installed:
+        # already patched → the primary action is Reinstall; Restore is available to undo
+        options = [
+            "Reinstall  — re-apply driver + config (e.g. after a game update)",
+            "Restore    — undo: put the bottle back to its original state",
+        ]
+    else:
+        # not patched → the only sensible action is Install (nothing to restore)
+        options = ["Install  — GPU driver + bottle config (fullscreen, ~30-60 fps)"]
+
+    sel = select("Choose action:", options)
     if sel is None:
         return
     print()
 
-    if sel == 1:
+    if installed and sel == 1:
         restore(game_dir, bottle)
         return
 
