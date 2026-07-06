@@ -49,13 +49,17 @@ to `ostriv.exe` only.
 ### 3. Bottle environment (`cxbottle.conf` → `[EnvironmentVariables]`)
 
 ```
-"SteamAppId" = "773790"
-"SteamGameId" = "773790"
 "GALLIUM_DRIVER" = "d3d12"
 "wgl_require_gdi_compat" = "true"
+"MESA_D3D12_ASYNC_PRESENT" = "1"
 "MESA_GL_VERSION_OVERRIDE" = "4.3"
 "MESA_GLSL_VERSION_OVERRIDE" = "430"
 ```
+
+⚠️ **Do NOT put `SteamAppId`/`SteamGameId` in the bottle env.** Bottle env is applied to *every*
+process in the bottle including `steam.exe`, which then thinks it IS app 773790 and its CEF browser
+**crash-loops** (Play button dies). The game gets its app id from a game-scoped **`steam_appid.txt`**
+(contents: `773790`) placed next to `ostriv.exe` instead.
 
 **`wgl_require_gdi_compat=true` is the key line for GPU rendering.** It is a Mesa driconf
 option (settable as an env var): it restricts pixel formats to GDI-compatible ones, which
@@ -84,9 +88,20 @@ and crashes at window creation — the file must exist with MSAA off.
 
 ### 5. Launch
 
-- Start Steam in the bottle first (the Steam **client** must be running for
-  `SteamAPI_Init`; the Play button itself is unreliable when Steam's CEF is flaky).
-- Launch the game via the CrossOver launcher: `open ~/Applications/CrossOver/ostriv.app`.
+- Start **Steam** in the bottle first — the Steam **client** only needs to be *running* (for
+  `SteamAPI_Init`). You do not launch the game through it.
+- **Launch the game via CrossOver "Run Command" → `ostriv.exe`** (or save that as a launcher).
+- **Do NOT use Steam's Play button.** Play injects the Steam in-game overlay
+  (`gameoverlayrenderer64.dll`), whose GL hooks conflict with the Mesa `opengl32` and crash the game
+  ~2s after launch (before it even writes its log). If you must use Play: disable the overlay for
+  Ostriv first (Library → Properties → uncheck "Enable the Steam Overlay while in-game").
+- **Why Run Command and not `wine --cx-app` from a shell:** a bare CLI launch reaches the menu but
+  the window has no foreground app owning it, so winemac closes it (`PostQuitMessage`) and the game
+  self-exits. CrossOver "Run Command" / a `.app` launcher gives the window a proper GUI app context,
+  so it stays running.
+- **If Steam itself keeps crashing** (`crash_steam.exe` dumps, CEF renderer restarts): clear its
+  browser caches — quit Steam, delete `…/Steam/appcache/httpcache`,
+  `…/AppData/Local/Steam/htmlcache`, and any `GPUCache`, then relaunch.
 
 ### Diagnostics cheat-sheet
 
