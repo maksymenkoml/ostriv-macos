@@ -90,13 +90,13 @@ def _bottle_of(game_dir):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def wine_reg(bottle, *args):
-    """Run a wine reg command in the given bottle. Returns True on success."""
+    """Run a wine reg command in the given bottle. Returns (returncode, stdout)."""
     wine = os.path.join(CROSSOVER, "bin", "wine")
     if not os.access(wine, os.X_OK):
-        return False
+        return (1, "")
     cmd = [wine, "--bottle", bottle, "--no-update", "--no-lock", "reg", *args]
     r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0
+    return (r.returncode, r.stdout)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,10 +119,19 @@ def install_driver(game_dir):
 
 
 def set_override(bottle):
-    """Scope opengl32=native to ostriv.exe (never global — that breaks Steam)."""
-    ok = wine_reg(bottle,
-                  r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides",
-                  "/v", "opengl32", "/d", "native", "/f")
+    """Scope opengl32=native to ostriv.exe (never global — that breaks Steam).
+
+    The first wine call after editing cxbottle.conf can reboot wineserver and return
+    non-zero mid-boot, so retry a couple of times and verify by querying the value back.
+    """
+    key = r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides"
+    ok = False
+    for _ in range(3):
+        wine_reg(bottle, "add", key, "/v", "opengl32", "/d", "native", "/f")
+        _, out = wine_reg(bottle, "query", key, "/v", "opengl32")
+        if "native" in out.lower():
+            ok = True
+            break
     print(f"  {green('OK') if ok else yellow('WARN')}    opengl32=native (ostriv.exe only)")
     return ok
 
@@ -199,7 +208,7 @@ def restore(game_dir, bottle):
         elif os.path.isfile(dst):
             os.remove(dst)
             print(f"  {green('OK')}    removed {dll}")
-    wine_reg(bottle, r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides",
+    wine_reg(bottle, "delete", r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides",
              "/v", "opengl32", "/f")
     print(f"  {green('OK')}    removed opengl32 override")
     print(green("\nRestored. Bottle env vars in cxbottle.conf were left in place "
