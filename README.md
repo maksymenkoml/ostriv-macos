@@ -30,10 +30,12 @@ python3 patch.py
 (Python 3, stdlib only — no dependencies). It's interactive; you can also pass the game dir directly:
 `python3 patch.py "/path/to/…/steamapps/common/Ostriv"`. Then:
 
-1. If it says so, run the game's **`ostriv_settings`** tool and set **Multisampling OFF** *(required —
-   see below; `patch.py` does this automatically if `settings.data` already exists)*.
-2. **Fully quit CrossOver and reopen it.** *(required once, to load the new bottle settings)*
-3. Start **Steam** inside the bottle, then launch **Ostriv**.
+1. **Fully quit CrossOver and reopen it.** *(required once, to load the new bottle settings)*
+2. Start **Steam** inside the bottle, then launch **Ostriv**.
+
+`patch.py` installs a `settings.data` with **multisampling off + borderless fullscreen** for fresh
+installs, so there's no manual settings step. *(If you already had a `settings.data`, it just flips
+multisampling off in place.)*
 
 That's it — the game runs GPU-accelerated and fullscreen. To undo, re-run `python3 patch.py` and
 choose **Restore**.
@@ -47,7 +49,7 @@ choose **Restore**.
 | Mesa driver | Copies `opengl32.dll`, `libgallium_wgl.dll`, `dxil.dll`, `libwinpthread-1.dll` next to `ostriv.exe` |
 | DLL override | `HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides` → `opengl32=native` (scoped to Ostriv only — a *global* override breaks Steam) |
 | Bottle env | `GALLIUM_DRIVER=d3d12`, `wgl_require_gdi_compat=true`, `MESA_D3D12_ASYNC_PRESENT=1`, `MESA_GL_VERSION_OVERRIDE=4.3`, `MESA_GLSL_VERSION_OVERRIDE=430`, `SteamAppId=773790` |
-| Multisampling | Sets it off in `settings.data` (if the file exists) so the game doesn't crash |
+| Settings | Installs a `settings.data` (multisampling off + borderless fullscreen) on fresh installs, or flips multisampling off in an existing one |
 
 Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoes it all. See
 **[docs/technical.md](docs/technical.md)** for the full explanation of every bug and fix.

@@ -164,13 +164,21 @@ def set_env(bottle):
     return True
 
 
-def disable_multisampling(bottle):
-    """Set bMultisampling=0 in the game's settings.data if it exists (MSAA on = crash)."""
-    settings = os.path.join(BOTTLES_ROOT, bottle, "drive_c", "users", "crossover",
-                            "Saved Games", "Ostriv", "settings.data")
+def ensure_settings(bottle):
+    """Guarantee multisampling is OFF (MSAA on = crash). If the game has no settings.data
+    yet, drop in our bundled template (MSAA off, borderless fullscreen); otherwise just
+    flip the multisampling flag in place."""
+    sg_dir = os.path.join(BOTTLES_ROOT, bottle, "drive_c", "users", "crossover",
+                          "Saved Games", "Ostriv")
+    settings = os.path.join(sg_dir, "settings.data")
+    template = os.path.join(SCRIPT_DIR, "assets", "settings.data")
     if not os.path.isfile(settings):
-        print(f"  {yellow('TODO')}  settings.data not created yet — run ostriv_settings once "
-              f"and set Multisampling OFF")
+        if os.path.isfile(template):
+            os.makedirs(sg_dir, exist_ok=True)
+            shutil.copy2(template, settings)
+            print(f"  {green('OK')}    settings.data created (multisampling off, borderless fullscreen)")
+            return True
+        print(f"  {yellow('TODO')}  no settings.data — run ostriv_settings once and set Multisampling OFF")
         return False
     import struct
     with open(settings, "rb") as f:
@@ -309,20 +317,19 @@ def main():
     if ok:
         set_override(bottle)
         set_env(bottle)
-        disable_multisampling(bottle)
+        ensure_settings(bottle)
     print()
 
     # ── Step 4: summary + next steps ─────────────────────────────────────────
     if ok:
         print(green(bold("Installed!")) + "\n")
-        print("Three manual steps remain:\n")
-        print(f"  1. If prompted above, run {bold('ostriv_settings')} and set "
-              f"{bold('Multisampling OFF')}.")
-        print(f"  2. {bold('Fully quit CrossOver and reopen it')} "
+        print("Two steps remain:\n")
+        print(f"  1. {bold('Fully quit CrossOver and reopen it')} "
               f"(loads the new bottle settings).")
-        print(f"  3. Start Steam in the bottle, then launch Ostriv.\n")
-        print(yellow("  If the game ever renders tiny on a big screen: "
-                     "fully quit CrossOver and reopen it.\n"))
+        print(f"  2. Start Steam in the bottle, then launch Ostriv.\n")
+        print(yellow("  If it warned about settings.data above: run ostriv_settings once, "
+                     "Multisampling OFF.\n"
+                     "  If the game ever renders tiny on a big screen: quit CrossOver and reopen it.\n"))
         print("To undo later: re-run this script and choose Restore.")
     else:
         print(yellow("Completed with warnings — check the output above.\n"))
