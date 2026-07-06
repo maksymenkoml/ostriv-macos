@@ -66,6 +66,11 @@ Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoe
 - **If the game ever renders tiny (e.g. 1024×768) on a big screen:** winemac's display state got
   confused (usually after changing your Mac's resolution). **Fully quit CrossOver and reopen it** —
   do *not* use display-resolution tools to force fullscreen, they corrupt winemac's state.
+- **If Play launches the game but it closes after ~2 seconds** (Steam shows it "running" briefly):
+  the **Steam in-game overlay** conflicts with the custom Mesa `opengl32` and crashes it at startup.
+  Fix: Steam → **Library → right-click Ostriv → Properties → General → uncheck "Enable the Steam
+  Overlay while in-game"**, then Play. (Launching directly via CrossOver "Run Command" → `ostriv.exe`
+  also works — the overlay only injects on a Steam-Play launch.)
 - **If Steam's Play button does nothing / Steam keeps crashing** (`crash_steam.exe` dumps, the
   browser UI restarting): that's a Steam-under-Wine issue, not the patch. Quit Steam, delete these
   folders in the bottle, and relaunch Steam: `…/Steam/appcache/httpcache`,
