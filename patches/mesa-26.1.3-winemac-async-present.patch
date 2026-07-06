@@ -1,0 +1,191 @@
+diff --git a/src/gallium/drivers/d3d12/d3d12_screen.cpp b/src/gallium/drivers/d3d12/d3d12_screen.cpp
+index 6c071b4..7fd4202 100644
+--- a/src/gallium/drivers/d3d12/d3d12_screen.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_screen.cpp
+@@ -682,6 +682,64 @@ d3d12_destroy_screen(struct d3d12_screen *screen)
+    FREE(screen);
+ }
+ 
++#if defined(_WIN32) && !defined(_GAMING_XBOX)
++/* --- Async GDI present (Wine/CrossOver winemac optimization) ---------------
++ * On Wine's Mac driver the GDI StretchDIBits + window-surface flush is very
++ * expensive; doing it inline serializes GPU rendering with the screen upload
++ * and caps the frame rate.  This offloads the blit to a worker thread and
++ * DROPS frames while the worker is busy (natural rate adaptation, no queue
++ * buildup / latency).  Disable with MESA_D3D12_ASYNC_PRESENT=0.
++ */
++struct d3d12_async_present {
++   mtx_t lock;
++   cnd_t cv;
++   thrd_t thread;
++   bool thread_ok;
++   bool pending;
++   HWND hwnd;
++   uint8_t *pixels;
++   size_t buf_size;
++   unsigned width, height, stride;
++   BITMAPV5HEADER bmi;
++};
++static struct d3d12_async_present d3d12_ap;
++static once_flag d3d12_ap_once = ONCE_FLAG_INIT;
++
++static int
++d3d12_ap_worker(void *arg)
++{
++   struct d3d12_async_present *st = (struct d3d12_async_present *)arg;
++   mtx_lock(&st->lock);
++   for (;;) {
++      while (!st->pending)
++         cnd_wait(&st->cv, &st->lock);
++      /* params + pixels are stable while pending==true */
++      HWND w = st->hwnd;
++      mtx_unlock(&st->lock);
++      HDC hdc = GetDC(w);
++      if (hdc) {
++         StretchDIBits(hdc,
++                       0, 0, st->width, st->height,
++                       0, 0, st->width, st->height,
++                       st->pixels, (BITMAPINFO *)&st->bmi, 0, SRCCOPY);
++         ReleaseDC(w, hdc);
++      }
++      mtx_lock(&st->lock);
++      st->pending = false;
++   }
++   return 0;
++}
++
++static void
++d3d12_ap_init(void)
++{
++   mtx_init(&d3d12_ap.lock, mtx_plain);
++   cnd_init(&d3d12_ap.cv);
++   d3d12_ap.thread_ok =
++      thrd_create(&d3d12_ap.thread, d3d12_ap_worker, &d3d12_ap) == thrd_success;
++}
++#endif
++
+ static void
+ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
+                         struct pipe_context *pctx,
+@@ -722,6 +780,83 @@ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
+    }
+ 
+    assert(res->dt);
++
++#if defined(_WIN32) && !defined(_GAMING_XBOX)
++   {
++      static const char *ap_env = getenv("MESA_D3D12_ASYNC_PRESENT");
++      bool ap_enabled = !(ap_env && ap_env[0] == '0');
++      HWND ap_hwnd = ap_enabled ? WindowFromDC((HDC)winsys_drawable_handle) : NULL;
++
++      if (ap_enabled && ap_hwnd) {
++         call_once(&d3d12_ap_once, d3d12_ap_init);
++
++         if (d3d12_ap.thread_ok) {
++            mtx_lock(&d3d12_ap.lock);
++            bool busy = d3d12_ap.pending;
++            mtx_unlock(&d3d12_ap.lock);
++            if (busy)
++               return;   /* drop frame: worker still flushing the previous one */
++
++            struct pipe_context *upctx = threaded_context_unwrap_sync(pctx);
++            pipe_transfer *transfer = nullptr;
++            void *res_map = pipe_texture_map(upctx, pres, level, layer, PIPE_MAP_READ, 0, 0,
++                                             u_minify(pres->width0, level),
++                                             u_minify(pres->height0, level),
++                                             &transfer);
++            if (res_map) {
++               unsigned w = transfer->box.width, h = transfer->box.height;
++               unsigned cpp = util_format_get_blocksize(pres->format);
++               unsigned bpp = util_format_get_blocksizebits(pres->format);
++               unsigned stride = align(w * cpp, 64);
++               size_t need = (size_t)stride * h;
++               if (need > d3d12_ap.buf_size) {
++                  align_free(d3d12_ap.pixels);
++                  d3d12_ap.pixels = (uint8_t *)align_malloc(need, 64);
++                  d3d12_ap.buf_size = d3d12_ap.pixels ? need : 0;
++               }
++               if (d3d12_ap.pixels) {
++                  util_copy_rect(d3d12_ap.pixels, pres->format, stride, 0, 0, w, h,
++                                 (const uint8_t*)res_map, transfer->stride, 0, 0);
++                  pipe_texture_unmap(upctx, transfer);
++
++                  memset(&d3d12_ap.bmi, 0, sizeof(d3d12_ap.bmi));
++                  d3d12_ap.bmi.bV5Size = sizeof(BITMAPV5HEADER);
++                  d3d12_ap.bmi.bV5Width = stride / cpp;
++                  d3d12_ap.bmi.bV5Height = -(LONG)h;
++                  d3d12_ap.bmi.bV5Planes = 1;
++                  d3d12_ap.bmi.bV5BitCount = bpp;
++                  d3d12_ap.bmi.bV5Compression = BI_RGB;
++                  if (pres->format == PIPE_FORMAT_R10G10B10A2_UNORM) {
++                     d3d12_ap.bmi.bV5Compression = BI_BITFIELDS;
++                     d3d12_ap.bmi.bV5RedMask   = 0x000003FF;
++                     d3d12_ap.bmi.bV5GreenMask = 0x000FFC00;
++                     d3d12_ap.bmi.bV5BlueMask  = 0x3FF00000;
++                  } else if (pres->format == PIPE_FORMAT_R8G8B8X8_UNORM ||
++                             pres->format == PIPE_FORMAT_R8G8B8A8_UNORM) {
++                     d3d12_ap.bmi.bV5Compression = BI_BITFIELDS;
++                     d3d12_ap.bmi.bV5RedMask   = 0x0000ff;
++                     d3d12_ap.bmi.bV5GreenMask = 0x00ff00;
++                     d3d12_ap.bmi.bV5BlueMask  = 0xff0000;
++                  }
++                  d3d12_ap.width = w;
++                  d3d12_ap.height = h;
++                  d3d12_ap.stride = stride;
++
++                  mtx_lock(&d3d12_ap.lock);
++                  d3d12_ap.hwnd = ap_hwnd;
++                  d3d12_ap.pending = true;
++                  cnd_signal(&d3d12_ap.cv);
++                  mtx_unlock(&d3d12_ap.lock);
++                  return;   /* presented asynchronously */
++               }
++               pipe_texture_unmap(upctx, transfer);
++            }
++            /* fall through to the sync path on any failure */
++         }
++      }
++   }
++#endif
++
+    void *map = winsys->displaytarget_map(winsys, res->dt, 0);
+ 
+    if (map) {
+diff --git a/src/gallium/frontends/wgl/stw_pixelformat.c b/src/gallium/frontends/wgl/stw_pixelformat.c
+index 8b2647b..a3c5579 100644
+--- a/src/gallium/frontends/wgl/stw_pixelformat.c
++++ b/src/gallium/frontends/wgl/stw_pixelformat.c
+@@ -266,10 +266,33 @@ add_color_format_variants(const struct stw_pf_color_info *color_formats,
+ 
+    bool require_gdi_compat =
+       driQueryOptionb(&stw_dev->option_cache, "wgl_require_gdi_compat");
++   /* Wine/CrossOver winemac patch: driconf/xmlconfig may be compiled out in
++    * this build, so honor the env var directly and DEFAULT TO ON — GDI-compat
++    * formats are the only ones winemac can composite. Set to 0 to disable. */
++   {
++      const char *e = getenv("wgl_require_gdi_compat");
++      if (!e) e = getenv("WGL_REQUIRE_GDI_COMPAT");
++      require_gdi_compat = e ? (e[0] != '0') : true;
++   }
++
++   /* Wine/CrossOver winemac patch: never expose multisample pixel formats.
++    * winemac cannot create the recursive MSAA window wglChoosePixelFormatARB
++    * needs, so an MSAA format choice crashes the app (windows_createWindow
++    * FAILED 0 -> NULL deref). With no MSAA formats on offer, the game's own
++    * MSAA setting becomes a harmless no-op. Set MESA_WGL_ALLOW_MSAA=1 to
++    * restore stock behavior. */
++   bool allow_msaa = false;
++   {
++      const char *e = getenv("MESA_WGL_ALLOW_MSAA");
++      if (e && e[0] == '1') allow_msaa = true;
++   }
+ 
+    for (ms = 0; ms < ARRAY_SIZE(stw_pf_multisample); ms++) {
+       unsigned samples = stw_pf_multisample[ms];
+ 
++      if (samples > 0 && !allow_msaa)
++         continue;
++
+       if (force_samples && samples != force_samples)
+          continue;
+ 
