@@ -62,6 +62,9 @@ There are no unit tests. Verify by launching the game and reading its log at
   corrupts winemac's display state (it then reports 1024×768 to the game regardless of the real
   resolution), and ONLY a full **quit-and-reopen of CrossOver** resets it (`wineserver -k` is not
   enough). Fullscreen = the game's own `bFullscreenBorderlessWindow=1` flag, no VD.
+- **Never set `SteamAppId`/`SteamGameId` as *bottle* env vars** — they hit `steam.exe` too and
+  crash-loop Steam's CEF browser (the Play button dies). Use a game-scoped `steam_appid.txt` next to
+  `ostriv.exe` instead.
 - **Multisampling must stay off** in the game settings, or it crashes.
 - **Keep the DLLs in Git LFS.** Don't commit the 45 MB `libgallium_wgl.dll` as a raw blob.
 - Pin the Mesa version (`mesa-26.1.3`) — the prebuilt DLLs and the patch line-numbers assume it.

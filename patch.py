@@ -21,10 +21,13 @@ DRIVER_DLLS = ["opengl32.dll", "libgallium_wgl.dll", "dxil.dll", "libwinpthread-
 BOTTLES_ROOT = os.path.expanduser("~/Library/Application Support/CrossOver/Bottles")
 CROSSOVER = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
 
+APPID = "773790"
+
 # Bottle environment the game needs (GL 4.3 via d3d12, visible via gdi present, fast via async present).
+# NOTE: do NOT put SteamAppId/SteamGameId here — bottle env is applied to *every* process in the
+# bottle, incl. steam.exe, which then thinks it IS the game and its CEF browser crash-loops. The
+# game instead gets its app id from a game-scoped steam_appid.txt (see write_appid_file).
 BOTTLE_ENV = {
-    "SteamAppId": "773790",
-    "SteamGameId": "773790",
     "GALLIUM_DRIVER": "d3d12",
     "wgl_require_gdi_compat": "true",
     "MESA_D3D12_ASYNC_PRESENT": "1",
@@ -116,6 +119,18 @@ def install_driver(game_dir):
         shutil.copy2(src, dst)
         print(f"  {green('OK')}    {dll}")
     return True
+
+
+def write_appid_file(game_dir):
+    """Write steam_appid.txt next to ostriv.exe so SteamAPI_Init finds the app id WITHOUT a
+    bottle-wide SteamAppId env var (which would crash Steam's own processes)."""
+    path = os.path.join(game_dir, "steam_appid.txt")
+    if os.path.isfile(path) and open(path).read().strip() == APPID:
+        print(f"  {green('OK')}    steam_appid.txt (already present)")
+        return
+    with open(path, "w") as f:
+        f.write(APPID)
+    print(f"  {green('OK')}    steam_appid.txt ({APPID})")
 
 
 def set_override(bottle):
@@ -315,6 +330,7 @@ def main():
     print("Installing...\n")
     ok = install_driver(game_dir)
     if ok:
+        write_appid_file(game_dir)
         set_override(bottle)
         set_env(bottle)
         ensure_settings(bottle)

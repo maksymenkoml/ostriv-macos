@@ -48,7 +48,8 @@ choose **Restore**.
 |---|---|
 | Mesa driver | Copies `opengl32.dll`, `libgallium_wgl.dll`, `dxil.dll`, `libwinpthread-1.dll` next to `ostriv.exe` |
 | DLL override | `HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides` → `opengl32=native` (scoped to Ostriv only — a *global* override breaks Steam) |
-| Bottle env | `GALLIUM_DRIVER=d3d12`, `wgl_require_gdi_compat=true`, `MESA_D3D12_ASYNC_PRESENT=1`, `MESA_GL_VERSION_OVERRIDE=4.3`, `MESA_GLSL_VERSION_OVERRIDE=430`, `SteamAppId=773790` |
+| Bottle env | `GALLIUM_DRIVER=d3d12`, `wgl_require_gdi_compat=true`, `MESA_D3D12_ASYNC_PRESENT=1`, `MESA_GL_VERSION_OVERRIDE=4.3`, `MESA_GLSL_VERSION_OVERRIDE=430` |
+| Steam app id | Writes `steam_appid.txt` (773790) next to `ostriv.exe` — **not** a bottle-wide `SteamAppId` env, which would make `steam.exe` itself think it's the game and crash Steam's browser |
 | Settings | Installs a `settings.data` (multisampling off + borderless fullscreen) on fresh installs, or flips multisampling off in an existing one |
 
 Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoes it all. See
