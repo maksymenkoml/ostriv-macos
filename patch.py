@@ -14,6 +14,12 @@ import sys
 import subprocess
 import shutil
 
+try:
+    import termios
+    import tty
+except ImportError:  # non-POSIX; select() falls back to numbered input
+    termios = tty = None
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PREBUILT = os.path.join(SCRIPT_DIR, "prebuilt")
 DRIVER_DLLS = ["opengl32.dll", "libgallium_wgl.dll", "dxil.dll", "libwinpthread-1.dll"]
@@ -265,12 +271,58 @@ def print_status(game_dir):
           (yellow("  (driver already installed)") if installed else ""))
 
 
-def ask(prompt, valid):
-    while True:
-        val = input(prompt).strip().upper()
-        if val in valid:
-            return val
-        print(f"  Please enter one of: {', '.join(sorted(valid))}")
+def select(prompt, options):
+    """Interactive ↑/↓ + Enter menu. `options` is a list of label strings.
+    Returns the chosen index, or None if the user quits (q / Ctrl-C).
+    Falls back to numbered input when stdin/stdout isn't an interactive TTY."""
+    n = len(options)
+
+    if not (termios and sys.stdin.isatty() and sys.stdout.isatty()):
+        print(prompt)
+        for i, label in enumerate(options, 1):
+            print(f"  [{i}] {label}")
+        while True:
+            val = input("Select (number, or Q to quit): ").strip().lower()
+            if val in ("q", "quit"):
+                return None
+            if val.isdigit() and 1 <= int(val) <= n:
+                return int(val) - 1
+            print(f"  Enter 1-{n} or Q")
+
+    print(prompt)
+    print(cyan("  (↑/↓ to move · Enter to select · q to quit)"))
+    idx = 0
+
+    def draw(first=False):
+        if not first:
+            sys.stdout.write(f"\x1b[{n}A")            # cursor up n lines
+        for i, label in enumerate(options):
+            row = (green("❯ ") + bold(label)) if i == idx else "  " + label
+            sys.stdout.write("\r\x1b[K  " + row + "\r\n")  # clear line, write, CRLF
+        sys.stdout.flush()
+
+    assert termios and tty  # narrowed: TTY branch only reached when available
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        draw(first=True)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b" and sys.stdin.read(1) == "[":
+                arrow = sys.stdin.read(1)
+                if arrow == "A":
+                    idx = (idx - 1) % n; draw()
+                elif arrow == "B":
+                    idx = (idx + 1) % n; draw()
+            elif ch in ("\r", "\n"):
+                return idx
+            elif ch in ("q", "Q"):
+                return None
+            elif ch == "\x03":
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,14 +358,12 @@ def main():
             print(f"  Found in bottle '{bottle}':\n  {shorten(game_dir)}\n")
         else:
             print()
-            for i, (b, p) in enumerate(found, 1):
-                print(f"  [{i}] {b}: {shorten(p)}")
-            print("  [Q] Quit\n")
-            valid = {str(i) for i in range(1, len(found) + 1)} | {"Q"}
-            sel = ask("Select: ", valid)
-            if sel == "Q":
+            sel = select("Select the Ostriv installation to patch:",
+                         [f"{b}  ({shorten(p)})" for b, p in found])
+            if sel is None:
                 return
-            bottle, game_dir = found[int(sel) - 1]
+            bottle, game_dir = found[sel]
+            print()
 
     if not os.path.isfile(os.path.join(game_dir, "ostriv.exe")):
         print(red(f"\n  '{game_dir}' doesn't contain ostriv.exe."))
@@ -324,16 +374,15 @@ def main():
     print()
 
     # ── Step 2: choose action ────────────────────────────────────────────────
-    print("Choose action:\n")
-    print("  [1] Install  — GPU driver + bottle config (fullscreen, ~30-60 fps)")
-    print("  [2] Restore  — undo: put back the original driver")
-    print("  [Q] Quit\n")
-    sel = ask("Action: ", {"1", "2", "Q"})
-    if sel == "Q":
+    sel = select("Choose action:", [
+        "Install  — GPU driver + bottle config (fullscreen, ~30-60 fps)",
+        "Restore  — undo: put back the original driver",
+    ])
+    if sel is None:
         return
     print()
 
-    if sel == "2":
+    if sel == 1:
         restore(game_dir, bottle)
         return
 
