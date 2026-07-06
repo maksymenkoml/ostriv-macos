@@ -238,7 +238,12 @@ def windows_path(game_dir, exe):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def restore(game_dir, bottle):
-    print("Restoring original driver...\n")
+    """Completely undo everything install did — driver DLLs, steam_appid.txt, the
+    opengl32 override, the bottle env vars, and our settings.data. No leftovers."""
+    import re
+    print("Restoring to the pre-patch state...\n")
+
+    # 1. driver DLLs — put back the backup, or remove the one we added
     for dll in DRIVER_DLLS:
         dst = os.path.join(game_dir, dll)
         bak = dst + ".bak"
@@ -248,11 +253,44 @@ def restore(game_dir, bottle):
         elif os.path.isfile(dst):
             os.remove(dst)
             print(f"  {green('OK')}    removed {dll}")
+
+    # 2. steam_appid.txt we wrote
+    appid = os.path.join(game_dir, "steam_appid.txt")
+    if os.path.isfile(appid):
+        os.remove(appid)
+        print(f"  {green('OK')}    removed steam_appid.txt")
+
+    # 3. opengl32=native override
     wine_reg(bottle, "delete", r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides",
              "/v", "opengl32", "/f")
     print(f"  {green('OK')}    removed opengl32 override")
-    print(green("\nRestored. Bottle env vars in cxbottle.conf were left in place "
-                "(harmless); remove them by hand if you like.\n"))
+
+    # 4. bottle env vars we added (leaves any other bottle env untouched)
+    conf = os.path.join(BOTTLES_ROOT, bottle, "cxbottle.conf")
+    if os.path.isfile(conf):
+        with open(conf) as f:
+            s = f.read()
+        for k in BOTTLE_ENV:
+            s = re.sub(rf'^"{re.escape(k)}"\s*=\s*"[^"]*"\n', "", s, flags=re.M)
+        with open(conf, "w") as f:
+            f.write(s)
+        if os.path.isfile(conf + ".bak"):
+            os.remove(conf + ".bak")
+        print(f"  {green('OK')}    removed bottle env vars")
+
+    # 5. settings.data — restore the backup, or remove the template we dropped in
+    settings = os.path.join(BOTTLES_ROOT, bottle, "drive_c", "users", "crossover",
+                            "Saved Games", "Ostriv", "settings.data")
+    template = os.path.join(SCRIPT_DIR, "assets", "settings.data")
+    if os.path.isfile(settings + ".bak"):
+        shutil.move(settings + ".bak", settings)
+        print(f"  {green('OK')}    restored settings.data")
+    elif (os.path.isfile(settings) and os.path.isfile(template)
+          and open(settings, "rb").read() == open(template, "rb").read()):
+        os.remove(settings)
+        print(f"  {green('OK')}    removed settings.data (installed by us)")
+
+    print(green(bold("\nFully restored.")) + " The bottle is back to its pre-patch state.\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
