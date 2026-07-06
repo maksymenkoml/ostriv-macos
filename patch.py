@@ -216,6 +216,17 @@ def ensure_settings(bottle):
     return True
 
 
+def windows_path(game_dir, exe):
+    """Convert a macOS bottle path (…/drive_c/rest) to the Windows path CrossOver's
+    'Run Command' expects, e.g. C:\\Program Files (x86)\\Steam\\...\\ostriv.exe."""
+    marker = os.sep + "drive_c" + os.sep
+    idx = game_dir.find(marker)
+    if idx < 0:
+        return os.path.join(game_dir, exe)  # fallback: raw path
+    rest = game_dir[idx + len(marker):]
+    return "C:\\" + rest.replace("/", "\\") + "\\" + exe
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Restore
 # ──────────────────────────────────────────────────────────────────────────────
@@ -338,15 +349,26 @@ def main():
 
     # ── Step 4: summary + next steps ─────────────────────────────────────────
     if ok:
+        game_win = windows_path(game_dir, "ostriv.exe")
+        settings_win = windows_path(game_dir, "ostriv_settings.exe")
         print(green(bold("Installed!")) + "\n")
-        print("Two steps remain:\n")
+        print("How to launch:\n")
         print(f"  1. {bold('Fully quit CrossOver and reopen it')} "
               f"(loads the new bottle settings).")
-        print(f"  2. Start Steam in the bottle, then launch Ostriv.\n")
-        print(yellow("  If it warned about settings.data above: run ostriv_settings once, "
-                     "Multisampling OFF.\n"
+        print(f"  2. Start {bold('Steam')} in the bottle — it just needs to be "
+              f"{bold('running')} (for the Steam API).")
+        print(f"  3. In CrossOver, select the {bold(bottle)} bottle → "
+              f"{bold('Run Command')}, and run the game with this path:\n")
+        print(f"        {cyan(game_win)}\n")
+        print(f"     {bold('Do NOT use the Steam Play button')} — it injects the Steam overlay, "
+              f"which crashes the game.\n")
+        print(f"     Tip: in the Run Command dialog, {bold('Save a Launcher')} so you get a "
+              f"double-click app.\n")
+        print("To change graphics settings, run this one the same way (Run Command):\n")
+        print(f"        {cyan(settings_win)}\n")
+        print(yellow("  Keep Multisampling OFF in settings, or the game crashes at launch.\n"
                      "  If the game ever renders tiny on a big screen: quit CrossOver and reopen it.\n"))
-        print("To undo later: re-run this script and choose Restore.")
+        print("To undo everything: re-run this script and choose Restore.")
     else:
         print(yellow("Completed with warnings — check the output above.\n"))
     print()
