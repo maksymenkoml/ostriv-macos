@@ -482,6 +482,19 @@ def steam_state():
     return pid, active
 
 
+def steam_ready():
+    """True once Steam can actually serve SteamAPI_Init: the client is running, login has
+    finished (the ActiveUser registry value is nonzero), AND its CEF UI has come up (a
+    steamwebhelper renderer is running). Merely running + logged in is NOT enough — a cold
+    client sets ActiveUser seconds before it can service the API, and the game crashes at
+    SteamAPI_Init if launched too early. The steamwebhelper renderer is a reliable
+    'client fully up' signal."""
+    if not (steam_running() and steam_state()[1]):
+        return False
+    return subprocess.run(["pgrep", "-f", "steamwebhelper.exe.*type=renderer"],
+                          capture_output=True).returncode == 0
+
+
 def find_steam_app():
     """The CrossOver launcher .app for Steam in this bottle, resolved at launch time."""
     if not os.path.isdir(CX_APPS):
@@ -511,7 +524,6 @@ def start_steam():
     script (wine --start) it comes up in a broken half-state — tray icon, no window."""
     if steam_running():
         return
-    old_pid, _ = steam_state()
     app = find_steam_app()
     if app:
         subprocess.run(["open", app], check=False)
@@ -524,14 +536,15 @@ def start_steam():
                 break
         else:
             return
-    # steam.exe existing is not enough for SteamAPI_Init — wait until Steam has
-    # (re)written its ActiveProcess registry key and the user login finished.
-    for _ in range(60):
-        pid, active_user = steam_state()
-        if pid and pid != old_pid and active_user:
+    # Wait until Steam can actually serve SteamAPI_Init (see steam_ready()), not just until
+    # it's logged in — launching too early crashes the game before the main menu. Do NOT gate
+    # on the registry pid changing: Steam's wine-side pid is often reused across launches, so a
+    # "pid must differ from before" check can spin until timeout even when Steam is ready.
+    for _ in range(80):
+        if steam_ready():
             break
         time.sleep(3)
-    time.sleep(5)  # settle
+    time.sleep(8)  # settle once the client's UI is up
 
 
 def main():
