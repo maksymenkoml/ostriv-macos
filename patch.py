@@ -12,6 +12,8 @@ backed up to *.bak.
 import os
 import sys
 import re
+import filecmp
+import itertools
 import plistlib
 import subprocess
 import shutil
@@ -27,7 +29,69 @@ PREBUILT = os.path.join(SCRIPT_DIR, "prebuilt")
 DRIVER_DLLS = ["opengl32.dll", "libgallium_wgl.dll", "dxil.dll", "libwinpthread-1.dll"]
 
 BOTTLES_ROOT = os.path.expanduser("~/Library/Application Support/CrossOver/Bottles")
-CROSSOVER = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
+
+
+def cx_bin(cx_root, name):
+    """Path of bin/<name> under a CrossOver SharedSupport root, or None if not executable."""
+    path = os.path.join(cx_root, "bin", name)
+    return path if os.access(path, os.X_OK) else None
+
+
+def _cx_root(app):
+    """The SharedSupport/CrossOver dir inside a CrossOver.app bundle."""
+    return os.path.join(app, "Contents", "SharedSupport", "CrossOver")
+
+
+def _crossover_from_spotlight():
+    """Ask macOS where CrossOver.app is (users who moved it out of ~/ or /Applications).
+    Spotlight first, then LaunchServices via lsregister — both best-effort, stdlib-only.
+    Skips trashed / translocated / temp copies so we never resolve to a stale bundle."""
+    def ok(path):
+        junk = ("/.Trash/", "/AppTranslocation/", "/private/var/folders/", "/var/folders/")
+        return path.endswith("CrossOver.app") and not any(j in path for j in junk)
+
+    for cmd in (["mdfind", "kMDItemCFBundleIdentifier == 'com.codeweavers.CrossOver'"],
+                ["mdfind", "-name", "CrossOver.app"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.splitlines():
+            line = line.strip()
+            if ok(line):
+                yield line
+    lsreg = ("/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+             "LaunchServices.framework/Support/lsregister")
+    try:
+        out = subprocess.run([lsreg, "-dump"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    for m in re.finditer(r"(/\S+/CrossOver\.app)", out):
+        if ok(m.group(1)):
+            yield m.group(1)
+
+
+def find_crossover_app():
+    """The installed CrossOver.app bundle. CrossOver's installer defaults to ~/Applications,
+    but users may move it; check the common spots, then ask macOS. Falls back to the
+    conventional /Applications path when nothing matches."""
+    def usable(app):
+        return bool(cx_bin(_cx_root(app), "wine"))
+
+    fixed = []
+    env = os.environ.get("OSTRIV_CROSSOVER_APP")
+    if env:
+        fixed.append(os.path.expanduser(env))
+    fixed += [os.path.expanduser("~/Applications/CrossOver.app"), "/Applications/CrossOver.app"]
+    # fixed paths first (no subprocess); only ask macOS if they all miss (chain stays lazy)
+    for app in itertools.chain(fixed, _crossover_from_spotlight()):
+        if usable(app):
+            return app
+    return "/Applications/CrossOver.app"
+
+
+CROSSOVER_APP = find_crossover_app()
+CROSSOVER = _cx_root(CROSSOVER_APP)
 
 APPID = "773790"
 TESTED_CROSSOVER = "26.2"
@@ -37,7 +101,7 @@ TESTED_OSTRIV = "0.5.9.58"
 def crossover_version():
     """Installed CrossOver version, or None."""
     try:
-        with open(os.path.join(CROSSOVER.split("/SharedSupport")[0], "Info.plist"), "rb") as f:
+        with open(os.path.join(CROSSOVER_APP, "Contents", "Info.plist"), "rb") as f:
             d = plistlib.load(f)
         return d.get("CFBundleShortVersionString") or d.get("CFBundleVersion")
     except Exception:
@@ -129,8 +193,7 @@ def _bottle_of(game_dir):
 
 def cx_tool(name):
     """Path of a CrossOver CLI tool (bin/<name>), or None if not executable."""
-    path = os.path.join(CROSSOVER, "bin", name)
-    return path if os.access(path, os.X_OK) else None
+    return cx_bin(CROSSOVER, name)
 
 
 def bottle_conf(bottle):
@@ -152,15 +215,27 @@ def wine_reg(bottle, *args):
 # Install steps
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _same_file(a, b):
+    """True if both paths exist with byte-identical contents (used to tell an original
+    file apart from one of our own driver DLLs)."""
+    try:
+        return filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
 def install_driver(game_dir):
-    """Copy the Mesa driver DLLs next to ostriv.exe, backing up any existing file."""
+    """Copy the Mesa driver DLLs next to ostriv.exe, backing up any genuine pre-existing
+    file. Never back up one of our own driver DLLs: reinstalling over an already-patched
+    bottle must not capture a Mesa DLL as the 'original' (that would defeat Restore)."""
     for dll in DRIVER_DLLS:
         src = os.path.join(PREBUILT, dll)
         dst = os.path.join(game_dir, dll)
         if not os.path.isfile(src):
             print(f"  {red('MISS')}  prebuilt/{dll} not found — is the repo complete (Git LFS pulled)?")
             return False
-        if os.path.isfile(dst) and not os.path.isfile(dst + ".bak"):
+        if (os.path.isfile(dst) and not os.path.isfile(dst + ".bak")
+                and not _same_file(dst, src)):
             shutil.copy2(dst, dst + ".bak")
         shutil.copy2(src, dst)
         print(f"  {green('OK')}    {dll}")
@@ -503,9 +578,7 @@ def materialize_launcher_app(bottle, command):
     unreliable (often never, until a restart). Materialize it deterministically
     instead: extract the template CrossOver uses and fill in the same Info.plist
     keys its generated launcher apps carry."""
-    # CROSSOVER = .../CrossOver.app/Contents/SharedSupport/CrossOver
-    template = os.path.join(CROSSOVER.split("/SharedSupport")[0],
-                            "Resources", "Menu Helper.cpbz2")
+    template = os.path.join(CROSSOVER_APP, "Contents", "Resources", "Menu Helper.cpbz2")
     if not os.path.isfile(template):
         return False
     shutil.rmtree(PLAY_LAUNCHER, ignore_errors=True)
@@ -640,16 +713,22 @@ def restore(game_dir, bottle):
     import re
     print("Restoring to the pre-patch state...\n")
 
-    # 1. driver DLLs — put back the backup, or remove the one we added
+    # 1. driver DLLs — restore a genuine original, else remove what we added. A .bak whose
+    #    bytes match our prebuilt DLL is a stale self-backup from an earlier reinstall (not a
+    #    real original), so ignore it and delete both — otherwise "restore" leaves Mesa DLLs.
     for dll in DRIVER_DLLS:
+        src = os.path.join(PREBUILT, dll)
         dst = os.path.join(game_dir, dll)
         bak = dst + ".bak"
-        if os.path.isfile(bak):
+        if os.path.isfile(bak) and not _same_file(bak, src):
             shutil.move(bak, dst)
             print(f"  {green('OK')}    restored {dll}")
-        elif os.path.isfile(dst):
-            os.remove(dst)
-            print(f"  {green('OK')}    removed {dll}")
+        else:
+            if os.path.isfile(bak):
+                os.remove(bak)  # stale self-backup
+            if os.path.isfile(dst):
+                os.remove(dst)
+                print(f"  {green('OK')}    removed {dll}")
 
     # 2. steam_appid.txt we wrote
     appid = os.path.join(game_dir, "steam_appid.txt")
@@ -791,8 +870,9 @@ def main():
     print()
 
     if not cx_tool("wine"):
-        print(red("  CrossOver not found at /Applications/CrossOver.app"))
+        print(red("  CrossOver not found (checked ~/Applications, /Applications, and Spotlight)."))
         print(red("  Install CrossOver first: https://www.codeweavers.com/crossover"))
+        print(red("  If it's installed somewhere unusual, set OSTRIV_CROSSOVER_APP to its path."))
         sys.exit(1)
 
     # ── Step 1: locate game ──────────────────────────────────────────────────
