@@ -1,172 +1,19 @@
-diff --git a/src/gallium/drivers/d3d12/d3d12_screen.cpp b/src/gallium/drivers/d3d12/d3d12_screen.cpp
-index 6c071b4..7fd4202 100644
---- a/src/gallium/drivers/d3d12/d3d12_screen.cpp
-+++ b/src/gallium/drivers/d3d12/d3d12_screen.cpp
-@@ -682,6 +682,64 @@ d3d12_destroy_screen(struct d3d12_screen *screen)
-    FREE(screen);
- }
- 
-+#if defined(_WIN32) && !defined(_GAMING_XBOX)
-+/* --- Async GDI present (Wine/CrossOver winemac optimization) ---------------
-+ * On Wine's Mac driver the GDI StretchDIBits + window-surface flush is very
-+ * expensive; doing it inline serializes GPU rendering with the screen upload
-+ * and caps the frame rate.  This offloads the blit to a worker thread and
-+ * DROPS frames while the worker is busy (natural rate adaptation, no queue
-+ * buildup / latency).  Disable with MESA_D3D12_ASYNC_PRESENT=0.
-+ */
-+struct d3d12_async_present {
-+   mtx_t lock;
-+   cnd_t cv;
-+   thrd_t thread;
-+   bool thread_ok;
-+   bool pending;
-+   HWND hwnd;
-+   uint8_t *pixels;
-+   size_t buf_size;
-+   unsigned width, height, stride;
-+   BITMAPV5HEADER bmi;
-+};
-+static struct d3d12_async_present d3d12_ap;
-+static once_flag d3d12_ap_once = ONCE_FLAG_INIT;
-+
-+static int
-+d3d12_ap_worker(void *arg)
-+{
-+   struct d3d12_async_present *st = (struct d3d12_async_present *)arg;
-+   mtx_lock(&st->lock);
-+   for (;;) {
-+      while (!st->pending)
-+         cnd_wait(&st->cv, &st->lock);
-+      /* params + pixels are stable while pending==true */
-+      HWND w = st->hwnd;
-+      mtx_unlock(&st->lock);
-+      HDC hdc = GetDC(w);
-+      if (hdc) {
-+         StretchDIBits(hdc,
-+                       0, 0, st->width, st->height,
-+                       0, 0, st->width, st->height,
-+                       st->pixels, (BITMAPINFO *)&st->bmi, 0, SRCCOPY);
-+         ReleaseDC(w, hdc);
-+      }
-+      mtx_lock(&st->lock);
-+      st->pending = false;
-+   }
-+   return 0;
-+}
-+
-+static void
-+d3d12_ap_init(void)
-+{
-+   mtx_init(&d3d12_ap.lock, mtx_plain);
-+   cnd_init(&d3d12_ap.cv);
-+   d3d12_ap.thread_ok =
-+      thrd_create(&d3d12_ap.thread, d3d12_ap_worker, &d3d12_ap) == thrd_success;
-+}
-+#endif
-+
- static void
- d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
-                         struct pipe_context *pctx,
-@@ -722,6 +780,83 @@ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
-    }
- 
-    assert(res->dt);
-+
-+#if defined(_WIN32) && !defined(_GAMING_XBOX)
-+   {
-+      static const char *ap_env = getenv("MESA_D3D12_ASYNC_PRESENT");
-+      bool ap_enabled = !(ap_env && ap_env[0] == '0');
-+      HWND ap_hwnd = ap_enabled ? WindowFromDC((HDC)winsys_drawable_handle) : NULL;
-+
-+      if (ap_enabled && ap_hwnd) {
-+         call_once(&d3d12_ap_once, d3d12_ap_init);
-+
-+         if (d3d12_ap.thread_ok) {
-+            mtx_lock(&d3d12_ap.lock);
-+            bool busy = d3d12_ap.pending;
-+            mtx_unlock(&d3d12_ap.lock);
-+            if (busy)
-+               return;   /* drop frame: worker still flushing the previous one */
-+
-+            struct pipe_context *upctx = threaded_context_unwrap_sync(pctx);
-+            pipe_transfer *transfer = nullptr;
-+            void *res_map = pipe_texture_map(upctx, pres, level, layer, PIPE_MAP_READ, 0, 0,
-+                                             u_minify(pres->width0, level),
-+                                             u_minify(pres->height0, level),
-+                                             &transfer);
-+            if (res_map) {
-+               unsigned w = transfer->box.width, h = transfer->box.height;
-+               unsigned cpp = util_format_get_blocksize(pres->format);
-+               unsigned bpp = util_format_get_blocksizebits(pres->format);
-+               unsigned stride = align(w * cpp, 64);
-+               size_t need = (size_t)stride * h;
-+               if (need > d3d12_ap.buf_size) {
-+                  align_free(d3d12_ap.pixels);
-+                  d3d12_ap.pixels = (uint8_t *)align_malloc(need, 64);
-+                  d3d12_ap.buf_size = d3d12_ap.pixels ? need : 0;
-+               }
-+               if (d3d12_ap.pixels) {
-+                  util_copy_rect(d3d12_ap.pixels, pres->format, stride, 0, 0, w, h,
-+                                 (const uint8_t*)res_map, transfer->stride, 0, 0);
-+                  pipe_texture_unmap(upctx, transfer);
-+
-+                  memset(&d3d12_ap.bmi, 0, sizeof(d3d12_ap.bmi));
-+                  d3d12_ap.bmi.bV5Size = sizeof(BITMAPV5HEADER);
-+                  d3d12_ap.bmi.bV5Width = stride / cpp;
-+                  d3d12_ap.bmi.bV5Height = -(LONG)h;
-+                  d3d12_ap.bmi.bV5Planes = 1;
-+                  d3d12_ap.bmi.bV5BitCount = bpp;
-+                  d3d12_ap.bmi.bV5Compression = BI_RGB;
-+                  if (pres->format == PIPE_FORMAT_R10G10B10A2_UNORM) {
-+                     d3d12_ap.bmi.bV5Compression = BI_BITFIELDS;
-+                     d3d12_ap.bmi.bV5RedMask   = 0x000003FF;
-+                     d3d12_ap.bmi.bV5GreenMask = 0x000FFC00;
-+                     d3d12_ap.bmi.bV5BlueMask  = 0x3FF00000;
-+                  } else if (pres->format == PIPE_FORMAT_R8G8B8X8_UNORM ||
-+                             pres->format == PIPE_FORMAT_R8G8B8A8_UNORM) {
-+                     d3d12_ap.bmi.bV5Compression = BI_BITFIELDS;
-+                     d3d12_ap.bmi.bV5RedMask   = 0x0000ff;
-+                     d3d12_ap.bmi.bV5GreenMask = 0x00ff00;
-+                     d3d12_ap.bmi.bV5BlueMask  = 0xff0000;
-+                  }
-+                  d3d12_ap.width = w;
-+                  d3d12_ap.height = h;
-+                  d3d12_ap.stride = stride;
-+
-+                  mtx_lock(&d3d12_ap.lock);
-+                  d3d12_ap.hwnd = ap_hwnd;
-+                  d3d12_ap.pending = true;
-+                  cnd_signal(&d3d12_ap.cv);
-+                  mtx_unlock(&d3d12_ap.lock);
-+                  return;   /* presented asynchronously */
-+               }
-+               pipe_texture_unmap(upctx, transfer);
-+            }
-+            /* fall through to the sync path on any failure */
-+         }
-+      }
-+   }
-+#endif
-+
-    void *map = winsys->displaytarget_map(winsys, res->dt, 0);
- 
-    if (map) {
 diff --git a/src/gallium/frontends/wgl/stw_pixelformat.c b/src/gallium/frontends/wgl/stw_pixelformat.c
-index 8b2647b..a3c5579 100644
+index 8b2647b..a9784ab 100644
 --- a/src/gallium/frontends/wgl/stw_pixelformat.c
 +++ b/src/gallium/frontends/wgl/stw_pixelformat.c
-@@ -266,10 +266,33 @@ add_color_format_variants(const struct stw_pf_color_info *color_formats,
+@@ -264,12 +264,31 @@ add_color_format_variants(const struct stw_pf_color_info *color_formats,
+       bind_flags |= PIPE_BIND_DISPLAY_TARGET;
+    }
  
-    bool require_gdi_compat =
-       driQueryOptionb(&stw_dev->option_cache, "wgl_require_gdi_compat");
+-   bool require_gdi_compat =
+-      driQueryOptionb(&stw_dev->option_cache, "wgl_require_gdi_compat");
 +   /* Wine/CrossOver winemac patch: driconf/xmlconfig may be compiled out in
-+    * this build, so honor the env var directly and DEFAULT TO ON — GDI-compat
++    * this build, so honor the env var directly and DEFAULT TO ON - GDI-compat
 +    * formats are the only ones winemac can composite. Set to 0 to disable. */
-+   {
-+      const char *e = getenv("wgl_require_gdi_compat");
-+      if (!e) e = getenv("WGL_REQUIRE_GDI_COMPAT");
-+      require_gdi_compat = e ? (e[0] != '0') : true;
-+   }
++   const char *gdi_compat_env = getenv("wgl_require_gdi_compat");
++   if (!gdi_compat_env) gdi_compat_env = getenv("WGL_REQUIRE_GDI_COMPAT");
++   bool require_gdi_compat = gdi_compat_env ? (gdi_compat_env[0] != '0') : true;
 +
 +   /* Wine/CrossOver winemac patch: never expose multisample pixel formats.
 +    * winemac cannot create the recursive MSAA window wglChoosePixelFormatARB
@@ -188,4 +35,320 @@ index 8b2647b..a3c5579 100644
 +
        if (force_samples && samples != force_samples)
           continue;
+ 
+diff --git a/src/gallium/winsys/sw/gdi/gdi_sw_winsys.c b/src/gallium/winsys/sw/gdi/gdi_sw_winsys.c
+index 3c43393..d8a64ee 100644
+--- a/src/gallium/winsys/sw/gdi/gdi_sw_winsys.c
++++ b/src/gallium/winsys/sw/gdi/gdi_sw_winsys.c
+@@ -35,9 +35,12 @@
+ 
+ 
+ #include <windows.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "util/format/u_formats.h"
+ #include "pipe/p_context.h"
++#include "util/u_thread.h"
+ #include "util/u_inlines.h"
+ #include "util/format/u_format.h"
+ #include "util/u_math.h"
+@@ -248,6 +251,88 @@ gdi_sw_display( struct sw_winsys *winsys,
+                   gdt->data, (BITMAPINFO *)&gdt->bmi, 0, SRCCOPY);
+ }
+ 
++#if defined(_WIN32)
++/* Wine/CrossOver winemac optimization: keep Mesa's normal frontbuffer
++ * synchronization/readback path intact, then offload only the final GDI
++ * StretchDIBits upload.  Disable with MESA_D3D12_ASYNC_PRESENT=0.
++ */
++struct gdi_async_present {
++   mtx_t lock;
++   cnd_t cv;
++   thrd_t thread;
++   bool thread_ok;
++   bool pending;
++   HWND hwnd;
++   uint8_t *pixels;
++   size_t buf_size;
++   unsigned width;
++   unsigned height;
++   BITMAPV5HEADER bmi;
++};
++
++static struct gdi_async_present gdi_ap;
++static once_flag gdi_ap_once = ONCE_FLAG_INIT;
++
++static int
++gdi_async_present_worker(void *arg)
++{
++   struct gdi_async_present *st = (struct gdi_async_present *)arg;
++
++   mtx_lock(&st->lock);
++   for (;;) {
++      while (!st->pending)
++         cnd_wait(&st->cv, &st->lock);
++
++      HWND hwnd = st->hwnd;
++      mtx_unlock(&st->lock);
++
++      HDC hdc = GetDC(hwnd);
++      if (hdc) {
++         StretchDIBits(hdc,
++                       0, 0, st->width, st->height,
++                       0, 0, st->width, st->height,
++                       st->pixels, (BITMAPINFO *)&st->bmi, 0, SRCCOPY);
++         ReleaseDC(hwnd, hdc);
++      }
++
++      mtx_lock(&st->lock);
++      st->pending = false;
++   }
++
++   return 0;
++}
++
++static void
++gdi_async_present_init(void)
++{
++   if (mtx_init(&gdi_ap.lock, mtx_plain) != thrd_success)
++      return;
++   if (cnd_init(&gdi_ap.cv) != thrd_success)
++      return;
++
++   gdi_ap.thread_ok =
++      thrd_create(&gdi_ap.thread, gdi_async_present_worker, &gdi_ap) == thrd_success;
++}
++
++static bool gdi_ap_enabled;
++static once_flag gdi_ap_enabled_once = ONCE_FLAG_INIT;
++
++static void
++gdi_async_present_read_enabled(void)
++{
++   const char *env = getenv("MESA_D3D12_ASYNC_PRESENT");
++   gdi_ap_enabled = !(env && env[0] == '0');
++}
++
++static bool
++gdi_async_present_enabled(void)
++{
++   /* Read the env exactly once - this is queried on every present. */
++   call_once(&gdi_ap_enabled_once, gdi_async_present_read_enabled);
++   return gdi_ap_enabled;
++}
++#endif
++
+ static void
+ gdi_sw_displaytarget_display(struct sw_winsys *_winsys, 
+                              struct sw_displaytarget *dt,
+@@ -258,6 +343,49 @@ gdi_sw_displaytarget_display(struct sw_winsys *_winsys,
+     struct gdi_sw_winsys *winsys = gdi_sw_winsys(_winsys);
+     HDC hDC = winsys->acquire_hdc(context_private);
+ 
++#if defined(_WIN32)
++    if (gdi_async_present_enabled()) {
++       struct gdi_sw_displaytarget *gdt = gdi_sw_displaytarget(dt);
++       HWND hwnd = hDC ? WindowFromDC(hDC) : NULL;
++
++       if (hwnd) {
++          call_once(&gdi_ap_once, gdi_async_present_init);
++
++          if (gdi_ap.thread_ok) {
++             mtx_lock(&gdi_ap.lock);
++             if (gdi_ap.pending) {
++                mtx_unlock(&gdi_ap.lock);
++                winsys->release_hdc(context_private, hDC);
++                return;
++             }
++
++             if (gdt->size > gdi_ap.buf_size) {
++                uint8_t *pixels = (uint8_t *)align_malloc(gdt->size, 64);
++                if (pixels) {
++                   align_free(gdi_ap.pixels);
++                   gdi_ap.pixels = pixels;
++                   gdi_ap.buf_size = gdt->size;
++                }
++             }
++
++             if (gdi_ap.buf_size >= gdt->size) {
++                memcpy(gdi_ap.pixels, gdt->data, gdt->size);
++                gdi_ap.width = gdt->width;
++                gdi_ap.height = gdt->height;
++                gdi_ap.bmi = gdt->bmi;
++                gdi_ap.hwnd = hwnd;
++                gdi_ap.pending = true;
++                cnd_signal(&gdi_ap.cv);
++                mtx_unlock(&gdi_ap.lock);
++                winsys->release_hdc(context_private, hDC);
++                return;
++             }
++             mtx_unlock(&gdi_ap.lock);
++          }
++       }
++    }
++#endif
++
+     gdi_sw_display(_winsys, dt, hDC);
+     winsys->release_hdc(context_private, hDC);
+ }
+diff --git a/src/mesa/main/shaderapi.c b/src/mesa/main/shaderapi.c
+index eabd224..2052fc1 100644
+--- a/src/mesa/main/shaderapi.c
++++ b/src/mesa/main/shaderapi.c
+@@ -2176,6 +2176,155 @@ shader_source(struct gl_context *ctx, GLuint shaderObj, GLsizei count,
+    blake3_hash original_blake3;
+    _mesa_blake3_compute(source, strlen(source), original_blake3);
+ 
++   const char *ostriv_tree_hack = os_get_option("MESA_OSTRIV_TREE_SHADER_HACK");
++   if (ostriv_tree_hack && ostriv_tree_hack[0] == '1' &&
++       sh->Stage == MESA_SHADER_VERTEX &&
++       strstr(source, "in_bFruitsHarvested") &&
++       strstr(source, "flat out int v_bFruitsHarvested")) {
++      const char *decl_old = "flat out int v_bFruitsHarvested;";
++      const char *decl_new = "out float v_fFruitsHarvested;";
++      const char *assign_old = "v_bFruitsHarvested = in_bFruitsHarvested;";
++      const char *assign_new = "v_fFruitsHarvested = float(in_bFruitsHarvested);";
++      char *decl = strstr(source, decl_old);
++      char *assign = strstr(source, assign_old);
++      if (decl && assign) {
++         size_t source_len = strlen(source);
++         size_t new_len = source_len - strlen(decl_old) - strlen(assign_old) +
++                          strlen(decl_new) + strlen(assign_new) + 1;
++         GLcharARB *new_source = malloc(new_len);
++         if (new_source) {
++            char *dst = new_source;
++            char *first = decl < assign ? decl : assign;
++            char *second = decl < assign ? assign : decl;
++            const char *first_old = decl < assign ? decl_old : assign_old;
++            const char *first_new = decl < assign ? decl_new : assign_new;
++            const char *second_old = decl < assign ? assign_old : decl_old;
++            const char *second_new = decl < assign ? assign_new : decl_new;
++
++            size_t n = first - source;
++            memcpy(dst, source, n);
++            dst += n;
++            memcpy(dst, first_new, strlen(first_new));
++            dst += strlen(first_new);
++
++            char *mid = first + strlen(first_old);
++            n = second - mid;
++            memcpy(dst, mid, n);
++            dst += n;
++            memcpy(dst, second_new, strlen(second_new));
++            dst += strlen(second_new);
++
++            char *tail = second + strlen(second_old);
++            strcpy(dst, tail);
++            free(source);
++            source = new_source;
++         }
++      }
++   }
++
++   if (ostriv_tree_hack && ostriv_tree_hack[0] == '1' &&
++       sh->Stage == MESA_SHADER_FRAGMENT &&
++       strstr(source, "v_bFruitsHarvested") &&
++       strstr(source, "u_iTextureSnowmap") &&
++       strstr(source, "u_flOpacity")) {
++      static const char direct_texture_replacement[] =
++            "#version 430 core\n"
++            "layout(location = 0) out vec4 outColor;\n"
++            "in vec3 backColor;\n"
++            "in vec2 v_vTexCoord;\n"
++            "in vec2 v_vTexCoordSnow;\n"
++            "in vec4 shadowCoord;\n"
++            "in vec4 shadowCoord_low;\n"
++            "in float fogFactor;\n"
++            "in float v_flSnowAmt;\n"
++            "in float v_flHue;\n"
++            "in vec3 v_vLightDir;\n"
++            "in float v_flHeightAboveGround;\n"
++            "in float v_flHeight;\n"
++            "in float v_fFruitsHarvested;\n"
++            "uniform sampler2DArray u_iTextureArray;\n"
++            "uniform sampler2D u_iTextureSnow;\n"
++            "uniform sampler2D u_iTextureSnowmap;\n"
++            "uniform sampler2DShadow ShadowMap;\n"
++            "uniform sampler2DShadow ShadowMap_low;\n"
++            "uniform int u_iLod;\n"
++            "uniform float u_flOpacity;\n"
++            "uniform float u_flBlossomAmount;\n"
++            "uniform float u_flLeavesAmt;\n"
++            "uniform float u_flYellowAmt;\n"
++            "uniform float u_flFruitsAmount;\n"
++            "uniform int u_iEvergreen;\n"
++            "uniform float u_flSnowAmt;\n"
++            "uniform int u_iUseNormalMap;\n"
++            "const float smoothing = 1.0 / 256.0;\n"
++            "void main() {\n"
++            "   vec4 base = texture(u_iTextureArray, vec3(v_vTexCoord, 0));\n"
++            "   vec4 green = texture(u_iTextureArray, vec3(v_vTexCoord, 1));\n"
++            "   vec4 yellow = texture(u_iTextureArray, vec3(v_vTexCoord, 2));\n"
++            "   float leaf_amt = u_iEvergreen == 0 ? smoothstep(0.05, 0.8, u_flLeavesAmt) : 1.0;\n"
++            "   float leaf_alpha = green.a * leaf_amt;\n"
++            "   float scattering = 0.0;\n"
++            "   if (u_iEvergreen == 0 && v_fFruitsHarvested < 0.5) {\n"
++            "      vec4 dist = texture(u_iTextureArray, vec3(v_vTexCoord, 5));\n"
++            "      float time_amt = min(1.0, dist.b + v_flHue * 6.0);\n"
++            "      float leaf_gate = u_flLeavesAmt;\n"
++            "      if (u_flYellowAmt > -0.2)\n"
++            "         leaf_gate = 1.0 - smoothstep(u_flLeavesAmt - 0.12, u_flLeavesAmt + 0.12, time_amt);\n"
++            "      float shaped_alpha = smoothstep(0.5 - smoothing, 0.5 + smoothing, dist.r * leaf_gate) * green.a;\n"
++            "      leaf_alpha = max(shaped_alpha, leaf_alpha * 0.45);\n"
++            "      scattering = max(0.0, dist.g * leaf_alpha);\n"
++            "   }\n"
++            "   vec3 leaf_rgb = mix(green.rgb, yellow.rgb, clamp(u_flYellowAmt, 0.0, 1.0));\n"
++            "   vec3 rgb = mix(base.rgb, leaf_rgb + vec3(v_flHue, v_flHue, 0.0), clamp(leaf_alpha, 0.0, 1.0));\n"
++            "   float alpha = max(base.a, leaf_alpha);\n"
++            "   if (u_iLod == 1)\n"
++            "      alpha = max(alpha, base.a * 0.5);\n"
++            "   if (u_iEvergreen == 0 && v_fFruitsHarvested < 0.5) {\n"
++            "      vec4 blossom = texture(u_iTextureArray, vec3(v_vTexCoord, 3));\n"
++            "      float blossom_alpha = smoothstep(0.5 - smoothing, 0.5 + smoothing, 3.0 * blossom.a * u_flBlossomAmount);\n"
++            "      rgb = mix(rgb, blossom.rgb, blossom_alpha);\n"
++            "      alpha = max(alpha, blossom_alpha * 0.97);\n"
++            "      if (u_iLod == 0) {\n"
++            "         vec4 fruits = texture(u_iTextureArray, vec3(v_vTexCoord, 4));\n"
++            "         float fruits_alpha = smoothstep(0.5 - smoothing, 0.5 + smoothing, 3.0 * fruits.a * u_flFruitsAmount);\n"
++            "         rgb = mix(rgb, fruits.rgb, fruits_alpha);\n"
++            "         alpha = max(alpha, fruits_alpha * 0.95);\n"
++            "      }\n"
++            "   }\n"
++            "   if (u_iLod == 0 && u_iEvergreen == 0 && v_flSnowAmt > 0.0) {\n"
++            "      vec4 snow = texture(u_iTextureSnow, v_vTexCoordSnow);\n"
++            "      rgb = mix(rgb, snow.rgb, smoothstep(1.0, 1.5, v_flSnowAmt + snow.a));\n"
++            "   } else if (u_iEvergreen == 1 && u_flSnowAmt > 0.0) {\n"
++            "      vec4 snow = texture(u_iTextureSnow, v_vTexCoord);\n"
++            "      float snow_amt = smoothstep(1.0, 1.5, u_flSnowAmt + snow.a);\n"
++            "      if (u_iLod == 0)\n"
++            "         snow_amt *= texture(u_iTextureSnowmap, v_vTexCoord).r;\n"
++            "      rgb = mix(rgb, snow.rgb, snow_amt);\n"
++            "   }\n"
++            "   vec3 normal_rgb = u_iUseNormalMap == 1 ? texture(u_iTextureArray, vec3(v_vTexCoord, 6)).rgb : vec3(0.5, 0.5, 1.0);\n"
++            "   float shadow = u_iLod == 1 ? textureProj(ShadowMap_low, shadowCoord_low) : textureProj(ShadowMap, shadowCoord);\n"
++            "   shadow = clamp(shadow, 0.35, 1.0);\n"
++            "   float diffuse = max(0.0, dot(normalize(normal_rgb * 2.0 - 1.0), normalize(v_vLightDir)));\n"
++            "   rgb *= mix(vec3(0.62, 0.66, 0.60), vec3(1.0), diffuse * shadow * 0.7);\n"
++            "   float ground_ao = smoothstep(-5.0, 5.0, v_flHeight - v_flHeightAboveGround);\n"
++            "   rgb *= mix(0.78, 1.0, ground_ao);\n"
++            "   if (u_iEvergreen == 0)\n"
++            "      rgb += backColor * rgb * 0.35 * scattering;\n"
++            "   rgb = mix(vec3(209.0 / 255.0, 236.0 / 255.0, 255.0 / 255.0), rgb, fogFactor);\n"
++            "   float out_alpha = clamp(alpha * max(u_flOpacity, 0.0), 0.0, 1.0);\n"
++            "   if (out_alpha < 0.03)\n"
++            "      discard;\n"
++            "   outColor = vec4(rgb, out_alpha);\n"
++            "}\n";
++      GLcharARB *new_source = malloc(sizeof(direct_texture_replacement));
++      if (new_source) {
++         memcpy(new_source, direct_texture_replacement,
++                sizeof(direct_texture_replacement));
++         free(source);
++         source = new_source;
++      }
++   }
++
+ #ifdef ENABLE_SHADER_CACHE
+    GLcharARB *replacement;
  
