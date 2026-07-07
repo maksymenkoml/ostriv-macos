@@ -1,118 +1,66 @@
-# Ostriv on macOS (Apple Silicon) — GPU-accelerated, fullscreen
+# Ostriv on Mac (Apple Silicon)
 
-Run **[Ostriv](https://store.steampowered.com/app/773790/Ostriv/)** on an Apple Silicon Mac
-(M1–M5) under **CrossOver / Wine** — **GPU-accelerated, fullscreen, smooth**.
+[Ostriv](https://store.steampowered.com/app/773790/Ostriv/) crashes on launch under
+CrossOver. This project fixes it.
 
-> **Why this is needed:** Ostriv requires **OpenGL 4.3**. Apple's OpenGL is permanently frozen at
-> **4.1**, so the game crashes on launch under stock Wine/CrossOver. This project routes the game's
-> OpenGL through **Mesa's D3D12 driver → Apple's D3DMetal → Metal**, reaching GL 4.3 on the GPU, and
-> fixes the two follow-on bugs (a multisampling crash and an invisible window). A small **Mesa
-> source patch** then makes fullscreen actually fast (~7 fps → **locked 30–60**).
+## How to play
 
-Tested on **Apple M5 Max**, macOS, **CrossOver 26.2**, Ostriv **Alpha 5 patch 9 (0.5.9.58)**.
+You need: an Apple Silicon Mac, [CrossOver](https://www.codeweavers.com/crossover),
+and Ostriv installed via Steam inside a CrossOver bottle.
 
----
+Open Terminal and run:
 
-## Quick start
-
-**Requirements**
-- Apple Silicon Mac
-- [CrossOver](https://www.codeweavers.com/crossover) (paid; 14-day trial works)
-- Ostriv installed via Steam inside a CrossOver bottle
-
-**Install**
 ```bash
-git clone https://github.com/<you>/ostriv-macos
+git clone https://github.com/maksymenkoml/ostriv-macos
 cd ostriv-macos
 python3 patch.py
 ```
-`patch.py` auto-detects your Ostriv bottle, installs the Mesa driver, and configures everything
-(Python 3, stdlib only — no dependencies). It's interactive; you can also pass the game dir directly:
-`python3 patch.py "/path/to/…/steamapps/common/Ostriv"`. Then:
 
-1. **Fully quit CrossOver and reopen it.** *(required once, to load the new bottle settings)*
-2. Start **Steam** inside the bottle (it just needs to be running, for the Steam API).
-3. **Launch the game via CrossOver "Run Command"** with the **quoted** exe path — quotes are
-   required because the path has spaces:
-   `"C:\Program Files (x86)\Steam\steamapps\common\Ostriv\ostriv.exe"` (or save it as a launcher).
-   Use *this*, not Steam's **Play** button — the Play button injects the Steam overlay, which
-   conflicts with the Mesa driver and crashes the game at startup. Launching via CrossOver keeps the
-   Steam client running in the background, so achievements/cloud saves still work.
+Choose **Install** and follow the instructions. Then:
 
-`patch.py` installs a `settings.data` with **multisampling off + borderless fullscreen** for fresh
-installs, so there's no manual settings step. *(If you already had a `settings.data`, it just flips
-multisampling off in place.)*
+1. Quit CrossOver (⌘Q) and reopen it — once.
+2. Double-click **Ostriv (patched)** in `~/Applications/CrossOver`.
 
-That's it — the game runs GPU-accelerated and fullscreen. To undo, re-run `python3 patch.py` and
-choose **Restore**.
+⚠️ Don't launch through Steam's **Play** button — the Steam overlay crashes the game.
 
----
+To uninstall the fix: re-run `python3 patch.py` → **Restore**.
 
-## What `patch.py` does
+## If something goes wrong
 
-| Step | Detail |
-|---|---|
-| Mesa driver | Copies `opengl32.dll`, `libgallium_wgl.dll`, `dxil.dll`, `libwinpthread-1.dll` next to `ostriv.exe` |
-| DLL override | `HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides` → `opengl32=native` (scoped to Ostriv only — a *global* override breaks Steam) |
-| Bottle env | `GALLIUM_DRIVER=d3d12`, `wgl_require_gdi_compat=true`, `MESA_D3D12_ASYNC_PRESENT=1`, `MESA_OSTRIV_TREE_SHADER_HACK=1`, `MESA_GL_VERSION_OVERRIDE=4.3`, `MESA_GLSL_VERSION_OVERRIDE=430` |
-| Steam app id | Writes `steam_appid.txt` (773790) next to `ostriv.exe` — **not** a bottle-wide `SteamAppId` env, which would make `steam.exe` itself think it's the game and crash Steam's browser |
-| Settings | Installs a `settings.data` (multisampling off + borderless fullscreen) on fresh installs, or flips multisampling off in an existing one |
+- **Crash at startup** → re-run `python3 patch.py` and choose **Reinstall**.
+- **Game window is tiny on a big screen** → fully quit CrossOver and reopen it.
+- **Game closes ~2 seconds after launch** → you used Steam's Play button; use the
+  **Ostriv (patched)** launcher.
+- **Very low FPS (~10)** → you launched manually with a non-sRGB display profile; use the
+  launcher, it sets the right profile automatically.
+- Still stuck? Attach this file to a bug report:
+  `<bottle>/drive_c/users/crossover/Saved Games/Ostriv/log.txt`
 
-Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoes it all. See
-**[docs/technical.md](docs/technical.md)** for the full explanation of every bug and fix.
+## What it does (short version)
 
----
+Ostriv needs OpenGL 4.3; Macs only have 4.1, so the game can't start. The patcher installs
+a custom graphics driver (Mesa, routed to Apple's Metal via CrossOver) next to the game,
+tweaks a few CrossOver settings, and creates the **Ostriv (patched)** launcher. It also
+preconfigures the game's graphics settings: multisampling off (it crashes the game on Mac)
+and borderless fullscreen on. Game files are not modified; everything is undoable with
+**Restore**.
 
-## Two things that trip people up
+## Under the hood
 
-- **Multisampling must be OFF.** With MSAA on, Ostriv calls `wglChoosePixelFormatARB`, which makes
-  Mesa recursively create a second window — an operation winemac can't do — and the game crashes at
-  startup (`windows_createWindow FAILED 0`). MSAA off avoids that path entirely; the game looks
-  virtually identical.
-- **If the game ever renders tiny (e.g. 1024×768) on a big screen:** winemac's display state got
-  confused (usually after changing your Mac's resolution). **Fully quit CrossOver and reopen it** —
-  do *not* use display-resolution tools to force fullscreen, they corrupt winemac's state.
-- **If Play launches the game but it closes after ~2 seconds** (Steam shows it "running" briefly):
-  the **Steam in-game overlay** conflicts with the custom Mesa `opengl32` and crashes it at startup.
-  Fix: Steam → **Library → right-click Ostriv → Properties → General → uncheck "Enable the Steam
-  Overlay while in-game"**, then Play. (Launching directly via CrossOver "Run Command" with the quoted `ostriv.exe` path
-  also works — the overlay only injects on a Steam-Play launch.)
-- **If Steam's Play button does nothing / Steam keeps crashing** (`crash_steam.exe` dumps, the
-  browser UI restarting): that's a Steam-under-Wine issue, not the patch. Quit Steam, delete these
-  folders in the bottle, and relaunch Steam: `…/Steam/appcache/httpcache`,
-  `…/AppData/Local/Steam/htmlcache`, and any `GPUCache`. (A bottle-wide `SteamAppId` env var also
-  causes this — `patch.py` deliberately avoids it, using a game-scoped `steam_appid.txt` instead.)
+Full write-up of every bug and fix — GL 4.3 via Mesa's D3D12 driver, the MSAA startup
+crash, the invisible-window present path, the async-present FPS patch, the tree-shader
+workaround, and the macOS color-profile bottleneck: **[docs/technical.md](docs/technical.md)**.
+That doc also covers rebuilding the patched driver from source instead of using the
+prebuilt DLLs.
 
-## Performance / fullscreen
-
-- Fullscreen is the game's own **`bFullscreenBorderlessWindow`** setting (borderless, no Wine
-  virtual desktop). It fills your screen at the display's current resolution.
-- The prebuilt driver includes an **async-present patch**: it pushes finished GPU frames to the
-  window on a worker thread and drops frames instead of stalling, so full-resolution fullscreen
-  stays fluid. Disable with `MESA_D3D12_ASYNC_PRESENT=0` if you ever want stock behavior.
-- It also includes an **Ostriv tree shader workaround**, enabled by
-  `MESA_OSTRIV_TREE_SHADER_HACK=1`, for Mesa/d3d12's broken handling of the game's tree shader.
-- Want more FPS headroom? Lower your **macOS display resolution** (System Settings → Displays) before
-  launching, or raise Ostriv's in-game **FPS limit**.
-
-## Building the driver yourself
-
-The prebuilt DLLs in [`prebuilt/`](prebuilt/) are ready to use. To rebuild from source:
-
-```bash
-./scripts/build-driver.sh   # clones Mesa 26.1.3, applies the patch, cross-compiles with mingw
-```
-The patch is [`patches/mesa-26.1.3-winemac-async-present.patch`](patches/) — three files:
-`gdi_sw_winsys.c` (async final GDI upload), `stw_pixelformat.c` (default
-`wgl_require_gdi_compat` on + suppress MSAA formats), and `shaderapi.c` (Ostriv tree shader
-workaround).
+Tested: Apple M5 Max · CrossOver 26.2 · Ostriv 0.5.9.58.
 
 ## Credits & license
 
-- OpenGL implementation: **[Mesa 3D](https://www.mesa3d.org/)** (MIT) — `d3d12` driver by Microsoft,
-  base Windows build by [pal1000/mesa-dist-win](https://github.com/pal1000/mesa-dist-win).
-- D3D→Metal translation: **D3DMetal** (Apple Game Porting Toolkit, shipped in CrossOver).
-- The winemac async-present patch in this repo is MIT, matching Mesa.
+- [Mesa 3D](https://www.mesa3d.org/) (MIT) — `d3d12` driver by Microsoft; base Windows build
+  by [pal1000/mesa-dist-win](https://github.com/pal1000/mesa-dist-win).
+- D3DMetal (Apple Game Porting Toolkit, shipped with CrossOver).
+- The Mesa patch in this repo is MIT, matching Mesa.
 
-This project is unaffiliated with Ostriv's developer (Yevheniy Grebenyuk). Buy the game on
+Unaffiliated with Ostriv's developer (Yevheniy Grebenyuk). Buy the game on
 [Steam](https://store.steampowered.com/app/773790/Ostriv/).
