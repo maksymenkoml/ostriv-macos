@@ -54,7 +54,7 @@ choose **Restore**.
 |---|---|
 | Mesa driver | Copies `opengl32.dll`, `libgallium_wgl.dll`, `dxil.dll`, `libwinpthread-1.dll` next to `ostriv.exe` |
 | DLL override | `HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides` → `opengl32=native` (scoped to Ostriv only — a *global* override breaks Steam) |
-| Bottle env | `GALLIUM_DRIVER=d3d12`, `wgl_require_gdi_compat=true`, `MESA_D3D12_ASYNC_PRESENT=1`, `MESA_GL_VERSION_OVERRIDE=4.3`, `MESA_GLSL_VERSION_OVERRIDE=430` |
+| Bottle env | `GALLIUM_DRIVER=d3d12`, `wgl_require_gdi_compat=true`, `MESA_D3D12_ASYNC_PRESENT=1`, `MESA_OSTRIV_TREE_SHADER_HACK=1`, `MESA_GL_VERSION_OVERRIDE=4.3`, `MESA_GLSL_VERSION_OVERRIDE=430` |
 | Steam app id | Writes `steam_appid.txt` (773790) next to `ostriv.exe` — **not** a bottle-wide `SteamAppId` env, which would make `steam.exe` itself think it's the game and crash Steam's browser |
 | Settings | Installs a `settings.data` (multisampling off + borderless fullscreen) on fresh installs, or flips multisampling off in an existing one |
 
@@ -90,6 +90,8 @@ Nothing is overwritten without a `.bak` backup, and **Restore** (option 2) undoe
 - The prebuilt driver includes an **async-present patch**: it pushes finished GPU frames to the
   window on a worker thread and drops frames instead of stalling, so full-resolution fullscreen
   stays fluid. Disable with `MESA_D3D12_ASYNC_PRESENT=0` if you ever want stock behavior.
+- It also includes an **Ostriv tree shader workaround**, enabled by
+  `MESA_OSTRIV_TREE_SHADER_HACK=1`, for Mesa/d3d12's broken handling of the game's tree shader.
 - Want more FPS headroom? Lower your **macOS display resolution** (System Settings → Displays) before
   launching, or raise Ostriv's in-game **FPS limit**.
 
@@ -100,9 +102,10 @@ The prebuilt DLLs in [`prebuilt/`](prebuilt/) are ready to use. To rebuild from 
 ```bash
 ./scripts/build-driver.sh   # clones Mesa 26.1.3, applies the patch, cross-compiles with mingw
 ```
-The patch is [`patches/mesa-26.1.3-winemac-async-present.patch`](patches/) — two files:
-`d3d12_screen.cpp` (async GDI present) and `stw_pixelformat.c` (default `wgl_require_gdi_compat`
-on + suppress MSAA formats).
+The patch is [`patches/mesa-26.1.3-winemac-async-present.patch`](patches/) — three files:
+`gdi_sw_winsys.c` (async final GDI upload), `stw_pixelformat.c` (default
+`wgl_require_gdi_compat` on + suppress MSAA formats), and `shaderapi.c` (Ostriv tree shader
+workaround).
 
 ## Credits & license
 

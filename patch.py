@@ -65,6 +65,7 @@ BOTTLE_ENV = {
     "GALLIUM_DRIVER": "d3d12",
     "wgl_require_gdi_compat": "true",
     "MESA_D3D12_ASYNC_PRESENT": "1",
+    "MESA_OSTRIV_TREE_SHADER_HACK": "1",
     "MESA_GL_VERSION_OVERRIDE": "4.3",
     "MESA_GLSL_VERSION_OVERRIDE": "430",
 }

@@ -52,6 +52,7 @@ to `ostriv.exe` only.
 "GALLIUM_DRIVER" = "d3d12"
 "wgl_require_gdi_compat" = "true"
 "MESA_D3D12_ASYNC_PRESENT" = "1"
+"MESA_OSTRIV_TREE_SHADER_HACK" = "1"
 "MESA_GL_VERSION_OVERRIDE" = "4.3"
 "MESA_GLSL_VERSION_OVERRIDE" = "430"
 ```
@@ -129,10 +130,11 @@ Measured bottleneck chain (GALLIUM_HUD=fps + feel):
 Working performance config (on top of the recipe above):
 - `"mesa_glthread" = "true"` (safe — the old crash was MSAA, not glthread)
 - game `max fps` = 30 (ostriv_settings) — stops glthread queueing ahead of the screen
-- **window size = the FPS dial**: per-app virtual desktop caps it reliably:
-  `HKCU\Software\Wine\Explorer\Desktops`  `Ostriv=1920x1080`
-  `HKCU\Software\Wine\AppDefaults\ostriv.exe\Explorer`  `Desktop=Ostriv`
-  (smaller = smoother; 1504x846 for extra headroom)
+- ~~**window size = the FPS dial**: per-app virtual desktop caps it reliably~~
+  **SUPERSEDED — do not use.** The virtual-desktop trick (`HKCU\Software\Wine\Explorer\Desktops`
+  `Ostriv=1920x1080` + `AppDefaults\ostriv.exe\Explorer` `Desktop=Ostriv`) predates the
+  async-present driver patch and **corrupts winemac's display state** (see the Fullscreen section
+  below). With the patched driver, fullscreen at native resolution is fluid without it.
 - Optional HUD: `"GALLIUM_HUD" = "fps"` (drawn into the frame, works on this path)
 - Fullscreen feel: macOS display → 1920×1080 scaled mode (GPU upscale) + game Fullscreen ON
   inside the virtual desktop; or the desktop window's native macOS full-screen if it stretches.
