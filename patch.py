@@ -27,6 +27,8 @@ except ImportError:  # non-POSIX; select() falls back to numbered input
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PREBUILT = os.path.join(SCRIPT_DIR, "prebuilt")
 DRIVER_DLLS = ["opengl32.dll", "libgallium_wgl.dll", "dxil.dll", "libwinpthread-1.dll"]
+# Diagnostic logs the patched driver writes next to ostriv.exe (removed on restore).
+DIAGNOSTIC_LOGS = ["mesa_ostriv_hack_log.txt", "mesa_ostriv_pso_log.txt"]
 
 BOTTLES_ROOT = os.path.expanduser("~/Library/Application Support/CrossOver/Bottles")
 
@@ -130,6 +132,15 @@ BOTTLE_ENV = {
     "wgl_require_gdi_compat": "true",
     "MESA_D3D12_ASYNC_PRESENT": "1",
     "MESA_OSTRIV_TREE_SHADER_HACK": "1",
+    # Reeds/grass/terrain invisible: D3DMetal no-ops GS-less pipelines whose DXIL
+    # has flat inputs — see docs/technical.md "Reeds never render". The hack
+    # rewrites the game's flat int varyings to floats; DISABLE_IO_OPT stops Mesa's
+    # varying optimizer from re-introducing flat inputs (a global opt-out, but the
+    # lost varying packing is negligible for this game's ~27 small programs).
+    # NB: MESA_OSTRIV_* toggles take literally "1"/"0"; DISABLE_IO_OPT is a stock
+    # Mesa boolean and takes "true".
+    "MESA_OSTRIV_FLAT_VARYING_HACK": "1",
+    "MESA_GLSL_DISABLE_IO_OPT": "true",
     "MESA_GL_VERSION_OVERRIDE": "4.3",
     "MESA_GLSL_VERSION_OVERRIDE": "430",
 }
@@ -748,6 +759,13 @@ def restore(game_dir, bottle):
     if os.path.isfile(appid):
         os.remove(appid)
         print(f"  {green('OK')}    removed steam_appid.txt")
+
+    # 2a. diagnostic logs the patched driver writes next to ostriv.exe
+    for log_name in DIAGNOSTIC_LOGS:
+        log_path = os.path.join(game_dir, log_name)
+        if os.path.isfile(log_path):
+            os.remove(log_path)
+            print(f"  {green('OK')}    removed {log_name}")
 
     # 2b. the generated launcher (menu entry + app + script)
     had_launcher = os.path.isdir(PLAY_LAUNCHER)

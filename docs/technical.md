@@ -27,9 +27,15 @@ Tested: Apple M5 Max · macOS · CrossOver 26.2 · Ostriv 0.5.9.58 (Steam).
    "wgl_require_gdi_compat" = "true"
    "MESA_D3D12_ASYNC_PRESENT" = "1"
    "MESA_OSTRIV_TREE_SHADER_HACK" = "1"
+   "MESA_OSTRIV_FLAT_VARYING_HACK" = "1"
+   "MESA_GLSL_DISABLE_IO_OPT" = "true"
    "MESA_GL_VERSION_OVERRIDE" = "4.3"
    "MESA_GLSL_VERSION_OVERRIDE" = "430"
    ```
+
+   The `MESA_OSTRIV_*` hack toggles take literally `1`/`0` only (the driver checks the
+   first character against `'1'`) — setting one to `true` silently disables it;
+   `MESA_GLSL_DISABLE_IO_OPT` is a stock Mesa boolean and accepts `true`.
 
    `wgl_require_gdi_compat=true` is the visibility fix: it forces Mesa off the DXGI
    swapchain onto the GDI present path (`flush_frontbuffer` → CPU readback →
@@ -59,9 +65,50 @@ Software fallback if the GPU path breaks: `GALLIUM_DRIVER=llvmpipe` (visible, sl
   (broken flat integer varying). The patch rewrites the matched shader at `glShaderSource`:
   float varying in the VS, and a conservative direct texture-array FS that keeps leaves,
   blossom, fruit, snow, fog, lighting, opacity. Toggle: `MESA_OSTRIV_TREE_SHADER_HACK=0`.
+- **`shaderapi.c` — flat-varying workaround (reeds/grass/terrain).** See
+  [the D3DMetal flat-input bug](#reeds-never-render-the-d3dmetal-flat-input-bug) below.
+  Rewrites `flat int` varyings (`v_iSkip`, `v_iPatchType`) to plain floats at
+  `glShaderSource`, with length-preserving in-place substitutions. Toggle:
+  `MESA_OSTRIV_FLAT_VARYING_HACK=0`. Every fired hack (this one and the tree one) appends a
+  line to `mesa_ostriv_hack_log.txt` next to `ostriv.exe`.
+- **`d3d12_pipeline_state.cpp` — PSO attribution log.** With `MESA_OSTRIV_PSO_LOG=1` the
+  driver writes `mesa_ostriv_pso_log.txt` (next to `ostriv.exe`) listing every graphics PSO
+  in creation order with the GLSL program names of its stages — this is how a D3DMetal
+  `marking PSO(N) as no-op` error is attributed to a specific game shader. Off by default.
 
 Rebuild: `scripts/build-driver.sh` (mingw-w64, meson, ninja, bison ≥ 3, python-mako).
 Mesa version is pinned to 26.1.3 — the patch hunks assume it.
+
+## Reeds never render: the D3DMetal flat-input bug
+
+**Symptom:** reeds (the thatchery's resource, drawn by `createPlantsProgram`) never appear;
+grass tufts (`createGrassProgram`) are missing too, less visibly. Nothing in the game log —
+every `glLinkProgram` reports success.
+
+**Root cause:** D3DMetal (CrossOver's GPTK D3D12→Metal layer) fails to convert the Metal
+fragment function of any **GS-less** pipeline whose DXIL has a **flat-interpolated input**
+(int or float), logs `Failed to compile fragment function … marking PSO(N) as no-op` on
+stderr, and silently draws nothing for those pipelines. Pipelines that get one of Mesa's
+auto-inserted geometry-shader variants (`GS=edgeflags`) compile fine — which is why terrain,
+which also has a flat varying, still mostly rendered while plants/grass did not.
+
+Ostriv feeds three programs flat **int** varyings from per-instance data: `v_iSkip` in the
+plants and grass shaders (the FS discards on it) and `v_iPatchType` in the terrain shader.
+Two more programs (minimap/world-map, UI-rect) pick up flat inputs **at compile time**: Mesa's
+varying optimizer (`nir_opt_varyings`) promotes convergent smooth varyings to flat.
+
+**Fix (two parts, both installed by patch.py):**
+
+1. `MESA_OSTRIV_FLAT_VARYING_HACK=1` — the driver rewrites the game's flat int varyings to
+   plain floats at `glShaderSource` (safe: they are per-instance constants, so interpolation
+   reproduces them exactly; int→float assignments compile via GLSL implicit conversion).
+   Comparisons are rewritten length-preserving: `v_iSkip == 1` → `v_iSkip > 0.5`,
+   `v_iPatchType == 0` → `v_iPatchType < 0.5`.
+2. Bottle env `MESA_GLSL_DISABLE_IO_OPT=true` — upstream Mesa escape hatch that skips
+   `nir_opt_varyings`, so no *new* flat inputs are invented for shaders that had none.
+
+Verified: with both in place the startup goes from **14 failed PSOs to 0** (plants ×~5,
+grass ×~4 before part 1; terrain ×3 + minimap ×2 before part 2).
 
 ## Display color profile (the ~10 fps ColorSync ceiling)
 
@@ -123,6 +170,19 @@ Hard-won implementation facts:
 - The game process is named **`Menu Helper`**, not `ostriv.exe`.
 - Optional FPS HUD: bottle env `"GALLIUM_HUD" = "fps"` (drawn into the frame).
 - `mesa_glthread=true` is safe and helps draw-call-heavy towns.
+- **Capturing driver stderr** (Mesa messages, D3DMetal `PSO no-op` errors): the launcher's
+  `wine … --start` path drops the PE side's std handles — Mesa's `fprintf(stderr)` output
+  vanishes (only mac-side D3DMetal lines survive). Run the game exe **directly** instead
+  (`wine --bottle <b> --workdir "C:/…/Ostriv" "C:/…/ostriv.exe" 2>file`); the game
+  self-exits at the menu without the launcher app context, but every shader has already
+  been compiled by then, which is exactly what a shader-diagnosis run needs.
+- `MESA_GLSL=dump` prints final **NIR** (with `name: GLSL<prog-id>` headers matching program
+  creation order in the game log) — the GLSL-source dump lines don't survive on this build.
+  `MESA_SHADER_DUMP_PATH`/`MESA_LOG_FILE` are compiled out of Windows builds entirely. The
+  game's GLSL sources are plain strings inside `ostriv.exe` (grep for a varying name).
+- `MESA_OSTRIV_PSO_LOG=1` + `mesa_ostriv_pso_log.txt` maps D3DMetal `PSO(N)` errors to game
+  shaders; `mesa_ostriv_hack_log.txt` confirms which shader hacks fired (both land next to
+  `ostriv.exe`).
 
 ## Dead ends (don't retry)
 

@@ -11,7 +11,7 @@ GL → D3D12 → Apple's D3DMetal → Metal, plus Wine/bottle config and a launc
 This is **configuration + a native driver swap**, NOT binary patching of the game (contrast with
 the sibling `cs2-macos-patcher`, which rewrites .NET IL).
 
-## The five fixes (all required together)
+## The six fixes (all required together)
 
 1. **GL 4.3** — Mesa DLLs next to `ostriv.exe`, `opengl32=native` scoped to `ostriv.exe`, bottle
    env `GALLIUM_DRIVER=d3d12` + `wgl_require_gdi_compat=true` (+ `MESA_D3D12_ASYNC_PRESENT=1`,
@@ -26,7 +26,14 @@ the sibling `cs2-macos-patcher`, which rewrites .NET IL).
    `MESA_D3D12_ASYNC_PRESENT=0`.
 4. **Trees** — Mesa/d3d12 breaks Ostriv's tree shader (flat int varying). The patch rewrites it at
    `glShaderSource` (`shaderapi.c`). Toggle: `MESA_OSTRIV_TREE_SHADER_HACK=0`.
-5. **Display color profile** — any non-sRGB profile makes CoreAnimation colorspace-convert every
+5. **Reeds/grass/terrain (flat inputs)** — D3DMetal fails to compile the Metal fragment function
+   of any GS-less pipeline whose DXIL has a flat input → `PSO no-op` → the geometry silently never
+   draws. Two-part fix: the patch rewrites Ostriv's `flat int` varyings (`v_iSkip`,
+   `v_iPatchType`) to floats (`MESA_OSTRIV_FLAT_VARYING_HACK=1`), and bottle env
+   `MESA_GLSL_DISABLE_IO_OPT=true` stops Mesa's varying optimizer from promoting convergent
+   smooth varyings to flat (minimap/UI). Diagnostics: `MESA_OSTRIV_PSO_LOG=1` →
+   `mesa_ostriv_pso_log.txt`, and `mesa_ostriv_hack_log.txt` (both next to `ostriv.exe`).
+6. **Display color profile** — any non-sRGB profile makes CoreAnimation colorspace-convert every
    frame on the CPU (~10 fps cap regardless of driver). The generated launcher switches the display
    to sRGB while playing and restores after.
 
@@ -41,8 +48,8 @@ the sibling `cs2-macos-patcher`, which rewrites .NET IL).
   Interactive Install/Reinstall/Restore, or `python3 patch.py <game-dir>`. Idempotent.
 - `assets/settings.data` — known-good settings template (MSAA off, borderless fullscreen).
 - `scripts/build-driver.sh` — clones Mesa 26.1.3, applies the patch, cross-compiles with mingw.
-- `patches/mesa-26.1.3-winemac-async-present.patch` — the Mesa source patch (3 files, see fixes
-  2–4). Regenerate with `git diff` in the Mesa tree.
+- `patches/mesa-26.1.3-winemac-async-present.patch` — the Mesa source patch (4 files, see fixes
+  2–5). Regenerate with `git diff` in the Mesa tree.
 - `prebuilt/` — drop-in DLLs, tracked via **Git LFS**.
 - `docs/technical.md` — every bug, fix, and dead end in detail.
 
