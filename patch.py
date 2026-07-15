@@ -631,7 +631,41 @@ def materialize_launcher_app(bottle, command):
         info["CXHelperAppBottleTag"] = "CrossOver-%s/" % bid
     with open(plist_path, "wb") as f:
         plistlib.dump(info, f)
+    # The Menu Helper template ships no CrossOverHelper.icns (the plist already
+    # names it), so the app gets a generic blank tile. Borrow the game icon
+    # CrossOver itself extracted from ostriv.exe for its menu-synced launcher.
+    icns = find_game_icon(bottle)
+    if icns:
+        shutil.copy(icns, os.path.join(PLAY_LAUNCHER, "Contents", "Resources",
+                                       "CrossOverHelper.icns"))
     return True
+
+
+def find_game_icon(bottle):
+    """The .icns CrossOver extracted from ostriv.exe for its own menu-synced
+    'Ostriv' launcher app (created whenever Steam's desktop shortcut syncs).
+    Returns the icon path, or None if no such app exists in this bottle."""
+    if not os.path.isdir(CX_APPS_ROOT):
+        return None
+    folders = [CX_APPS_ROOT] + [e.path for e in os.scandir(CX_APPS_ROOT)
+                                if e.is_dir() and not e.name.endswith(".app")]
+    for folder in folders:
+        for e in os.scandir(folder):
+            if not (e.is_dir() and e.name.endswith(".app")) or e.path == PLAY_LAUNCHER:
+                continue
+            try:
+                with open(os.path.join(e.path, "Contents", "Info.plist"), "rb") as f:
+                    pl = plistlib.load(f)
+            except Exception:
+                continue
+            cmd = pl.get("CrossOverHelperCommand", "").rstrip('"').lower()
+            if pl.get("CXHelperAppBottleName") != bottle or \
+                    not (cmd.endswith("/ostriv.lnk") or cmd.endswith("/ostriv.url")):
+                continue
+            icns = os.path.join(e.path, "Contents", "Resources", "CrossOverHelper.icns")
+            if os.path.isfile(icns):
+                return icns
+    return None
 
 
 def remove_launcher(bottle):
