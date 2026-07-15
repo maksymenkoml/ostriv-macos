@@ -49,7 +49,8 @@ and borderless fullscreen on. Game files are not modified; everything is undoabl
 
 Full write-up of every bug and fix — GL 4.3 via Mesa's D3D12 driver, the MSAA startup
 crash, the invisible-window present path, the async-present FPS patch, the tree-shader
-workaround, and the macOS color-profile bottleneck: **[docs/technical.md](docs/technical.md)**.
+workaround, the invisible reeds/grass (D3DMetal flat-input PSO bug), and the macOS
+color-profile bottleneck: **[docs/technical.md](docs/technical.md)**.
 That doc also covers rebuilding the patched driver from source instead of using the
 prebuilt DLLs.
 

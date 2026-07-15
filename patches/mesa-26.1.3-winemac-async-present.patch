@@ -1,3 +1,49 @@
+diff --git a/src/gallium/drivers/d3d12/d3d12_pipeline_state.cpp b/src/gallium/drivers/d3d12/d3d12_pipeline_state.cpp
+index 7dab6a2..81d5dba 100644
+--- a/src/gallium/drivers/d3d12/d3d12_pipeline_state.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_pipeline_state.cpp
+@@ -39,6 +39,7 @@
+ 
+ #include "util/hash_table.h"
+ #include "util/set.h"
++#include "util/u_debug.h"
+ #include "util/u_memory.h"
+ #include "util/u_prim.h"
+ 
+@@ -407,6 +408,33 @@ create_gfx_pipeline_state(struct d3d12_context *ctx)
+ 
+    pso_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+ 
++   /* MESA_OSTRIV_PSO_LOG=1: log every graphics PSO in creation order with
++    * its stages' GLSL program names, to attribute D3DMetal's "marking
++    * PSO(N) as no-op" errors to a game shader (docs/technical.md
++    * "Diagnostics"). The file lands in the CWD (the game directory).
++    */
++   static const bool ostriv_pso_log_enabled =
++      debug_get_bool_option("MESA_OSTRIV_PSO_LOG", false);
++   if (ostriv_pso_log_enabled) {
++      static unsigned ostriv_pso_counter = 0;
++      static FILE *ostriv_pso_log_file = NULL;
++      if (!ostriv_pso_log_file)
++         ostriv_pso_log_file = fopen("mesa_ostriv_pso_log.txt", "w");
++      if (ostriv_pso_log_file) {
++         fprintf(ostriv_pso_log_file, "PSO(%u):", ostriv_pso_counter);
++         for (unsigned i = 0; i < ARRAY_SIZE(state->stages); i++) {
++            if (state->stages[i] && state->stages[i]->nir)
++               fprintf(ostriv_pso_log_file, " %s=%s",
++                       _mesa_shader_stage_to_abbrev(i),
++                       state->stages[i]->nir->info.name ?
++                          state->stages[i]->nir->info.name : "?");
++         }
++         fprintf(ostriv_pso_log_file, "\n");
++         fflush(ostriv_pso_log_file);
++      }
++      ostriv_pso_counter++;
++   }
++
+    ID3D12PipelineState *ret;
+ 
+    HRESULT hr;
 diff --git a/src/gallium/frontends/wgl/stw_pixelformat.c b/src/gallium/frontends/wgl/stw_pixelformat.c
 index 8b2647b..a9784ab 100644
 --- a/src/gallium/frontends/wgl/stw_pixelformat.c
@@ -193,10 +239,40 @@ index 3c43393..d8a64ee 100644
      winsys->release_hdc(context_private, hDC);
  }
 diff --git a/src/mesa/main/shaderapi.c b/src/mesa/main/shaderapi.c
-index eabd224..2052fc1 100644
+index eabd224..5308475 100644
 --- a/src/mesa/main/shaderapi.c
 +++ b/src/mesa/main/shaderapi.c
-@@ -2176,6 +2176,155 @@ shader_source(struct gl_context *ctx, GLuint shaderObj, GLsizei count,
+@@ -2096,9 +2096,28 @@ _mesa_read_shader_source(const mesa_shader_stage stage, const char *source,
+ #endif /* ENABLE_SHADER_CACHE */
+ 
+ /**
+- * Called via glShaderSource() and glShaderSourceARB() API functions.
++ * Log a line when one of the Ostriv shader hacks rewrites a shader. Also
++ * written to a file next to ostriv.exe because the PE side's stderr is
++ * usually lost under the launcher (docs/technical.md "Diagnostics").
++ */
++static void
++ostriv_hack_log(const char *msg)
++{
++   static FILE *f = NULL;
++   if (!f)
++      f = fopen("mesa_ostriv_hack_log.txt", "w");
++   if (f) {
++      fprintf(f, "%s\n", msg);
++      fflush(f);
++   }
++   _mesa_log("MESA ostriv hack: %s\n", msg);
++}
++
++/**
+  * Basically, concatenate the source code strings into one long string
+  * and pass it to _mesa_shader_source().
++ *
++ * Called via glShaderSource() and glShaderSourceARB() API functions.
+  */
+ static ALWAYS_INLINE void
+ shader_source(struct gl_context *ctx, GLuint shaderObj, GLsizei count,
+@@ -2176,6 +2195,199 @@ shader_source(struct gl_context *ctx, GLuint shaderObj, GLsizei count,
     blake3_hash original_blake3;
     _mesa_blake3_compute(source, strlen(source), original_blake3);
  
@@ -242,8 +318,51 @@ index eabd224..2052fc1 100644
 +            strcpy(dst, tail);
 +            free(source);
 +            source = new_source;
++            ostriv_hack_log("tree vertex shader rewritten (v_bFruitsHarvested -> float)");
 +         }
 +      }
++   }
++
++   /* D3DMetal marks any GS-less pipeline whose DXIL has a flat input as a
++    * no-op PSO, so Ostriv's reeds/grass/terrain never render (see
++    * docs/technical.md "Reeds never render"). Rewrite the game's flat int
++    * varyings to plain floats; int -> float assignments compile via GLSL
++    * implicit conversion. Plants/terrain write these varyings from
++    * per-instance data, so interpolation reproduces them; grass computes
++    * v_iSkip per vertex, so boundary triangles get a per-fragment 0.5
++    * threshold instead of the provoking-vertex cut — a benign softening.
++    * All replacements are length-preserving and done in place (guarded at
++    * runtime: assert() is compiled out of release builds).
++    */
++   const char *ostriv_flat_hack = os_get_option("MESA_OSTRIV_FLAT_VARYING_HACK");
++   if (ostriv_flat_hack && ostriv_flat_hack[0] == '1' &&
++       (strstr(source, "v_iSkip") || strstr(source, "v_iPatchType"))) {
++      static const struct {
++         const char *from;
++         const char *to;
++      } subs[] = {
++         { "flat out int ",       "out float    "      },
++         { "flat in int ",        "in float    "       },
++         { "v_iSkip == 1 ",       "v_iSkip > 0.5"      },
++         { "v_iPatchType == 0 ",  "v_iPatchType < 0.5" },
++      };
++      bool changed = false;
++      for (unsigned s = 0; s < ARRAY_SIZE(subs); s++) {
++         size_t n = strlen(subs[s].from);
++         if (n != strlen(subs[s].to)) {
++            ostriv_hack_log("BUG: unbalanced substitution pair, skipping");
++            continue;
++         }
++         for (char *p = strstr(source, subs[s].from); p;
++              p = strstr(p + n, subs[s].from)) {
++            memcpy(p, subs[s].to, n);
++            changed = true;
++         }
++      }
++      if (changed)
++         ostriv_hack_log(sh->Stage == MESA_SHADER_VERTEX ?
++                         "flat int varying rewritten to float (vertex shader)" :
++                         "flat int varying rewritten to float (fragment shader)");
 +   }
 +
 +   if (ostriv_tree_hack && ostriv_tree_hack[0] == '1' &&
@@ -346,6 +465,7 @@ index eabd224..2052fc1 100644
 +                sizeof(direct_texture_replacement));
 +         free(source);
 +         source = new_source;
++         ostriv_hack_log("tree fragment shader replaced (direct texture-array)");
 +      }
 +   }
 +
