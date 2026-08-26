@@ -16,6 +16,7 @@ JOURNAL_SCHEMA = 1
 JOURNAL_CORRUPT_MESSAGE = "The installation journal is unreadable. Restore before trying again."
 RECOVERY_REQUIRED_MESSAGE = "A previous installation needs recovery."
 ROLLBACK_FAILED_MESSAGE = "Installation recovery failed. Restore before trying again."
+_JOURNAL_REPLACED_ATTRIBUTE = "_ostriv_journal_replaced"
 
 logger = logging.getLogger("ostriv_macos")
 if not logger.handlers:
@@ -48,7 +49,11 @@ def atomic_write_json(path: Path, data: Dict[str, object]) -> None:
         if os.name != "nt":
             directory_descriptor = os.open(str(path.parent), os.O_RDONLY)
             try:
-                os.fsync(directory_descriptor)
+                try:
+                    os.fsync(directory_descriptor)
+                except OSError as error:
+                    setattr(error, _JOURNAL_REPLACED_ATTRIBUTE, True)
+                    raise
             finally:
                 os.close(directory_descriptor)
     finally:
@@ -106,8 +111,14 @@ class InstallJournal:
                 raise ValueError("journal record {} undo data is invalid".format(index))
 
     def _save(self, candidate: Dict[str, object]) -> None:
-        atomic_write_json(self.path, candidate)
-        self.data = candidate
+        try:
+            atomic_write_json(self.path, candidate)
+        except BaseException as error:
+            if getattr(error, _JOURNAL_REPLACED_ATTRIBUTE, False):
+                self.data = candidate
+            raise
+        else:
+            self.data = candidate
 
     def start(self, operation: str) -> None:
         if self.data["records"] and not self.data.get("complete"):

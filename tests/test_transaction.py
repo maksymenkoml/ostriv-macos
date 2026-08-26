@@ -210,6 +210,30 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual("install.recovery_required", caught.exception.code)
         self.assertEqual(before_disk, self.path.read_bytes())
 
+    @unittest.skipIf(os.name == "nt", "Windows does not support opening directories this way")
+    def test_directory_sync_failure_reconciles_visible_commit(self):
+        journal = InstallJournal(self.path)
+        journal.start("install")
+        journal.begin("copy", UndoRecord("event", {"undo": "restore"}))
+        real_sync = os.fsync
+        sync_calls = 0
+
+        def fail_directory_sync(descriptor):
+            nonlocal sync_calls
+            sync_calls += 1
+            if sync_calls == 2:
+                raise OSError("directory sync failed")
+            return real_sync(descriptor)
+
+        with patch("ostriv_macos.installer.os.fsync", side_effect=fail_directory_sync):
+            with self.assertRaisesRegex(OSError, "directory sync failed"):
+                journal.commit()
+
+        self.assertTrue(journal.data["complete"])
+        self.assertTrue(json.loads(self.path.read_text(encoding="utf-8"))["complete"])
+        journal.start("reinstall")
+        self.assertEqual("reinstall", journal.data["operation"])
+
     def test_rollback_failure_is_silent_before_logger_configuration(self):
         package_logger = logging.getLogger("ostriv_macos")
         original_handlers = package_logger.handlers[:]
