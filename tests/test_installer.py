@@ -310,8 +310,12 @@ class InstallerTests(unittest.TestCase):
                         == str(destination)
                     ]
                     self.assertEqual(1, len(cleanup_records))
-                    staging = Path(cleanup_records[0]["undo"]["data"]["path"])
+                    cleanup_data = cleanup_records[0]["undo"]["data"]
+                    staging = Path(cleanup_data["path"])
                     self.assertEqual(destination.parent, staging.parent)
+                    staging_status = staging.lstat()
+                    self.assertEqual(staging_status.st_dev, cleanup_data["device"])
+                    self.assertEqual(staging_status.st_ino, cleanup_data["inode"])
                     inner_self.journal.begin(name, undo)
                     staging.write_bytes(b"partial driver bytes")
                     raise SystemExit("simulated hard termination")
@@ -340,6 +344,89 @@ class InstallerTests(unittest.TestCase):
 
             self.assertFalse(staging.exists())
             self.assertEqual(genuine, destination.read_bytes())
+        finally:
+            fixture.cleanup()
+
+    def test_symlink_driver_destination_is_rejected_before_journaling(self):
+        fixture = FakeBottleFixture()
+        try:
+            destination = fixture.game_dir / "opengl32.dll"
+            destination.unlink()
+            victim = fixture.root / "outside-bottle-driver.dll"
+            original = b"outside victim bytes"
+            victim.write_bytes(original)
+            destination.symlink_to(victim)
+            installer = fixture.installer()
+
+            with self.assertRaises(PatchError) as caught:
+                installer.install(fixture.installation, fixture.payload)
+
+            self.assertEqual("install.preflight", caught.exception.code)
+            self.assertEqual([], installer.transactions)
+            self.assertEqual(original, victim.read_bytes())
+            self.assertTrue(destination.is_symlink())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
+            self.assertEqual([], list(victim.parent.glob(".outside-bottle-driver.dll.*")))
+            self.assertEqual([], list(destination.parent.glob(".opengl32.dll.*")))
+        finally:
+            fixture.cleanup()
+
+    def test_staging_symlink_substitution_never_follows_or_deletes_symlink(self):
+        fixture = FakeBottleFixture()
+        try:
+            destination = (fixture.game_dir / "opengl32.dll").resolve()
+            genuine = destination.read_bytes()
+            victim = fixture.root / "outside-bottle-victim"
+            victim_original = b"do not truncate or overwrite"
+            victim.write_bytes(victim_original)
+            installer = fixture.installer()
+            installer.preflight(fixture.installation, fixture.payload)
+            installer._start_ownership()
+            substituted = []
+
+            class SubstituteBeforeCopy(Transaction):
+                def step(inner_self, name, undo, action):
+                    if name == "stage opengl32.dll":
+                        cleanup = next(
+                            item
+                            for item in inner_self.journal.data["records"]
+                            if item["undo"]["kind"] == "remove_staging"
+                            and item["undo"]["data"].get("destination")
+                            == str(destination)
+                        )
+                        staging = Path(cleanup["undo"]["data"]["path"])
+                        staging.unlink()
+                        staging.symlink_to(victim)
+                        substituted.append(staging)
+                    return super(SubstituteBeforeCopy, inner_self).step(
+                        name, undo, action
+                    )
+
+            transaction = SubstituteBeforeCopy(
+                InstallJournal(installer.journal_path(fixture.installation)),
+                installer.undo_handlers(fixture.installation),
+            )
+            transaction.start("install")
+            try:
+                with self.assertRaises(OSError):
+                    installer.stage_driver_files(
+                        transaction, fixture.installation, fixture.payload
+                    )
+            finally:
+                transaction.rollback()
+
+            self.assertEqual(1, len(substituted))
+            self.assertEqual(victim_original, victim.read_bytes())
+            self.assertEqual(genuine, destination.read_bytes())
+            self.assertTrue(substituted[0].is_symlink())
+            self.assertEqual(
+                [],
+                [
+                    path
+                    for path in destination.parent.glob(".opengl32.dll.*")
+                    if not path.is_symlink()
+                ],
+            )
         finally:
             fixture.cleanup()
 

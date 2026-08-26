@@ -2,12 +2,15 @@
 
 import copy
 import base64
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import stat
 import struct
 import tempfile
 from dataclasses import asdict, dataclass
@@ -313,23 +316,88 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_copy_file(source: Path, destination: Path, staging: Path) -> None:
-    if staging.parent != destination.parent:
-        raise ValueError("copy staging path must be a sibling of its destination")
+@dataclass(frozen=True)
+class _CopyStaging:
+    path: Path
+    device: int
+    inode: int
+
+
+def _staging_status(staging: _CopyStaging) -> os.stat_result:
+    status = os.lstat(staging.path)
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_nlink != 1
+        or status.st_dev != staging.device
+        or status.st_ino != staging.inode
+    ):
+        raise OSError(
+            errno.EPERM,
+            "copy staging identity changed",
+            str(staging.path),
+        )
+    return status
+
+
+def _unlink_owned_staging(staging: _CopyStaging) -> None:
     try:
-        with source.open("rb") as source_stream, staging.open("wb") as destination_stream:
+        _staging_status(staging)
+    except (FileNotFoundError, OSError):
+        return
+    staging.path.unlink()
+
+
+def _atomic_copy_file(
+    source: Path, destination: Path, staging: _CopyStaging
+) -> None:
+    if staging.path.parent != destination.parent:
+        raise ValueError("copy staging path must be a sibling of its destination")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise OSError(errno.ENOTSUP, "no-follow file opens are unavailable")
+    flags = os.O_WRONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(str(staging.path), flags)
+        descriptor_status = os.fstat(descriptor)
+        path_status = _staging_status(staging)
+        if (
+            descriptor_status.st_dev != path_status.st_dev
+            or descriptor_status.st_ino != path_status.st_ino
+            or descriptor_status.st_nlink != 1
+        ):
+            raise OSError(
+                errno.EPERM,
+                "copy staging identity changed",
+                str(staging.path),
+            )
+        os.ftruncate(descriptor, 0)
+        with source.open("rb") as source_stream, os.fdopen(
+            descriptor, "wb", closefd=False
+        ) as destination_stream:
             shutil.copyfileobj(source_stream, destination_stream)
             destination_stream.flush()
-            shutil.copystat(source, staging)
-            os.fsync(destination_stream.fileno())
-        os.replace(str(staging), str(destination))
+        os.fchmod(descriptor, stat_mode(source))
+        os.fsync(descriptor)
+        _staging_status(staging)
+        os.replace(str(staging.path), str(destination))
+        installed_status = os.lstat(destination)
+        if (
+            installed_status.st_dev != staging.device
+            or installed_status.st_ino != staging.inode
+        ):
+            raise OSError(
+                errno.EPERM,
+                "installed file identity changed",
+                str(destination),
+            )
         _fsync_directory(destination.parent)
     except BaseException:
-        try:
-            staging.unlink()
-        except FileNotFoundError:
-            pass
+        _unlink_owned_staging(staging)
         raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 class LauncherPort(Protocol):
@@ -589,10 +657,14 @@ class Installer:
     def _allowed_atomic_copy_destination(
         self, installation: GameInstallation, destination: Path
     ) -> bool:
-        destination = destination.resolve(strict=False)
-        targets = self._allowed_owned_targets(installation) | {
+        destination = destination.parent.resolve(strict=False) / destination.name
+        raw_targets = self._allowed_owned_targets(installation) | {
             installation.bottle.root.resolve() / "cxbottle.conf",
             self._settings_path(installation),
+        }
+        targets = {
+            target.parent.resolve(strict=False) / target.name
+            for target in raw_targets
         }
         return destination in targets or any(
             self._valid_backup_relationship(target, destination)
@@ -786,6 +858,17 @@ class Installer:
         config = bottle_root / "cxbottle.conf"
         registry_file = bottle_root / "system.reg"
         settings = self._settings_path(installation)
+        mutable_destinations = [
+            *(game_dir / name for name in DRIVER_NAMES),
+            game_dir / "steam_appid.txt",
+            config,
+            settings,
+        ]
+        for destination in mutable_destinations:
+            if destination.is_symlink():
+                issues.append(
+                    "Unsafe symbolic-link destination: {}".format(destination)
+                )
         if not game_dir.is_dir() or not os.access(game_dir, os.W_OK | os.X_OK):
             issues.append("Ostriv destination is not writable: {}".format(game_dir))
         if not config.is_file() or not os.access(config, os.R_OK | os.W_OK):
@@ -889,38 +972,76 @@ class Installer:
         return candidate
 
     @staticmethod
-    def _staging_name(destination: Path, counter: int) -> str:
-        suffix = "" if counter == 1 else "-{}".format(counter)
-        return ".{}.ostriv-macos-stage{}".format(destination.name, suffix)
+    def _staging_name(destination: Path, token: str) -> str:
+        return ".{}.ostriv-macos-stage-{}".format(destination.name, token)
 
     def _prepare_copy_staging(
         self,
         transaction: Transaction,
         installation: GameInstallation,
         destination: Path,
-    ) -> Path:
-        destination = destination.resolve(strict=False)
-        counter = 1
-        staging = destination.with_name(self._staging_name(destination, counter))
-        while staging.exists():
-            counter += 1
-            staging = destination.with_name(self._staging_name(destination, counter))
+    ) -> _CopyStaging:
+        if not destination.is_absolute():
+            raise PatchError(
+                "install.ownership_conflict",
+                "Installation cannot use an unsafe destination.",
+                str(destination),
+            )
+        destination = destination.parent.resolve(strict=False) / destination.name
+        if destination.is_symlink() or not self._allowed_atomic_copy_destination(
+            installation, destination
+        ):
+            raise PatchError(
+                "install.ownership_conflict",
+                "Installation cannot use an unsafe destination.",
+                str(destination),
+            )
+        while True:
+            token = secrets.token_hex(16)
+            staging = destination.with_name(self._staging_name(destination, token))
+            if not os.path.lexists(staging):
+                break
+
+        record_data: Dict[str, object] = {
+            "path": str(staging),
+            "destination": str(destination),
+        }
 
         def create_owned_staging() -> None:
-            with staging.open("xb") as stream:
-                stream.flush()
-                os.fsync(stream.fileno())
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            no_follow = getattr(os, "O_NOFOLLOW", 0)
+            if not no_follow:
+                raise OSError(errno.ENOTSUP, "no-follow file opens are unavailable")
+            descriptor = os.open(
+                str(staging),
+                flags | no_follow | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            try:
+                status = os.fstat(descriptor)
+                if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+                    raise OSError(
+                        errno.EPERM,
+                        "copy staging is not an exclusive regular file",
+                        str(staging),
+                    )
+                record_data["device"] = status.st_dev
+                record_data["inode"] = status.st_ino
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
             _fsync_directory(staging.parent)
 
         transaction.step(
             "own copy staging for {}".format(destination.name),
-            UndoRecord(
-                "remove_staging",
-                {"path": str(staging), "destination": str(destination)},
-            ),
+            UndoRecord("remove_staging", record_data),
             create_owned_staging,
         )
-        return staging
+        return _CopyStaging(
+            staging,
+            int(record_data["device"]),
+            int(record_data["inode"]),
+        )
 
     def _install_file(
         self,
@@ -930,6 +1051,12 @@ class Installer:
         source: Path,
         name: str,
     ) -> None:
+        if path.is_symlink():
+            raise PatchError(
+                "install.ownership_conflict",
+                "Installation cannot replace a symbolic-link destination.",
+                str(path),
+            )
         desired_digest = _file_digest(source)
         existing_owned = self._owned(path)
         if existing_owned is not None:
@@ -1603,29 +1730,40 @@ class Installer:
     ) -> None:
         path_text = record.data.get("path")
         destination_text = record.data.get("destination")
-        if not isinstance(path_text, str) or not isinstance(destination_text, str):
+        device = record.data.get("device")
+        inode = record.data.get("inode")
+        if (
+            not isinstance(path_text, str)
+            or not isinstance(destination_text, str)
+            or not isinstance(device, int)
+            or not isinstance(inode, int)
+        ):
             return
         path = Path(path_text)
         destination = Path(destination_text)
+        lexical_path = path.parent.resolve(strict=False) / path.name
+        lexical_destination = (
+            destination.parent.resolve(strict=False) / destination.name
+        )
         if (
             not path.is_absolute()
             or not destination.is_absolute()
-            or path.parent != destination.parent
-            or not self._allowed_atomic_copy_destination(installation, destination)
+            or path != lexical_path
+            or destination != lexical_destination
+            or lexical_path.parent != lexical_destination.parent
+            or not self._allowed_atomic_copy_destination(
+                installation, lexical_destination
+            )
         ):
             return
-        base_name = self._staging_name(destination, 1)
-        suffix = (
-            path.name[len(base_name) + 1 :]
-            if path.name.startswith(base_name + "-")
-            else ""
+        name_pattern = re.compile(
+            r"^{}[0-9a-f]{{32}}$".format(
+                re.escape(".{}.ostriv-macos-stage-".format(destination.name))
+            )
         )
-        valid_name = path.name == base_name or (
-            suffix.isdigit() and str(int(suffix)) == suffix and int(suffix) >= 2
-        )
-        if not valid_name or path.is_symlink() or not path.is_file():
+        if name_pattern.fullmatch(path.name) is None:
             return
-        path.unlink()
+        _unlink_owned_staging(_CopyStaging(path, device, inode))
 
     def _remove_empty_owned_directories(
         self, installation: GameInstallation, directories: object
