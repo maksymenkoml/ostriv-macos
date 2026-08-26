@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import plistlib
-import re
+import stat
 import subprocess
 from unittest.mock import patch
 
@@ -63,6 +63,12 @@ class ProbeRunner:
                     '"steamwebhelper.exe","418","Console","1","24,000 K"'
                 )
             return FakeResult(0, "\n".join(rows))
+        if argv[:1] == ["/bin/ps"]:
+            role = "renderer" if self.renderer else "gpu-process"
+            return FakeResult(
+                0,
+                "418 /selected/steamwebhelper.exe --type={}\n".format(role),
+            )
         return FakeResult(0, self.registry)
 
 
@@ -480,6 +486,14 @@ class SteamControllerTests(unittest.TestCase):
             "query",
             r"HKCU\Software\Valve\Steam\ActiveProcess",
         ]
+        expected_renderer = [
+            "/bin/ps",
+            "-ww",
+            "-o",
+            "pid=,command=",
+            "-p",
+            "418",
+        ]
         calls = []
 
         class RepresentativeRunner:
@@ -494,19 +508,77 @@ class SteamControllerTests(unittest.TestCase):
                     )
                 if argv == expected_registry:
                     return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
-                if argv[:2] == ["pgrep", "-f"]:
-                    representative = (
-                        "/CrossOver-selected-id/steamwebhelper.exe --type=renderer"
-                        if "steamwebhelper" in argv[-1]
-                        else "/CrossOver-selected-id/steam.exe"
+                if argv == expected_renderer:
+                    return FakeResult(
+                        0,
+                        "418 /CrossOver-selected-id/steamwebhelper.exe "
+                        "--type=renderer\n",
                     )
-                    return FakeResult(0 if re.search(argv[-1], representative) else 1)
                 raise AssertionError(argv)
 
         signals = SteamController(config=config, runner=RepresentativeRunner()).probe()
 
         self.assertEqual(SteamSignals(True, True, True), signals)
-        self.assertEqual([expected_task, expected_registry], calls)
+        self.assertEqual([expected_task, expected_renderer, expected_registry], calls)
+
+    def test_non_renderer_helper_never_passes_selected_bottle_readiness_gate(self):
+        """A helper without the renderer role must not satisfy the 15-second gate."""
+        config = make_config("/private/tmp/selected")
+        clock = FakeClock()
+        calls = []
+
+        class NonRendererRunner:
+            def run(self, argv, timeout=None):
+                argv = list(argv)
+                calls.append(argv)
+                if "tasklist" in argv:
+                    return FakeResult(
+                        0,
+                        '"steam.exe","417","Console","1","12,000 K"\n'
+                        '"steamwebhelper.exe","418","Console","1","24,000 K"\n',
+                    )
+                if argv[:1] == ["/bin/ps"]:
+                    return FakeResult(
+                        0,
+                        "418 /selected/steamwebhelper.exe --type=gpu-process\n"
+                        "999 /other/steamwebhelper.exe --type=renderer\n",
+                    )
+                return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
+
+        controller = SteamController(
+            config=config,
+            runner=NonRendererRunner(),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_seconds=2.0,
+            timeout_seconds=18.0,
+        )
+
+        with self.assertRaises(LauncherRuntimeError) as caught:
+            controller.ensure_ready()
+
+        self.assertEqual("steam_timeout", caught.exception.message_key)
+        self.assertEqual(18.0, clock.now)
+        queried_pids = next(
+            call[-1] for call in calls if call[:1] == ["/bin/ps"]
+        )
+        self.assertNotIn("999", queried_pids)
+
+    def test_renderer_detail_query_failure_is_a_safe_false_negative(self):
+        """Missing host detail evidence must never infer a renderer from its image name."""
+        config = make_config("/private/tmp/selected")
+
+        class FailedDetailRunner(ProbeRunner):
+            def run(self, argv, timeout=None):
+                if list(argv)[:1] == ["/bin/ps"]:
+                    return FakeResult(1, "", "ps unavailable")
+                return super().run(argv, timeout)
+
+        signals = SteamController(
+            config=config, runner=FailedDetailRunner()
+        ).probe()
+
+        self.assertEqual(SteamSignals(True, True, False), signals)
 
     def test_other_and_same_named_bottle_tasks_cannot_satisfy_selected_readiness(self):
         """Only the owning CrossOver and resolved bottle command may supply tasks."""
@@ -607,6 +679,30 @@ class ExternalProcessRunnerTests(unittest.TestCase):
         self.assertNotIn("private-value", text)
         self.assertLess(len(text), 6000)
 
+    @patch("subprocess.run")
+    def test_process_detail_query_never_logs_captured_command_lines(self, run):
+        """Host process arguments stay internal even when readiness needs their role."""
+        run.return_value = FakeResult(
+            0,
+            b"418 steamwebhelper --type=renderer --token private-value\n",
+            b"private-value warning\n",
+        )
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "launcher.log"
+            runner = runtime.ExternalProcessRunner(
+                logger=runtime._create_launcher_log(log_path)
+            )
+
+            result = runner.run(
+                ["/bin/ps", "-ww", "-o", "pid=,command=", "-p", "418"],
+                timeout=5.0,
+            )
+
+            text = log_path.read_text(encoding="utf-8")
+        self.assertIn("private-value", result.stdout)
+        self.assertNotIn("private-value", text)
+        self.assertIn("<process details omitted>", text)
+
 
 class ProcessLockTests(unittest.TestCase):
     @unittest.skipIf(not hasattr(os, "O_NOFOLLOW"), "requires no-follow file opens")
@@ -658,6 +754,29 @@ class ProcessLockTests(unittest.TestCase):
             first.close()
             self.assertTrue(second.acquire())
             second.close()
+
+    def test_held_lock_proof_rejects_changed_content_and_mode(self):
+        """Recovery may preserve an inode only while its full ownership proof holds."""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "launcher.lock"
+            expected = b"owned-token\n"
+            path.write_bytes(expected)
+            path.chmod(0o600)
+            lock = ProcessLock(path)
+            self.assertTrue(lock.acquire())
+            try:
+                path.write_bytes(b"changed-token\n")
+                with self.assertRaisesRegex(OSError, "content changed"):
+                    lock.validate_current_path(expected, 0o600)
+                self.assertEqual(b"changed-token\n", path.read_bytes())
+
+                path.write_bytes(expected)
+                path.chmod(0o644)
+                with self.assertRaisesRegex(OSError, "mode changed"):
+                    lock.validate_current_path(expected, 0o600)
+                self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
+            finally:
+                lock.close()
 
     def test_stale_lock_path_is_harmless_and_is_not_deleted(self):
         """Treating file existence as ownership would permanently block after a hard exit."""

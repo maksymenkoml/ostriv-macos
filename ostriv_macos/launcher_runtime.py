@@ -45,7 +45,7 @@ class ProcessLock:
         self.path = Path(path)
         self.fd = None
 
-    def _validate_descriptor_path(self, descriptor: int) -> None:
+    def _validate_descriptor_path(self, descriptor: int) -> os.stat_result:
         opened = os.fstat(descriptor)
         current = os.lstat(str(self.path))
         if (
@@ -57,12 +57,26 @@ class ProcessLock:
             or opened.st_ino != current.st_ino
         ):
             raise OSError("launcher lock path changed after open")
+        return opened
 
-    def validate_current_path(self) -> None:
-        """Prove the held descriptor still names the current lock pathname."""
+    def validate_current_path(
+        self,
+        expected_content: Optional[bytes] = None,
+        expected_mode: Optional[int] = None,
+    ) -> None:
+        """Prove the held descriptor still names the exact owned lock leaf."""
         if self.fd is None:
             raise OSError("launcher lock is not acquired")
-        self._validate_descriptor_path(self.fd)
+        opened = self._validate_descriptor_path(self.fd)
+        if (
+            expected_mode is not None
+            and stat.S_IMODE(opened.st_mode) != expected_mode
+        ):
+            raise OSError("launcher lock mode changed after open")
+        if expected_content is not None:
+            content = os.pread(self.fd, len(expected_content) + 1, 0)
+            if content != expected_content:
+                raise OSError("launcher lock content changed after open")
 
     def acquire(self) -> bool:
         if self.fd is not None:
@@ -99,6 +113,7 @@ class ProcessLock:
 
 MAX_LOG_EVIDENCE_BYTES = 256 * 1024
 LOG_TOKEN_TAIL_BYTES = 64 * 1024
+MAX_RENDERER_HELPER_PIDS = 64
 _AMBIGUOUS_LOG_EVIDENCE = "<changed log generation outside bounded evidence>"
 
 
@@ -269,7 +284,7 @@ class ExternalCommandError(RuntimeError):
 class ExternalProcessRunner:
     """Run external commands without ever exposing their raw output to the player."""
 
-    ALLOWED_EXECUTABLES = frozenset({"open", "osascript", "wine"})
+    ALLOWED_EXECUTABLES = frozenset({"open", "osascript", "ps", "wine"})
     SENSITIVE_OPTIONS = frozenset(
         {"--api-key", "--password", "--secret", "--token", "/d"}
     )
@@ -325,6 +340,9 @@ class ExternalProcessRunner:
 
     @classmethod
     def _diagnostic(cls, command, returncode, stdout, stderr, status=None):
+        if Path(command[0]).name == "ps":
+            stdout = "<process details omitted>"
+            stderr = "<process details omitted>"
         sensitive_values = cls._sensitive_values(command)
         fields = (
             ["returncode={}".format(returncode)]
@@ -497,18 +515,58 @@ class SteamController:
         return True
 
     @staticmethod
-    def _task_images(output) -> set:
+    def _task_processes(output) -> Dict[str, set]:
         if isinstance(output, bytes):
             output = output.decode("utf-8", errors="replace")
-        images = set()
+        processes: Dict[str, set] = {}
         try:
             rows = csv.reader(io.StringIO(str(output)[: MAX_LOG_EVIDENCE_BYTES]))
             for row in rows:
-                if row:
-                    images.add(row[0].lstrip("\ufeff").strip().lower())
+                if len(row) < 2:
+                    continue
+                image = row[0].lstrip("\ufeff").strip().lower()
+                pid_text = row[1].strip()
+                if not image or not pid_text.isdecimal():
+                    continue
+                pid = int(pid_text)
+                if not 0 < pid < 2**31:
+                    continue
+                processes.setdefault(image, set()).add(pid)
         except csv.Error:
-            return set()
-        return images
+            return {}
+        return processes
+
+    def _renderer_running(self, helper_pids) -> bool:
+        selected = sorted(set(helper_pids))
+        if not selected or len(selected) > MAX_RENDERER_HELPER_PIDS:
+            return False
+        command = [
+            "/bin/ps",
+            "-ww",
+            "-o",
+            "pid=,command=",
+            "-p",
+            ",".join(str(pid) for pid in selected),
+        ]
+        try:
+            result = self.runner.run(command, timeout=5.0)
+        except (ExternalCommandError, OSError, ValueError):
+            return False
+        if result.returncode != 0:
+            return False
+        output = result.stdout
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        selected_set = set(selected)
+        for line in str(output)[:MAX_LOG_EVIDENCE_BYTES].splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) != 2 or not fields[0].isdecimal():
+                continue
+            if int(fields[0]) not in selected_set:
+                continue
+            if "--type=renderer" in fields[1].split():
+                return True
+        return False
 
     def probe(self) -> SteamSignals:
         if self._probe is not None:
@@ -526,8 +584,13 @@ class SteamController:
                 "/nh",
             )
             tasks = self.runner.run(task_command, timeout=10.0)
-            images = self._task_images(tasks.stdout) if tasks.returncode == 0 else set()
-            process = "steam.exe" in images
+            processes = (
+                self._task_processes(tasks.stdout) if tasks.returncode == 0 else {}
+            )
+            process = bool(processes.get("steam.exe"))
+            renderer = self._renderer_running(
+                processes.get("steamwebhelper.exe", set())
+            )
             registry_command = self._wine_command(
                 "--no-update",
                 "--no-lock",
@@ -551,7 +614,6 @@ class SteamController:
                         active_user = int(parts[2], 16) != 0
                     except ValueError:
                         active_user = False
-            renderer = "steamwebhelper.exe" in images
             signals = SteamSignals(process, active_user, renderer)
         self.logger.info(
             "steam probe process=%s active_user=%s renderer=%s ready=%s",

@@ -1017,8 +1017,8 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
-    def test_restore_restart_recovers_journaled_lock_unlink_before_reacquiring(self):
-        """Restarted Restore must hold the inode restored by journal recovery."""
+    def test_restore_restart_holds_lock_through_incomplete_journal_rollback(self):
+        """No contender may enter while recovery restores the lock snapshot."""
         fixture = FakeBottleFixture()
         try:
             profiles = FakeRestoreProfiles()
@@ -1087,12 +1087,22 @@ class InstallerTests(unittest.TestCase):
                     installer.undo_handlers(installation),
                 )
                 restart_transactions.append(transaction)
-                if len(restart_transactions) == 2:
-                    contender = ProcessLock(lock)
-                    try:
-                        contender_acquired.append(contender.acquire())
-                    finally:
-                        contender.close()
+                if len(restart_transactions) == 1:
+                    original = transaction.handlers["restore_launcher"]
+
+                    def probe_inside_rollback(record):
+                        original(record)
+                        if contender_acquired:
+                            return
+                        contender = ProcessLock(lock)
+                        try:
+                            contender_acquired.append(contender.acquire())
+                        finally:
+                            contender.close()
+
+                    handlers = dict(transaction.handlers)
+                    handlers["restore_launcher"] = probe_inside_rollback
+                    transaction.handlers = handlers
                 return transaction
 
             with patch.object(
@@ -1107,6 +1117,91 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(installer.state_path(fixture.installation).exists())
             self.assertFalse(installer.journal_path(fixture.installation).exists())
             self.assertEqual(before, fixture.snapshot())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_restart_preserves_lock_substituted_after_lease_acquisition(self):
+        """Recovery must not replace a lookalike inode that displaced the held lock."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            _launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            lock = Path(str(state.launcher_artifacts["lock_path"]))
+            expected = lock.read_bytes()
+            armed = [True]
+
+            class HardKill(BaseException):
+                pass
+
+            class HardKillTransaction(Transaction):
+                def __init__(self, journal, handlers):
+                    super().__init__(journal, handlers)
+                    self.killed = False
+
+                def step(self, name, undo, action):
+                    if name != "remove launcher recovery lock" or not armed:
+                        return super().step(name, undo, action)
+                    self.journal.begin(name, undo)
+                    action()
+                    armed.pop()
+                    self.killed = True
+                    raise HardKill()
+
+                def rollback(self):
+                    if self.killed:
+                        raise HardKill()
+                    return super().rollback()
+
+            def interrupting_transaction_for(installation):
+                return HardKillTransaction(
+                    InstallJournal(installer.journal_path(installation)),
+                    installer.undo_handlers(installation),
+                )
+
+            with patch.object(
+                installer, "transaction_for", side_effect=interrupting_transaction_for
+            ):
+                with self.assertRaises(HardKill):
+                    installer.restore(fixture.installation)
+
+            self.assertFalse(lock.exists())
+            replacement_identity = []
+
+            def restart_transaction_for(installation):
+                transaction = Transaction(
+                    InstallJournal(installer.journal_path(installation)),
+                    installer.undo_handlers(installation),
+                )
+                original_recover = transaction.recover_incomplete
+
+                def substitute_then_recover():
+                    lock.unlink()
+                    lock.write_bytes(expected)
+                    lock.chmod(0o600)
+                    status = lock.stat()
+                    replacement_identity.append((status.st_dev, status.st_ino))
+                    original_recover()
+
+                transaction.recover_incomplete = substitute_then_recover
+                return transaction
+
+            with patch.object(
+                installer, "transaction_for", side_effect=restart_transaction_for
+            ):
+                with self.assertRaises(PatchError) as caught:
+                    installer.restore(fixture.installation)
+
+            self.assertEqual("install.rollback_failed", caught.exception.code)
+            status = lock.stat()
+            self.assertEqual(replacement_identity, [(status.st_dev, status.st_ino)])
+            self.assertEqual(expected, lock.read_bytes())
+            self.assertEqual([], profiles.calls)
+            self.assertTrue(installer.state_path(fixture.installation).is_file())
+            journal = json.loads(
+                installer.journal_path(fixture.installation).read_text(encoding="utf-8")
+            )
+            self.assertFalse(journal["complete"])
         finally:
             fixture.cleanup()
 

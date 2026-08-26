@@ -96,9 +96,12 @@ the exact original display profile in `<bottle>/.ostriv-profile-recovery.json` u
 succeeds. A killed run leaves the marker for recovery on the next click; a stale lock pathname is
 harmless because the kernel owns the lock.
 
-Steam readiness comes from the selected bottle's task table and ActiveUser registry value, queried
-through that bottle's resolved CrossOver `wine --bottle` command identity. Global macOS process
-matches and canonical-path argv substrings do not contribute readiness signals.
+Steam process identity comes from the selected bottle's task table, and ActiveUser comes from its
+registry, both queried through that bottle's resolved CrossOver `wine --bottle` command identity.
+Only helper PIDs in that task table are correlated with bounded macOS process detail, and a helper
+counts as ready only with the exact `--type=renderer` role. Captured command lines are omitted from
+diagnostics. Global process matches and canonical-path argv substrings do not contribute readiness
+signals.
 
 Detailed installer logs stay at `~/Library/Logs/ostriv-macos/install.log`. Launcher logs use a
 filesystem-safe bottle identity under `~/Library/Logs/ostriv-macos/`. They contain command and

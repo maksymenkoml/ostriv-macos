@@ -1121,7 +1121,7 @@ class GlobalConstraintTests(unittest.TestCase):
                 ):
                     literal_executables.add(Path(node.args[0].elts[0].value).name)
         self.assertEqual(set(), imported - allowed_imports)
-        self.assertEqual(set(), literal_executables - {"open", "osascript"})
+        self.assertEqual(set(), literal_executables - {"open", "osascript", "ps"})
 
     @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_runtime_command_boundaries_reject_network_and_unlisted_tools(self, run):

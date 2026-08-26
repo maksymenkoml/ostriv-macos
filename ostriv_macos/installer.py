@@ -2778,6 +2778,110 @@ class Installer:
             if descriptor is not None:
                 os.close(descriptor)
 
+    def _handlers_preserving_recovery_lock(
+        self,
+        installation: GameInstallation,
+        state: InstallState,
+        lease,
+        handlers: Mapping[str, Callable[[UndoRecord], None]],
+    ) -> Mapping[str, Callable[[UndoRecord], None]]:
+        """Keep an authenticated held lock inode out of Restore snapshot replay."""
+        lock = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
+        launcher_state = state.launcher_artifacts
+        owner_token = launcher_state.get("profile_owner_token")
+        expected_digest = launcher_state.get("lock_sha256")
+
+        def failure(detail: str) -> PatchError:
+            return PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                detail,
+            )
+
+        if (
+            launcher_state.get("lock_path") != str(lock)
+            or not isinstance(owner_token, str)
+            or re.fullmatch(r"[0-9a-f]{64}", owner_token) is None
+            or not isinstance(expected_digest, str)
+            or Path(str(getattr(lease, "path", ""))) != lock
+        ):
+            raise failure("Launcher recovery lock ownership is invalid")
+        expected_data = (owner_token + "\n").encode("ascii")
+        if _bytes_digest(expected_data) != expected_digest:
+            raise failure("Launcher recovery lock digest is invalid")
+
+        original = handlers.get("restore_launcher")
+        if not callable(original):
+            raise failure("Launcher recovery undo handler is unavailable")
+
+        def preserve(record: UndoRecord) -> None:
+            data = copy.deepcopy(record.data)
+            matches = []
+            for field in ("snapshots", "restore_files"):
+                snapshots = data.get(field)
+                if not isinstance(snapshots, list):
+                    continue
+                kept = []
+                for snapshot in snapshots:
+                    path_text = (
+                        snapshot.get("path")
+                        if isinstance(snapshot, dict)
+                        else None
+                    )
+                    if isinstance(path_text, str) and path_text != str(lock):
+                        try:
+                            aliases_lock = Path(path_text).resolve(strict=False) == lock
+                        except OSError:
+                            aliases_lock = False
+                        if aliases_lock:
+                            raise failure(
+                                "Launcher recovery lock snapshot path is not lexical"
+                            )
+                    if path_text != str(lock):
+                        kept.append(snapshot)
+                        continue
+                    matches.append(snapshot)
+                data[field] = kept
+
+            if not matches:
+                original(UndoRecord(record.kind, data))
+                return
+            if len(matches) != 1:
+                raise failure("Launcher recovery lock snapshot is duplicated")
+            snapshot = matches[0]
+            try:
+                captured = base64.b64decode(
+                    str(snapshot["content"]), validate=True
+                )
+            except (KeyError, ValueError) as error:
+                raise failure("Launcher recovery lock snapshot is invalid") from error
+            mode = snapshot.get("mode")
+            if (
+                snapshot.get("present") is not True
+                or snapshot.get("type") not in (None, "file")
+                or snapshot.get("sha256") != expected_digest
+                or captured != expected_data
+                or type(mode) is not int
+                or mode != 0o600
+            ):
+                raise failure("Launcher recovery lock snapshot is not owned")
+            validate_current_path = getattr(lease, "validate_current_path", None)
+            if not callable(validate_current_path):
+                raise failure("Launcher recovery lock lease cannot be validated")
+            try:
+                validate_current_path(expected_data, 0o600)
+            except (OSError, TypeError, ValueError) as error:
+                raise failure(
+                    "Launcher recovery lock changed during journal recovery: {}".format(
+                        error
+                    )
+                ) from error
+            original(UndoRecord(record.kind, data))
+
+        protected = dict(handlers)
+        protected["restore_launcher"] = preserve
+        return protected
+
     def restore(self, installation: GameInstallation) -> None:
         logger.info(
             "restore start bottle=%s game=%s",
@@ -2802,11 +2906,38 @@ class Installer:
                 recover_profile=not recovering_incomplete,
             )
         try:
+            preserving_recovery_lock = (
+                recovering_incomplete
+                and transaction.journal.data.get("operation") == "restore"
+                and state is not None
+                and restore_lease is not None
+            )
+            if preserving_recovery_lock:
+                transaction.handlers = self._handlers_preserving_recovery_lock(
+                    installation,
+                    state,
+                    restore_lease,
+                    transaction.handlers,
+                )
             transaction.recover_incomplete()
-            if recovering_incomplete and restore_lease is not None:
+            if (
+                recovering_incomplete
+                and restore_lease is not None
+                and not preserving_recovery_lock
+            ):
                 restore_lease.close()
                 restore_lease = None
             state = self._load_state(installation, "restore")
+            if preserving_recovery_lock and restore_lease is not None:
+                if state is None:
+                    restore_lease.close()
+                    restore_lease = None
+                else:
+                    restore_lease = prepare_restore(
+                        installation,
+                        state.launcher_artifacts,
+                        existing_lock=restore_lease,
+                    )
             if (
                 restore_lease is None
                 and state is not None

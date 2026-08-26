@@ -66,8 +66,11 @@ current implementation.
 `ostriv_macos/launcher_runtime.py` now owns a deterministic readiness state machine:
 
 1. Acquire a per-bottle advisory lock so a repeated click cannot start another Steam/game path.
-2. Probe all three signals: the Steam process, nonzero `ActiveUser`, and a renderer helper. Process
-   presence or login alone is never ready.
+2. Probe all three signals: the selected bottle's Wine task table must contain Steam, its registry
+   must report a nonzero `ActiveUser`, and an exact helper PID from that same task table must have
+   `--type=renderer` in its bounded macOS process detail. Another bottle's helper, a non-renderer
+   helper, process presence, or login alone is never ready. Captured process details are omitted
+   from diagnostics.
 3. For an already warm client, require two consecutive ready probes two seconds apart.
 4. For a stopped or transitioning client, open the matching CrossOver Steam app at most once and
    require all readiness signals to remain stable for 15 seconds. Any dropped signal resets the
