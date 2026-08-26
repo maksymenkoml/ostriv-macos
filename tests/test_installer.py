@@ -9,7 +9,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+import ostriv_macos.installer as installer_module
 from ostriv_macos.diagnostics import CommandResult, PatchError
 from ostriv_macos.discovery import Bottle, CrossOverInstall, GameInstallation
 from ostriv_macos.installer import (
@@ -45,6 +47,8 @@ class FakeRunner:
         self.calls = []
         self.add_failures = 0
         self.delete_failures = 0
+        self.query_failures = 0
+        self.query_failures_after_delete = 0
         self.status_result = CommandResult(0, "running\n", "")
 
     def run(self, argv, timeout=None):
@@ -59,6 +63,9 @@ class FakeRunner:
         value = argv[argv.index("/v") + 1]
         identity = (key, value)
         if operation == "query":
+            if self.query_failures:
+                self.query_failures -= 1
+                return CommandResult(2, "", "\ufffd registry query failed")
             if identity not in self.registry:
                 return CommandResult(1, "\ufffd missing\n", "\ufffd not found")
             return CommandResult(
@@ -79,6 +86,9 @@ class FakeRunner:
                 self.delete_failures -= 1
                 return CommandResult(1, "", "\ufffd transient delete failure")
             self.registry.pop(identity, None)
+            if self.query_failures_after_delete:
+                self.query_failures = self.query_failures_after_delete
+                self.query_failures_after_delete = 0
             return CommandResult(0, "", "")
         raise AssertionError(argv)
 
@@ -270,6 +280,45 @@ class FakeBottleFixture:
 
 
 class InstallerTests(unittest.TestCase):
+    def test_driver_copy_failure_before_replace_preserves_genuine_destination(self):
+        fixture = FakeBottleFixture()
+        try:
+            before = fixture.snapshot()
+
+            real_replace = os.replace
+
+            def fail_before_driver_replace(source, destination):
+                if (
+                    Path(destination).resolve()
+                    == (fixture.game_dir / "opengl32.dll").resolve()
+                    and Path(source).name.startswith(".opengl32.dll.")
+                ):
+                    self.assertEqual(
+                        b"genuine opengl",
+                        (fixture.game_dir / "opengl32.dll").read_bytes(),
+                    )
+                    raise OSError("injected staging copy failure")
+                return real_replace(source, destination)
+
+            with patch.object(
+                installer_module.os,
+                "replace",
+                side_effect=fail_before_driver_replace,
+            ):
+                with self.assertRaisesRegex(OSError, "staging copy failure"):
+                    fixture.installer().install(
+                        fixture.installation, fixture.payload
+                    )
+
+            self.assertEqual(before, fixture.snapshot())
+            self.assertEqual(
+                b"genuine opengl",
+                (fixture.game_dir / "opengl32.dll").read_bytes(),
+            )
+            self.assertEqual([], list(fixture.game_dir.glob(".opengl32.dll.*")))
+        finally:
+            fixture.cleanup()
+
     def test_failure_after_each_actual_journaled_mutation_restores_original_tree(self):
         counter = FakeBottleFixture()
         try:
@@ -307,6 +356,42 @@ class InstallerTests(unittest.TestCase):
             restored_once = fixture.snapshot()
             installer.restore(fixture.installation)
             self.assertEqual(restored_once, fixture.snapshot())
+        finally:
+            fixture.cleanup()
+
+    def test_reinstall_with_changed_payload_keeps_genuine_restore_backup(self):
+        fixture = FakeBottleFixture()
+        try:
+            installer = fixture.installer()
+            installer.install(fixture.installation, fixture.payload)
+            replacement = b"MZreplacement-driver"
+            source = fixture.prebuilt / "opengl32.dll"
+            source.write_bytes(replacement)
+            fixture.payload = [
+                PayloadEntry(
+                    entry.relative_path,
+                    len(replacement),
+                    digest(replacement),
+                    entry.pe,
+                )
+                if entry.relative_path == "prebuilt/opengl32.dll"
+                else entry
+                for entry in fixture.payload
+            ]
+
+            installer.install(fixture.installation, fixture.payload)
+            self.assertEqual(replacement, (fixture.game_dir / "opengl32.dll").read_bytes())
+            self.assertEqual(
+                b"genuine opengl",
+                (fixture.game_dir / "opengl32.dll.bak").read_bytes(),
+            )
+
+            installer.restore(fixture.installation)
+
+            self.assertEqual(
+                b"genuine opengl",
+                (fixture.game_dir / "opengl32.dll").read_bytes(),
+            )
         finally:
             fixture.cleanup()
 
@@ -462,6 +547,52 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_registry_preserves_prior_value_containing_spaces(self):
+        fixture = FakeBottleFixture(prior_registry="user override with spaces")
+        try:
+            installer = fixture.installer()
+            state = installer.install(fixture.installation, fixture.payload)
+            self.assertEqual("user override with spaces", state.prior_registry_value)
+
+            installer.restore(fixture.installation)
+
+            self.assertEqual(
+                "user override with spaces",
+                fixture.registry[(REGISTRY_KEY, REGISTRY_VALUE)],
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_registry_query_failure_is_typed_and_rolls_back(self):
+        fixture = FakeBottleFixture()
+        try:
+            before = fixture.snapshot()
+            fixture.runner.query_failures = 2
+
+            with self.assertRaises(PatchError) as caught:
+                fixture.installer().install(fixture.installation, fixture.payload)
+
+            self.assertEqual("install.registry", caught.exception.code)
+            self.assertEqual(before, fixture.snapshot())
+        finally:
+            fixture.cleanup()
+
+    def test_delete_verification_query_failure_does_not_pass_as_absent(self):
+        fixture = FakeBottleFixture(prior_registry=None)
+        try:
+            installer = fixture.installer()
+            installer.install(fixture.installation, fixture.payload)
+            installed = fixture.snapshot()
+            fixture.runner.query_failures_after_delete = 4
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual("restore.registry", caught.exception.code)
+            self.assertEqual(installed, fixture.snapshot())
+        finally:
+            fixture.cleanup()
+
     def test_restore_retries_registry_delete_once_and_verifies_absence(self):
         fixture = FakeBottleFixture(prior_registry=None)
         try:
@@ -543,6 +674,55 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_missing_required_payload_inventory_fails_before_transaction(self):
+        for missing in ("prebuilt/dxil.dll", "assets/settings.data"):
+            with self.subTest(missing=missing):
+                fixture = FakeBottleFixture()
+                try:
+                    payload = [
+                        entry
+                        for entry in fixture.payload
+                        if entry.relative_path != missing
+                    ]
+                    before = fixture.snapshot()
+                    installer = fixture.installer()
+
+                    with self.assertRaises(PatchError) as caught:
+                        installer.install(fixture.installation, payload)
+
+                    self.assertEqual("install.payload_inventory", caught.exception.code)
+                    self.assertEqual([], installer.transactions)
+                    self.assertEqual(before, fixture.snapshot())
+                    self.assertFalse(
+                        (fixture.bottle_root / ".ostriv-macos-journal.json").exists()
+                    )
+                finally:
+                    fixture.cleanup()
+
+    def test_missing_settings_directory_is_removed_on_install_rollback(self):
+        fixture = FakeBottleFixture()
+        try:
+            fixture.settings.unlink()
+            fixture.settings.parent.rmdir()
+            before = fixture.snapshot()
+            with patch.object(
+                fixture.launcher,
+                "install",
+                side_effect=PatchError(
+                    "test.launcher_failure", "Installation failed.", "injected"
+                ),
+            ):
+                with self.assertRaises(PatchError) as caught:
+                    fixture.installer().install(
+                        fixture.installation, fixture.payload
+                    )
+
+            self.assertEqual("test.launcher_failure", caught.exception.code)
+            self.assertEqual(before, fixture.snapshot())
+            self.assertFalse(fixture.settings.parent.exists())
+        finally:
+            fixture.cleanup()
+
     def test_external_private_bottle_status_uses_absolute_root_without_managed_scope(self):
         fixture = FakeBottleFixture(scope="private")
         try:
@@ -620,6 +800,29 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_state_cannot_claim_unrelated_file_inside_game_directory(self):
+        fixture = FakeBottleFixture()
+        try:
+            installer = fixture.installer()
+            installer.install(fixture.installation, fixture.payload)
+            executable = fixture.game_dir / "ostriv.exe"
+            state_path = fixture.bottle_root / "ostriv-macos-state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["owned_files"].append(
+                {"path": str(executable.resolve()), "sha256": digest(executable.read_bytes())}
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            before = fixture.snapshot()
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual("restore.state_corrupt", caught.exception.code)
+            self.assertEqual(before, fixture.snapshot())
+            self.assertEqual(b"genuine game", executable.read_bytes())
+        finally:
+            fixture.cleanup()
+
     def test_restore_never_deletes_an_owned_path_replaced_with_unknown_content(self):
         fixture = FakeBottleFixture()
         try:
@@ -667,6 +870,26 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(b"leave me", unknown.read_bytes())
             self.assertFalse(fixture.launcher_artifact.exists())
             self.assertIn(("restore", fixture.game_dir), fixture.launcher.calls)
+        finally:
+            fixture.cleanup()
+
+    def test_legacy_environment_cleanup_is_limited_to_environment_section(self):
+        fixture = FakeBottleFixture()
+        try:
+            fixture.config.write_text(
+                fixture.config.read_text(encoding="utf-8")
+                + '"GALLIUM_DRIVER" = "d3d12"\n'
+                + "[UnrelatedSection]\n"
+                + '"GALLIUM_DRIVER" = "d3d12"\n',
+                encoding="utf-8",
+            )
+
+            fixture.installer().restore(fixture.installation)
+
+            config = fixture.config.read_text(encoding="utf-8")
+            environment, unrelated = config.split("[UnrelatedSection]", 1)
+            self.assertNotIn('"GALLIUM_DRIVER" = "d3d12"', environment)
+            self.assertIn('"GALLIUM_DRIVER" = "d3d12"', unrelated)
         finally:
             fixture.cleanup()
 

@@ -303,6 +303,40 @@ def _atomic_write_bytes(path: Path, data: bytes, mode: Optional[int] = None) -> 
             os.unlink(temp_name)
 
 
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with source.open("rb") as source_stream, tempfile.NamedTemporaryFile(
+            "wb",
+            prefix=".{}.".format(destination.name),
+            suffix=".tmp",
+            dir=str(destination.parent),
+            delete=False,
+        ) as destination_stream:
+            temp_name = destination_stream.name
+            shutil.copyfileobj(source_stream, destination_stream)
+            destination_stream.flush()
+            shutil.copystat(source, temp_name)
+            os.fsync(destination_stream.fileno())
+        os.replace(temp_name, str(destination))
+        temp_name = None
+        _fsync_directory(destination.parent)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 class LauncherPort(Protocol):
     def install(
         self, transaction: Transaction, installation: GameInstallation
@@ -393,15 +427,38 @@ class WineRegistry:
             + ["--no-update", "--no-lock", "reg"]
         )
 
-    def query(self, key: str, value: str) -> Optional[str]:
-        result = self.runner.run(self._base() + ["query", key, "/v", value])
-        if result.returncode != 0:
-            return None
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if len(fields) >= 3 and fields[0] == value:
-                return fields[-1]
-        return None
+    @staticmethod
+    def _missing(result) -> bool:
+        detail = "{}\n{}".format(result.stdout, result.stderr).lower()
+        return "not found" in detail or "unable to find" in detail
+
+    def query(
+        self, key: str, value: str, error_code: str = "install.registry"
+    ) -> Optional[str]:
+        last_detail = ""
+        pattern = re.compile(
+            r"^\s*{}\s+REG_[A-Za-z0-9_]+\s+(.*?)\s*$".format(
+                re.escape(value)
+            )
+        )
+        for _attempt in range(2):
+            result = self.runner.run(self._base() + ["query", key, "/v", value])
+            if result.returncode != 0:
+                if self._missing(result):
+                    return None
+                last_detail = result.stderr or result.stdout
+                continue
+            for line in result.stdout.splitlines():
+                match = pattern.match(line)
+                if match:
+                    return match.group(1)
+            last_detail = "Registry query succeeded without the requested value"
+        player_message = (
+            "Restore failed."
+            if error_code.startswith("restore.")
+            else "Installation failed."
+        )
+        raise PatchError(error_code, player_message, last_detail)
 
     def set(self, key: str, value: str, data: str) -> None:
         last_detail = ""
@@ -411,9 +468,12 @@ class WineRegistry:
             )
             last_detail = result.stderr
             if result.returncode == 0:
-                if self.query(key, value) == data:
-                    return
-                last_detail = "Registry query did not return the required value"
+                try:
+                    if self.query(key, value) == data:
+                        return
+                    last_detail = "Registry query did not return the required value"
+                except PatchError as error:
+                    last_detail = error.detail
         raise PatchError("install.registry", "Installation failed.", last_detail)
 
     def delete(self, key: str, value: str) -> None:
@@ -423,8 +483,13 @@ class WineRegistry:
                 self._base() + ["delete", key, "/v", value, "/f"]
             )
             last_detail = result.stderr
-            if result.returncode == 0 and self.query(key, value) is None:
-                return
+            if result.returncode == 0:
+                try:
+                    if self.query(key, value, "restore.registry") is None:
+                        return
+                    last_detail = "Registry value remains after deletion"
+                except PatchError as error:
+                    last_detail = error.detail
         raise PatchError("restore.registry", "Restore failed.", last_detail)
 
 
@@ -477,6 +542,128 @@ class Installer:
         except OSError:
             return False
 
+    def _launcher_app_path(self) -> Path:
+        if self.launcher_destination.suffix == ".app":
+            return self.launcher_destination.resolve(strict=False)
+        return (self.launcher_destination / "Ostriv (patched).app").resolve(
+            strict=False
+        )
+
+    def _allowed_launcher_artifacts(
+        self, installation: GameInstallation
+    ) -> set:
+        app = self._launcher_app_path()
+        bottle = installation.bottle.root.resolve()
+        return {
+            app,
+            app / "launcher",
+            app / "Contents/Info.plist",
+            app / "Contents/MacOS/Menu Helper",
+            app / "Contents/Resources/CrossOverHelper.icns",
+            bottle / "play-ostriv-patched.py",
+            bottle / "launcher-config.json",
+        }
+
+    def _allowed_owned_targets(self, installation: GameInstallation) -> set:
+        game_dir = installation.game_dir.resolve()
+        return {
+            *(game_dir / name for name in DRIVER_NAMES),
+            game_dir / "steam_appid.txt",
+            self._settings_path(installation),
+        }
+
+    def _allowed_settings_directories(
+        self, installation: GameInstallation
+    ) -> set:
+        directories = set()
+        current = self._settings_path(installation).parent
+        drive_c = installation.bottle.root.resolve() / "drive_c"
+        while current != drive_c and drive_c in current.parents:
+            directories.add(current)
+            current = current.parent
+        return directories
+
+    @staticmethod
+    def _valid_backup_relationship(target: Path, backup: Path) -> bool:
+        if backup.parent != target.parent:
+            return False
+        allowed_names = {
+            target.name + ".bak",
+            target.name + ".ostriv-macos.bak",
+        }
+        if backup.name in allowed_names:
+            return True
+        prefix = target.name + ".ostriv-macos-"
+        return backup.name.startswith(prefix) and backup.name.endswith(".bak")
+
+    def _validate_state_inventory(
+        self, installation: GameInstallation, state: InstallState
+    ) -> None:
+        allowed_owned = self._allowed_owned_targets(installation)
+        owned_by_path = {}
+        for item in state.owned_files:
+            path = Path(str(item["path"]))
+            digest = item.get("sha256")
+            if (
+                not path.is_absolute()
+                or path.resolve(strict=False) not in allowed_owned
+                or not isinstance(digest, str)
+            ):
+                raise ValueError("invalid owned-file inventory entry")
+            owned_by_path[path.resolve(strict=False)] = item
+            owned_directories = item.get("owned_directories", [])
+            if not isinstance(owned_directories, list) or any(
+                not isinstance(directory, str)
+                or Path(directory).resolve(strict=False)
+                not in self._allowed_settings_directories(installation)
+                for directory in owned_directories
+            ):
+                raise ValueError("invalid owned-directory inventory entry")
+
+        for item in state.backup_files:
+            target = Path(str(item["path"])).resolve(strict=False)
+            backup_text = item.get("backup_path")
+            if not isinstance(backup_text, str):
+                raise ValueError("invalid backup ownership entry")
+            backup = Path(backup_text)
+            owned = owned_by_path.get(target)
+            if (
+                target not in allowed_owned
+                or not backup.is_absolute()
+                or not self._valid_backup_relationship(
+                    target, backup.resolve(strict=False)
+                )
+                or owned is None
+                or item.get("installed_sha256") != owned.get("sha256")
+                or not isinstance(item.get("original_sha256"), str)
+            ):
+                raise ValueError("invalid backup-file inventory entry")
+
+        config = installation.bottle.root.resolve() / "cxbottle.conf"
+        settings = self._settings_path(installation)
+        for target, backup_text in (
+            (config, state.original_config_backup),
+            (settings, state.original_settings_backup),
+        ):
+            if backup_text is None:
+                continue
+            backup = Path(backup_text)
+            if (
+                not backup.is_absolute()
+                or not self._valid_backup_relationship(
+                    target, backup.resolve(strict=False)
+                )
+            ):
+                raise ValueError("invalid configuration backup inventory")
+
+        allowed_launcher = self._allowed_launcher_artifacts(installation)
+        for path in self._launcher_paths(state.launcher_artifacts):
+            if (
+                not path.is_absolute()
+                or path.resolve(strict=False) not in allowed_launcher
+            ):
+                raise ValueError("invalid launcher artifact inventory")
+
     def undo_handlers(
         self, installation: GameInstallation
     ) -> Mapping[str, Callable[[UndoRecord], None]]:
@@ -522,6 +709,7 @@ class Installer:
                 raise ValueError("ownership state belongs to another bottle")
             if state.game_realpath != str(installation.game_dir.resolve()):
                 raise ValueError("ownership state belongs to another game")
+            self._validate_state_inventory(installation, state)
             claimed_paths = [Path(str(item["path"])) for item in state.owned_files]
             for item in state.backup_files:
                 backup_path = item.get("backup_path")
@@ -559,6 +747,21 @@ class Installer:
         self, installation: GameInstallation, payload: Sequence[PayloadEntry]
     ) -> None:
         issues = []
+        expected_payload = {
+            *("prebuilt/{}".format(name) for name in DRIVER_NAMES),
+            "assets/settings.data",
+        }
+        actual_payload = [entry.relative_path for entry in payload]
+        inventory_invalid = (
+            len(actual_payload) != len(expected_payload)
+            or set(actual_payload) != expected_payload
+        )
+        if inventory_invalid:
+            issues.append(
+                "Required payload inventory mismatch: expected {!r}, received {!r}".format(
+                    sorted(expected_payload), sorted(actual_payload)
+                )
+            )
         bottle_root = installation.bottle.root.resolve()
         game_dir = installation.game_dir.resolve()
         config = bottle_root / "cxbottle.conf"
@@ -613,8 +816,9 @@ class Installer:
         self._existing_state = self._load_state(installation, "install")
         if issues:
             detail = "\n".join(issues)
-            logger.error("install.preflight: %s", detail)
-            raise PatchError("install.preflight", "Installation cannot start.", detail)
+            code = "install.payload_inventory" if inventory_invalid else "install.preflight"
+            logger.error("%s: %s", code, detail)
+            raise PatchError(code, "Installation cannot start.", detail)
 
     def _start_ownership(self) -> None:
         if self._existing_state is None:
@@ -687,28 +891,43 @@ class Installer:
             return
 
         if path.exists():
-            original_digest = _file_digest(path)
+            current_digest = _file_digest(path)
             backup_entry = self._backup_for(path)
             backup = (
                 Path(str(backup_entry["backup_path"]))
                 if backup_entry is not None
                 else self._choose_backup(path)
             )
-            undo = UndoRecord(
-                "restore_file",
-                {
-                    "path": str(path),
-                    "owned_path": str(path),
-                    "backup_path": str(backup),
-                    "installed_sha256": desired_digest,
-                    "original_sha256": original_digest,
-                },
-            )
+            if backup_entry is not None:
+                original_digest = str(backup_entry["original_sha256"])
+                if not _same_file(backup, original_digest):
+                    raise PatchError(
+                        "install.ownership_conflict",
+                        "Installation cannot replace a modified file.",
+                        "Original backup is missing or changed: {}".format(backup),
+                    )
+                snapshots = self._snapshots([path, backup])
+                for snapshot in snapshots:
+                    if snapshot.get("path") == str(path.resolve(strict=False)):
+                        snapshot["allowed_current_sha256"] = [desired_digest]
+                undo = UndoRecord("restore_file", {"snapshots": snapshots})
+            else:
+                original_digest = current_digest
+                undo = UndoRecord(
+                    "restore_file",
+                    {
+                        "path": str(path),
+                        "owned_path": str(path),
+                        "backup_path": str(backup),
+                        "installed_sha256": desired_digest,
+                        "original_sha256": original_digest,
+                    },
+                )
 
             def replace() -> None:
                 if not backup.exists():
-                    shutil.copy2(path, backup)
-                shutil.copy2(source, path)
+                    _atomic_copy_file(path, backup)
+                _atomic_copy_file(source, path)
 
             transaction.step(name, undo, replace)
             self._upsert(
@@ -729,7 +948,7 @@ class Installer:
                     "expected_sha256": desired_digest,
                 },
             )
-            transaction.step(name, undo, lambda: shutil.copy2(source, path))
+            transaction.step(name, undo, lambda: _atomic_copy_file(source, path))
         self._upsert(
             self._owned_files, {"path": str(path), "sha256": desired_digest}
         )
@@ -793,7 +1012,7 @@ class Installer:
             )
 
             def replace() -> None:
-                shutil.copy2(path, backup)
+                _atomic_copy_file(path, backup)
                 _atomic_write_bytes(path, desired, stat_mode(path))
 
             transaction.step("write game app id", undo, replace)
@@ -1015,6 +1234,11 @@ class Installer:
         desired = template.read_bytes()
         self._safe_settings(desired)
         installed_digest = _bytes_digest(desired)
+        owned_directories = []
+        current = path.parent
+        while not current.exists() and current != current.parent:
+            owned_directories.append(str(current.resolve(strict=False)))
+            current = current.parent
         transaction.step(
             "install safe graphics settings",
             UndoRecord(
@@ -1023,11 +1247,19 @@ class Installer:
                     "path": str(path),
                     "owned_path": str(path),
                     "expected_sha256": installed_digest,
+                    "owned_directories": owned_directories,
                 },
             ),
             lambda: _atomic_write_bytes(path, desired),
         )
-        self._upsert(self._owned_files, {"path": str(path), "sha256": installed_digest})
+        self._upsert(
+            self._owned_files,
+            {
+                "path": str(path),
+                "sha256": installed_digest,
+                "owned_directories": owned_directories,
+            },
+        )
         self._settings = {
             "backup": None,
             "original_digest": "",
@@ -1038,7 +1270,7 @@ class Installer:
     def _backup_and_write(path: Path, backup: Path, data: bytes) -> None:
         mode = stat_mode(path)
         if not backup.exists():
-            shutil.copy2(path, backup)
+            _atomic_copy_file(path, backup)
         _atomic_write_bytes(path, data, mode)
 
     def _completed_time(self) -> str:
@@ -1274,6 +1506,28 @@ class Installer:
         expected = record.data.get("expected_sha256")
         if isinstance(expected, str) and _same_file(path, expected):
             path.unlink()
+        if path.exists():
+            return
+        self._remove_empty_owned_directories(
+            installation, record.data.get("owned_directories", [])
+        )
+
+    def _remove_empty_owned_directories(
+        self, installation: GameInstallation, directories: object
+    ) -> None:
+        if not isinstance(directories, list):
+            return
+        allowed = self._allowed_settings_directories(installation)
+        for directory_text in directories:
+            if not isinstance(directory_text, str):
+                continue
+            directory = Path(directory_text).resolve(strict=False)
+            if directory not in allowed:
+                continue
+            try:
+                directory.rmdir()
+            except (FileNotFoundError, OSError):
+                pass
 
     def _undo_restore_file(
         self, installation: GameInstallation, record: UndoRecord
@@ -1317,7 +1571,7 @@ class Installer:
         if not isinstance(key, str) or not isinstance(value, str):
             return
         registry = self._registry(installation)
-        current = registry.query(key, value)
+        current = registry.query(key, value, "restore.registry")
         if current == before:
             return
         if current != after:
@@ -1368,10 +1622,17 @@ class Installer:
         path = Path(str(item["path"]))
         expected = str(item.get("sha256", ""))
         snapshots = self._snapshots([path])
+        def remove_owned() -> None:
+            if _same_file(path, expected):
+                path.unlink()
+                self._remove_empty_owned_directories(
+                    installation, item.get("owned_directories", [])
+                )
+
         transaction.step(
             "remove {}".format(path.name),
             UndoRecord("restore_file", {"snapshots": snapshots}),
-            lambda: path.unlink() if _same_file(path, expected) else None,
+            remove_owned,
         )
 
     @staticmethod
@@ -1397,7 +1658,9 @@ class Installer:
                     failures.append("original file was not restored: {}".format(path))
             elif _same_file(path, str(item.get("sha256", ""))):
                 failures.append("owned file remains: {}".format(path))
-        registry_value = self._registry(installation).query(REGISTRY_KEY, REGISTRY_VALUE)
+        registry_value = self._registry(installation).query(
+            REGISTRY_KEY, REGISTRY_VALUE, "restore.registry"
+        )
         if registry_value != state.prior_registry_value:
             failures.append("registry value was not restored")
         config = installation.bottle.root.resolve() / "cxbottle.conf"
@@ -1501,7 +1764,9 @@ class Installer:
                     "restore_settings",
                 )
             registry = self._registry(installation)
-            current_registry = registry.query(REGISTRY_KEY, REGISTRY_VALUE)
+            current_registry = registry.query(
+                REGISTRY_KEY, REGISTRY_VALUE, "restore.registry"
+            )
             if current_registry == REGISTRY_DATA and current_registry != state.prior_registry_value:
                 transaction.step(
                     "restore registry override",
@@ -1595,7 +1860,10 @@ class Installer:
                     path.unlink,
                 )
         registry = self._registry(installation)
-        if registry.query(REGISTRY_KEY, REGISTRY_VALUE) == REGISTRY_DATA:
+        if (
+            registry.query(REGISTRY_KEY, REGISTRY_VALUE, "restore.registry")
+            == REGISTRY_DATA
+        ):
             transaction.step(
                 "remove legacy registry override",
                 UndoRecord(
@@ -1675,16 +1943,26 @@ class Installer:
             text = data.decode("utf-8")
         except UnicodeError:
             return data
-        for key, value in BOTTLE_ENV.items():
-            text = re.sub(
-                r'^\s*"{}"\s*=\s*"{}"\s*\r?\n'.format(
+        kept = []
+        in_environment = False
+        patterns = tuple(
+            re.compile(
+                r'^\s*"{}"\s*=\s*"{}"\s*$'.format(
                     re.escape(key), re.escape(value)
-                ),
-                "",
-                text,
-                flags=re.MULTILINE,
+                )
             )
-        return text.encode("utf-8")
+            for key, value in BOTTLE_ENV.items()
+        )
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_environment = stripped == "[EnvironmentVariables]"
+                kept.append(line)
+                continue
+            if in_environment and any(pattern.match(stripped) for pattern in patterns):
+                continue
+            kept.append(line)
+        return "".join(kept).encode("utf-8")
 
 
 def stat_mode(path: Path) -> int:
