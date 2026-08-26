@@ -96,6 +96,10 @@ class PayloadTests(unittest.TestCase):
         path = self.write_manifest_data({"schema": 2, "files": []})
         self.assert_payload_error(lambda: load_manifest(path), "payload.manifest")
 
+    def test_empty_files_list_is_rejected(self):
+        path = self.write_manifest_data({"schema": 1, "files": []})
+        self.assert_payload_error(lambda: load_manifest(path), "payload.manifest")
+
     def test_duplicate_paths_are_rejected(self):
         entry = {
             "path": "prebuilt/opengl32.dll",

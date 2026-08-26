@@ -32,7 +32,7 @@ def load_manifest(path: Path) -> Tuple[PayloadEntry, ...]:
     if not isinstance(data, dict) or data.get("schema") != 1:
         raise _manifest_error("Unsupported payload manifest schema")
     items = data.get("files")
-    if not isinstance(items, list):
+    if not isinstance(items, list) or not items:
         raise _manifest_error("Invalid payload manifest files list")
 
     entries = []
