@@ -39,31 +39,37 @@ the sibling `cs2-macos-patcher`, which rewrites .NET IL).
 
 ## Layout
 
-- `patch.py` — user entry point (Python 3, stdlib only). Detects the bottle, installs driver
-  (`.bak` backups), override, bottle env, `steam_appid.txt`, `settings.data`, and generates
-  `~/Applications/CrossOver/Ostriv (patched).app` + its cxmenu entry. The launcher runs a script
-  (written into the bottle dir) that saves/switches/restores the color profile via ColorSync
-  ctypes, starts Steam if needed, and runs
-  `wine --bottle … --check --wait-children --start "C:/…/ostriv.exe"`.
-  Interactive Install/Reinstall/Restore, or `python3 patch.py <game-dir>`. Idempotent.
+- `patch.py` — thin Python 3.9+ player entry point. It delegates Install, Reinstall, Restore,
+  read-only diagnosis, and package preflight to `ostriv_macos.cli`.
+- `ostriv_macos/` — standard-library-only package. `discovery.py` resolves CrossOver, bottles,
+  and games; `payload.py` verifies the bundled manifest; `installer.py` owns journaled bottle
+  changes; `launcher.py` materializes the app/runtime/config; `launcher_runtime.py` owns the
+  one-click Steam/profile state machine; `diagnostics.py` owns commands, logs, and player output.
+- `payload-manifest.json` — exact size, SHA-256, and PE-header contract for every required payload
+  file. Validation finishes before the installer mutates a bottle.
 - `assets/settings.data` — known-good settings template (MSAA off, borderless fullscreen).
+- `scripts/build-release.py` — builds and verifies the allowlisted, no-Git player ZIP.
 - `scripts/build-driver.sh` — clones Mesa 26.1.3, applies the patch, cross-compiles with mingw.
 - `patches/mesa-26.1.3-winemac-async-present.patch` — the Mesa source patch (4 files, see fixes
   2–5). Regenerate with `git diff` in the Mesa tree.
 - `prebuilt/` — drop-in DLLs, tracked via **Git LFS**.
+- `tests/` — deterministic unit, fake-process integration, rollback, launcher, CLI snapshot, and
+  release-artifact coverage. Tests must never launch installed CrossOver, Steam, or Ostriv.
 - `docs/technical.md` — every bug, fix, and dead end in detail.
 
 ## Commands
 
 ```bash
-python3 patch.py            # interactive install/restore into the detected bottle
-./scripts/build-driver.sh   # rebuild the driver (needs mingw-w64, meson, ninja, bison, python-mako)
+python3 -m unittest discover -s tests -v
+python3 scripts/build-release.py --output dist/ostriv-macos-player.zip
+python3 patch.py --preflight
+python3 patch.py --diagnose
+./scripts/build-driver.sh
 ```
 
-No unit tests. Verify by launching (double-click `Ostriv (patched).app`) and reading
-`<bottle>/drive_c/users/crossover/Saved Games/Ostriv/log.txt`:
-healthy = `4.3 (Core Profile) Mesa` → `uiMainMenu`; MSAA crash = `windows_createWindow FAILED`;
-stock driver = `2.1 Metal`. The game process is named **`Menu Helper`**, not `ostriv.exe`.
+`--preflight` is silent and checks only the downloaded package. `--diagnose` is process-free,
+read-only, and prints a concise local summary. The driver rebuild still needs mingw-w64, meson,
+ninja, bison, and python-mako; none of those are player dependencies.
 
 ## Hard-won rules — DO NOT violate
 

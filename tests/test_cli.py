@@ -1,3 +1,4 @@
+import ast
 import io
 import hashlib
 import json
@@ -967,5 +968,83 @@ class ReadOnlyCliTests(unittest.TestCase):
         self.assertEqual("", stderr.getvalue())
 
 
+class GlobalConstraintTests(unittest.TestCase):
+    def test_runtime_imports_are_standard_library_or_local_and_have_no_network_clients(self):
+        root = Path(__file__).resolve().parent.parent
+        runtime = [root / "patch.py", *sorted((root / "ostriv_macos").glob("*.py"))]
+        allowed = {
+            "argparse", "ast", "atexit", "base64", "bz2", "collections",
+            "configparser", "copy", "ctypes", "dataclasses", "datetime", "errno",
+            "fcntl", "hashlib", "json", "logging", "os", "ostriv_macos", "pathlib",
+            "platform", "plistlib", "re", "secrets", "shlex", "shutil", "signal",
+            "stat", "struct", "subprocess", "sys", "tempfile", "termios", "time",
+            "traceback", "tty", "typing",
+        }
+        imported = set()
+        source = []
+        for path in runtime:
+            text = path.read_text(encoding="utf-8")
+            source.append(text)
+            for node in ast.walk(ast.parse(text, filename=str(path))):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    imported.add(node.module.split(".")[0])
+        self.assertEqual(set(), imported - allowed)
+        lowered = "\n".join(source).lower()
+        for token in ("curl ", "wget ", "telemetry", "upload diagnostics"):
+            self.assertNotIn(token, lowered)
+
+    def test_install_does_not_modify_ostriv_executable_or_steam_files(self):
+        fixture = FakeBottleFixture()
+        self.addCleanup(fixture.cleanup)
+        steam = fixture.bottle_root / "drive_c/Program Files (x86)/Steam"
+        steam.mkdir(parents=True)
+        steam_executable = steam / "steam.exe"
+        steam_config = steam / "config/config.vdf"
+        steam_config.parent.mkdir()
+        steam_executable.write_bytes(b"genuine Steam executable")
+        steam_config.write_bytes(b"genuine Steam configuration")
+        game_before = (fixture.game_dir / "ostriv.exe").read_bytes()
+        steam_before = (steam_executable.read_bytes(), steam_config.read_bytes())
+
+        fixture.installer().install(fixture.installation, fixture.payload)
+
+        self.assertEqual(game_before, (fixture.game_dir / "ostriv.exe").read_bytes())
+        self.assertEqual(
+            steam_before,
+            (steam_executable.read_bytes(), steam_config.read_bytes()),
+        )
+
+    def test_player_documentation_claims_only_apple_silicon_support(self):
+        root = Path(__file__).resolve().parent.parent
+        player = (root / "README.md").read_text(encoding="utf-8").split(
+            "## Development", 1
+        )[0]
+        self.assertIn("Apple Silicon", player)
+        self.assertNotIn("Intel", player)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# Approved design coverage map (requirement | named regression evidence)
+# Success | self-contained no-Git player ZIP | ReleaseArtifactTests.test_built_zip_has_exact_hydrated_inventory_and_preflights_gitless
+# Success | no incomplete or partial install success | PayloadTests.test_missing_payload_is_rejected; InstallerTests.test_failure_after_each_actual_journaled_mutation_restores_original_tree
+# Success | default, symlinked, registered, external bottles | DiscoveryTests.test_environment_roots_include_private_and_managed_paths; DiscoveryTests.test_symlinked_bottle_keeps_name_and_resolves_real_root; DiscoveryTests.test_helper_plist_adds_valid_absolute_private_bottle
+# Success | one click starts/waits for Steam and launches Ostriv | SteamControllerTests.test_absent_client_opens_matching_crossover_steam_app_once; LauncherOrchestrationTests.test_successful_launch_follows_exact_order_and_restores_before_unlock
+# Success | repeated clicks cannot race | ProcessLockTests.test_second_launcher_is_rejected_until_first_lock_closes; LauncherOrchestrationTests.test_lock_failure_shows_one_message_and_short_circuits_every_adapter
+# Success | one controlled Steam initialization retry | LauncherOrchestrationTests.test_only_fresh_steam_api_failure_gets_one_retry; LauncherOrchestrationTests.test_graphics_and_unrelated_failures_never_retry
+# Success | exact display profile restoration and recovery | ProfileGuardTests.test_exit_restores_exact_original_profile; ProfileGuardTests.test_next_launch_recovers_factory_default_none; LauncherOrchestrationTests.test_game_runner_failure_restores_profile_and_releases_lock
+# Success | concise, actionable, non-repetitive terminal output | CliTests.test_success_is_brief_and_non_repetitive; CliTests.test_production_error_codes_map_to_one_action_at_cli_boundary
+# Success | detailed local diagnostics without raw player commands | DiagnosticsTests.test_logger_keeps_detail_out_of_player_output; ReadOnlyCliTests.test_main_diagnose_prints_concise_findings_without_creating_log
+# Success | installer, launcher, recovery, release failures automated | InstallerTests.test_failure_after_each_actual_journaled_mutation_restores_original_tree; LauncherInstallerTests.test_production_transaction_recovers_owned_pending_tree_after_restart; ReleaseArtifactTests.test_failed_build_does_not_replace_an_existing_asset
+# Constraint | patch.py is the only documented player install command | PlayerDocumentationTests.test_readme_leads_with_one_ordered_player_path
+# Constraint | runtime is standard-library-only | GlobalConstraintTests.test_runtime_imports_are_standard_library_or_local_and_have_no_network_clients; LauncherInstallerTests.test_installed_runtime_has_no_project_import_and_survives_source_move
+# Constraint | no executable payload download at install time | GlobalConstraintTests.test_runtime_imports_are_standard_library_or_local_and_have_no_network_clients; ReleaseArtifactTests.test_built_zip_has_exact_hydrated_inventory_and_preflights_gitless
+# Constraint | no telemetry or diagnostic upload | GlobalConstraintTests.test_runtime_imports_are_standard_library_or_local_and_have_no_network_clients; ReadOnlyCliTests.test_diagnose_is_process_free_read_only_and_succeeds_without_crossover
+# Constraint | do not modify Ostriv executables or Steam files | GlobalConstraintTests.test_install_does_not_modify_ostriv_executable_or_steam_files
+# Constraint | preserve DLLs/settings and Restore originals | InstallerTests.test_install_preserves_genuine_dll_and_unrelated_config_and_settings; InstallerTests.test_install_reinstall_restore_are_byte_for_byte_idempotent
+# Constraint | Apple Silicon only, no Intel support claim | GlobalConstraintTests.test_player_documentation_claims_only_apple_silicon_support
+# Constraint | no Steam overlay dependency; launch outside Play | SteamControllerTests.test_absent_client_opens_matching_crossover_steam_app_once; PlayerDocumentationTests.test_readme_leads_with_one_ordered_player_path

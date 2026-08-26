@@ -52,6 +52,56 @@ Tested: Apple M5 Max · macOS · CrossOver 26.2 · Ostriv 0.5.9.58 (Steam).
 
 Software fallback if the GPU path breaks: `GALLIUM_DRIVER=llvmpipe` (visible, slow).
 
+## Hardened installer architecture
+
+`patch.py` is only the Python 3.9 guard and CLI entry point. The standard-library-only
+`ostriv_macos` package separates ownership so player output and bottle mutation cannot leak into
+each other:
+
+| Module | Ownership |
+| --- | --- |
+| `cli.py` | Install/Reinstall/Restore selection, read-only preflight/diagnosis, and final player outcomes |
+| `diagnostics.py` | Tolerant subprocess decoding, typed failures, concise terminal rendering, and local log setup |
+| `payload.py` | `payload-manifest.json` parsing and pre-mutation file/type/size/SHA-256 validation |
+| `discovery.py` | CrossOver discovery and resolved `Bottle`/`GameInstallation` models |
+| `installer.py` | Preflight, journaled driver/registry/config/settings operations, verification, and Restore |
+| `launcher.py` | Verified app materialization, copied runtime/config, cxmenu registration, and legacy migration |
+| `launcher_runtime.py` | Per-bottle lock, Steam readiness/retry, display-profile recovery, game launch, and launcher logging |
+
+The payload manifest is the release contract, not a best-effort inventory. Every required DLL and
+`assets/settings.data` entry has an exact size and SHA-256 digest; DLLs must also be regular PE
+files with an `MZ` header and not Git LFS pointers. The complete payload is validated before the
+first destination mutation and revalidated in the extracted player ZIP.
+
+Discovery carries a resolved `Bottle` object through the rest of the installer. It keeps the
+bottle's display name, canonical root, private/managed scope, and owning CrossOver installation.
+Private and symlinked external bottles therefore use their absolute resolved roots, while managed
+bottles use their registered names and `--scope managed`; later modules never reconstruct a
+bottle from a fixed default directory.
+
+Each selected bottle stores two distinct durable records:
+
+- `.ostriv-macos-journal.json` is the in-progress transaction journal. Every mutation records its
+  idempotent undo operation before applying the change, so an error rolls back in reverse and the
+  next run can recover an interrupted operation.
+- `ostriv-macos-state.json` is the completed ownership state. It records genuine backups, prior
+  registry/config/settings values, owned files, launcher artifacts, and verification metadata so
+  Restore changes only project-owned content and is safe to repeat.
+
+The launcher is data plus packaged code, not interpolated source. Installation copies
+`launcher_runtime.py` byte-for-byte to `<bottle>/play-ostriv-patched.py`, writes the resolved
+values to `<bottle>/launcher-config.json`, verifies both and the pending app bundle, then swaps the
+app into place. The runtime holds an advisory flock at `<bottle>/.ostriv-launcher.lock` and keeps
+the exact original display profile in `<bottle>/.ostriv-profile-recovery.json` until restoration
+succeeds. A killed run leaves the marker for recovery on the next click; a stale lock pathname is
+harmless because the kernel owns the lock.
+
+Detailed installer logs stay at `~/Library/Logs/ostriv-macos/install.log`. Launcher logs use a
+filesystem-safe bottle identity under `~/Library/Logs/ostriv-macos/`. They contain command and
+state detail locally; the terminal and dialogs receive only one concise outcome and action. The
+read-only `python3 patch.py --diagnose` path does not create logs, start processes, mutate files,
+access the network, or upload data.
+
 ## The Mesa patch (patches/mesa-26.1.3-winemac-async-present.patch)
 
 - **`gdi_sw_winsys.c` — async present.** The GDI upload is expensive; done inline it caps
@@ -126,12 +176,12 @@ limiter). Applies live. The *root* fix belongs in winemac — tagging the surfac
 `CGDisplayCopyColorSpace` — see the ready-to-post report in
 [crossover-bug-report.md](crossover-bug-report.md).
 
-**The launcher automates it.** `patch.py` creates `~/Applications/CrossOver/Ostriv
-(patched).app` plus a cxmenu entry, whose command runs a generated Python script (stored in
-the bottle dir): save current profile → set sRGB (`ColorSyncDeviceSetCustomProfiles`,
-per-user, no admin) → start Steam if needed (`pgrep -f 'steam\.exe'`) → run
-`wine --bottle <bottle> --check --wait-children --start "C:/…/ostriv.exe"` → restore the
-profile on exit.
+**The launcher automates it.** The installer creates `~/Applications/CrossOver/Ostriv
+(patched).app` plus a cxmenu entry. Its command runs the packaged runtime copied into the bottle
+with a separate JSON configuration: recover a previous marker → save the exact current profile →
+set sRGB (`ColorSyncDeviceSetCustomProfiles`, per-user, no admin) → establish stable Steam
+readiness → run `wine --bottle <bottle> --check --wait-children --start
+"C:/…/ostriv.exe"` → restore the original profile in every handled exit path.
 
 Hard-won implementation facts:
 
