@@ -4,6 +4,7 @@ import configparser
 import os
 import plistlib
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -78,7 +79,7 @@ def _acceptable_app_path(path: str) -> bool:
 def _runner_stdout(runner: CommandRunner, argv: Sequence[str], timeout: float) -> str:
     try:
         return runner.run(argv, timeout=timeout).stdout
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return ""
 
 
@@ -161,8 +162,8 @@ def _root_sources(
     private_paths.append(private_default)
     managed_paths = list(_absolute_paths(env.get("CX_MANAGED_BOTTLE_PATH")))
     managed_paths.append(managed_root)
-    return [(path, "private") for path in private_paths] + [
-        (path, "managed") for path in managed_paths
+    return [(path, "managed") for path in managed_paths] + [
+        (path, "private") for path in private_paths
     ]
 
 
@@ -288,7 +289,6 @@ def discover_games(bottles: Iterable[Bottle]) -> List[GameInstallation]:
     for bottle in bottles:
         for game_dir in _search_ostriv(bottle.root / "drive_c", depth=8):
             games.append(GameInstallation(bottle, game_dir, _ostriv_version(bottle)))
-            break
     return games
 
 

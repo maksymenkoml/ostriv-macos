@@ -1,5 +1,6 @@
 import os
 import plistlib
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -120,6 +121,27 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual("Managed Space", bottle.command_bottle())
         self.assertEqual(["--scope", "managed"], bottle.scope_args())
 
+    def test_managed_bottle_wins_over_private_symlink_alias(self):
+        private = self.home / "Private Bottles"
+        managed = self.home / "Managed Bottles"
+        actual = make_bottle(managed, "Managed Bottle")
+        private.mkdir()
+        (private / "Private Alias").symlink_to(actual, target_is_directory=True)
+        bottles = discover_bottles(
+            self.crossover(),
+            self.home,
+            {
+                "CX_BOTTLE_PATH": str(private),
+                "CX_MANAGED_BOTTLE_PATH": str(managed),
+            },
+            self.managed_root(),
+        )
+        self.assertEqual(1, len(bottles))
+        self.assertEqual("Managed Bottle", bottles[0].name)
+        self.assertEqual("managed", bottles[0].scope)
+        self.assertEqual("Managed Bottle", bottles[0].command_bottle())
+        self.assertEqual(["--scope", "managed"], bottles[0].scope_args())
+
     def test_private_bottle_uses_resolved_absolute_path_without_scope(self):
         root = make_bottle(self.home / "External Bottles", "Ostriv Україна")
         bottle = Bottle("Ostriv Україна", root.resolve(), "private", self.crossover())
@@ -193,7 +215,20 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual([app.resolve()], [item.app for item in apps])
 
-    def test_discover_games_finds_one_game_per_bottle_and_parses_version(self):
+    def test_find_crossover_apps_ignores_runner_timeouts(self):
+        class TimeoutRunner:
+            def run(self, argv, timeout=None):
+                raise subprocess.TimeoutExpired(argv, timeout)
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=TimeoutRunner(),
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+        self.assertEqual([], apps)
+
+    def test_discover_games_finds_all_games_per_bottle_and_parses_version(self):
         bottle_root = make_bottle(self.home / "Bottles", "Game Bottle")
         game = bottle_root / "drive_c/Steam/steamapps/common/Ostriv"
         game.mkdir(parents=True)
@@ -206,9 +241,8 @@ class DiscoveryTests(unittest.TestCase):
         log.write_text("Alpha (0.5.9.58 Jun 4 2026)\n", encoding="utf-8")
         bottle = Bottle("Game Bottle", bottle_root.resolve(), "private", self.crossover())
         games = discover_games([bottle])
-        self.assertEqual(1, len(games))
-        self.assertIn(games[0].game_dir, (game.resolve(), duplicate.resolve()))
-        self.assertEqual("0.5.9.58", games[0].version)
+        self.assertEqual([duplicate.resolve(), game.resolve()], [item.game_dir for item in games])
+        self.assertEqual(["0.5.9.58", "0.5.9.58"], [item.version for item in games])
 
     def test_discover_games_returns_no_results_without_ostriv(self):
         root = make_bottle(self.home / "Bottles", "Empty")
