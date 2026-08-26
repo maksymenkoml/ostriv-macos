@@ -6,13 +6,300 @@ keep working after the release directory that supplied it has gone away.
 
 import atexit
 import ctypes
+import fcntl
 import json
+import logging
 import os
+import plistlib
 import signal
+import sys
 import tempfile
+import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+SRGB_PROFILE = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+
+
+class LauncherRuntimeError(RuntimeError):
+    """A handled launcher failure whose player message comes from configuration."""
+
+    def __init__(self, message_key: str, detail: str = "") -> None:
+        super().__init__(detail or message_key)
+        self.message_key = message_key
+        self.detail = detail or message_key
+
+
+class ProcessLock:
+    """A kernel-owned advisory lock whose on-disk path may safely outlive a process."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.fd = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(
+            str(self.path),
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            os.close(self.fd)
+            self.fd = None
+            return False
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def read_new_log(path: Path, offset: int) -> str:
+    path = Path(path)
+    if not path.exists():
+        return ""
+    with path.open("rb") as stream:
+        stream.seek(min(offset, path.stat().st_size))
+        return stream.read().decode("utf-8", errors="replace")
+
+
+def classify_launch(text: str) -> str:
+    if "SteamAPI_Init() failed" in text:
+        return "steam_api"
+    if "windows_createWindow FAILED" in text:
+        return "graphics_context"
+    return "other"
+
+
+def _create_launcher_log(path: Path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("ostriv_macos.launcher")
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    handler = logging.FileHandler(
+        str(path), encoding="utf-8", errors="backslashreplace"
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+@dataclass(frozen=True)
+class SteamSignals:
+    process: bool
+    active_user: bool
+    renderer: bool
+
+    @property
+    def ready(self) -> bool:
+        return self.process and self.active_user and self.renderer
+
+
+@dataclass(frozen=True)
+class ExternalResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class ExternalProcessRunner:
+    """Run external commands without ever exposing their raw output to the player."""
+
+    def run(self, argv, timeout=None) -> ExternalResult:
+        import subprocess
+
+        result = subprocess.run(
+            list(argv), capture_output=True, check=False, timeout=timeout
+        )
+        return ExternalResult(
+            result.returncode,
+            result.stdout.decode("utf-8", errors="replace"),
+            result.stderr.decode("utf-8", errors="replace"),
+        )
+
+
+def _display_dialog(message: str) -> None:
+    script = (
+        "on run argv\n"
+        'display dialog (item 1 of argv) with title "Ostriv for macOS" '
+        'buttons {"OK"} default button "OK"\n'
+        "end run"
+    )
+    try:
+        ExternalProcessRunner().run(
+            ["osascript", "-e", script, message], timeout=30.0
+        )
+    except Exception:
+        pass
+
+
+def _send_notification(message: str, runner) -> None:
+    script = (
+        "on run argv\n"
+        'display notification (item 1 of argv) with title "Ostriv for macOS"\n'
+        "end run"
+    )
+    try:
+        runner.run(["osascript", "-e", script, message], timeout=30.0)
+    except Exception:
+        pass
+
+
+class SteamController:
+    """Wait for Steam's process, login, and renderer signals to become stable."""
+
+    def __init__(
+        self,
+        probe=None,
+        open_steam=None,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+        poll_seconds: float = 2.0,
+        transition_stable_seconds: float = 15.0,
+        timeout_seconds: float = 300.0,
+        notify=lambda: None,
+        config=None,
+        runner=None,
+    ) -> None:
+        self._probe = probe
+        self.config = config
+        self.runner = runner
+        self.open_steam = open_steam or self._open_configured_steam
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.poll_seconds = poll_seconds
+        self.transition_stable_seconds = transition_stable_seconds
+        self.timeout_seconds = timeout_seconds
+        self.notify = notify
+        self._opened = False
+        self._notified = False
+
+    def _wine_command(self, *arguments: str) -> List[str]:
+        command = [self.config.wine, "--bottle", self.config.bottle_argument]
+        if self.config.scope == "managed":
+            command.extend(["--scope", "managed"])
+        command.extend(arguments)
+        return command
+
+    def _open_configured_steam(self) -> bool:
+        if self.config is None or self.runner is None:
+            return False
+        root = Path(self.config.steam_apps_root)
+        folders = [root]
+        try:
+            folders.extend(
+                entry
+                for entry in root.iterdir()
+                if entry.is_dir() and entry.suffix != ".app"
+            )
+        except OSError:
+            folders = []
+        for folder in folders:
+            try:
+                entries = list(folder.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.is_dir() or entry.suffix != ".app":
+                    continue
+                try:
+                    with (entry / "Contents/Info.plist").open("rb") as stream:
+                        properties = plistlib.load(stream)
+                except (OSError, plistlib.InvalidFileException, ValueError):
+                    continue
+                command = properties.get("CrossOverHelperCommand", "")
+                if (
+                    properties.get("CXHelperAppBottleName") == self.config.bottle_name
+                    and isinstance(command, str)
+                    and command.rstrip('"').lower().endswith("/steam.lnk")
+                ):
+                    self.runner.run(["open", str(entry)], timeout=10.0)
+                    return True
+
+        if not self.config.steam_links:
+            return False
+        command = self._wine_command("--start", self.config.steam_links[0])
+        self.runner.run(command, timeout=10.0)
+        return True
+
+    def probe(self) -> SteamSignals:
+        if self._probe is not None:
+            return self._probe()
+        if self.config is None or self.runner is None:
+            raise TypeError("SteamController requires a probe or config and runner")
+
+        process = self.runner.run(
+            ["pgrep", "-f", r"steam\.exe"], timeout=5.0
+        ).returncode == 0
+        registry_command = self._wine_command(
+            "--no-update",
+            "--no-lock",
+            "reg",
+            "query",
+            r"HKCU\Software\Valve\Steam\ActiveProcess",
+        )
+        registry = self.runner.run(registry_command, timeout=10.0)
+        output = registry.stdout
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        active_user = False
+        for line in str(output).splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "ActiveUser" and parts[2].startswith("0x"):
+                try:
+                    active_user = int(parts[2], 16) != 0
+                except ValueError:
+                    active_user = False
+        renderer = self.runner.run(
+            ["pgrep", "-f", "steamwebhelper.exe.*type=renderer"], timeout=5.0
+        ).returncode == 0
+        return SteamSignals(process, active_user, renderer)
+
+    def ensure_ready(self, timeout_seconds: Optional[float] = None) -> None:
+        started_at = self.monotonic()
+        timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        signals = self.probe()
+        if signals.ready:
+            self.sleep(self.poll_seconds)
+            signals = self.probe()
+            if signals.ready:
+                return
+        elif not signals.process and not self._opened:
+            self.open_steam()
+            self._opened = True
+
+        if not self._notified:
+            self.notify()
+            self._notified = True
+        ready_since = self.monotonic() if signals.ready else None
+        while self.monotonic() - started_at < timeout:
+            self.sleep(self.poll_seconds)
+            signals = self.probe()
+            now = self.monotonic()
+            if signals.ready:
+                if ready_since is None:
+                    ready_since = now
+                if now - ready_since >= self.transition_stable_seconds:
+                    return
+            else:
+                ready_since = None
+        message_key = (
+            "steam_login"
+            if signals.process and not signals.active_user
+            else "steam_timeout"
+        )
+        raise LauncherRuntimeError(message_key, "Steam did not become ready")
 
 
 def atomic_json(path: Path, data: Dict[str, Any]) -> None:
@@ -65,9 +352,37 @@ class LauncherConfig:
     @classmethod
     def load(cls, path: Path) -> "LauncherConfig":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or type(data.get("schema")) is not int:
+            raise RuntimeError("Invalid launcher configuration")
         if data.get("schema") != 1:
             raise RuntimeError("Unsupported launcher configuration")
-        return cls(**data)
+        string_fields = (
+            "bottle_name",
+            "bottle_argument",
+            "scope",
+            "wine",
+            "steam_apps_root",
+            "game_log",
+            "launcher_log",
+            "lock_path",
+            "recovery_marker",
+        )
+        if any(type(data.get(field)) is not str for field in string_fields):
+            raise RuntimeError("Invalid launcher configuration")
+        for field in ("game_command", "steam_links"):
+            value = data.get(field)
+            if not isinstance(value, list) or any(type(item) is not str for item in value):
+                raise RuntimeError("Invalid launcher configuration")
+        messages = data.get("messages")
+        if not isinstance(messages, dict) or any(
+            type(key) is not str or type(value) is not str
+            for key, value in messages.items()
+        ):
+            raise RuntimeError("Invalid launcher configuration")
+        try:
+            return cls(**data)
+        except TypeError as error:
+            raise RuntimeError("Invalid launcher configuration") from error
 
 
 class ColorSyncProfileBackend:
@@ -247,3 +562,133 @@ def install_signal_handlers(guard: ProfileGuard) -> None:
 def run_game(config: LauncherConfig, runner):
     """Run the configured game command through the caller's tolerant runner."""
     return runner.run(config.game_command)
+
+
+def _log_offset(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def run_launcher(
+    config: LauncherConfig,
+    *,
+    lock=None,
+    log_factory=None,
+    runner=None,
+    steam=None,
+    profile=None,
+    dialog=None,
+    install_handlers=None,
+) -> int:
+    """Run one locked launcher lifecycle using injectable platform boundaries."""
+    actual_lock = lock or ProcessLock(Path(config.lock_path))
+    if not actual_lock.acquire():
+        message = config.messages.get(
+            "already_running", "Ostriv is already starting or running."
+        )
+        if dialog is None:
+            _display_dialog(message)
+        else:
+            dialog(message)
+        return 0
+
+    logger = None
+    actual_profile = profile
+    final_state = "failed"
+    try:
+        actual_log_factory = log_factory or _create_launcher_log
+        logger = actual_log_factory(Path(config.launcher_log))
+        actual_runner = runner or ExternalProcessRunner()
+        if actual_profile is None:
+            actual_profile = ProfileGuard(
+                ColorSyncProfileBackend(),
+                Path(config.recovery_marker),
+                SRGB_PROFILE,
+            )
+        actual_steam = steam or SteamController(
+            config=config,
+            runner=actual_runner,
+            notify=lambda: _send_notification(
+                config.messages.get(
+                    "steam_wait", "Waiting for Steam to finish starting."
+                ),
+                actual_runner,
+            ),
+        )
+        logger.info("launcher state: recover")
+        actual_profile.recover()
+        logger.info("launcher state: steam readiness")
+        actual_steam.ensure_ready()
+        (install_handlers or install_signal_handlers)(actual_profile)
+        actual_profile.switch()
+
+        game_log = Path(config.game_log)
+        offset = _log_offset(game_log)
+        run_game(config, actual_runner)
+        final_state = classify_launch(read_new_log(game_log, offset))
+        if final_state == "steam_api":
+            actual_steam.ensure_ready(timeout_seconds=30.0)
+            offset = _log_offset(game_log)
+            run_game(config, actual_runner)
+            final_state = classify_launch(read_new_log(game_log, offset))
+        return 0
+    except Exception:
+        if logger is not None:
+            logger.exception("launcher failed")
+        raise
+    finally:
+        try:
+            if actual_profile is not None:
+                actual_profile.restore_once()
+        except Exception:
+            final_state = "failed"
+            if logger is not None:
+                logger.exception("display profile restoration failed")
+            raise
+        finally:
+            if logger is not None:
+                logger.info("launcher final state: %s", final_state)
+            actual_lock.close()
+
+
+def _record_entrypoint_failure(path: Path, error: Exception) -> None:
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", errors="backslashreplace") as stream:
+            stream.write(
+                "launcher entrypoint failure: {}: {}\n".format(
+                    type(error).__name__, error
+                )
+            )
+            stream.write(traceback.format_exc())
+    except Exception:
+        pass
+
+
+def main(argv=None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if len(arguments) != 1:
+        return 2
+    try:
+        config = LauncherConfig.load(Path(arguments[0]))
+    except Exception:
+        return 2
+
+    try:
+        return run_launcher(config)
+    except Exception as error:
+        _record_entrypoint_failure(Path(config.launcher_log), error)
+        message_key = getattr(error, "message_key", "error")
+        message = config.messages.get(
+            message_key,
+            config.messages.get("error", "Unable to start Ostriv."),
+        )
+        _display_dialog(message)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
