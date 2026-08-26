@@ -287,6 +287,118 @@ class FakeBottleFixture:
 
 
 class InstallerTests(unittest.TestCase):
+    def test_staging_cleanup_preserves_payload_substituted_after_validation(self):
+        fixture = FakeBottleFixture()
+        try:
+            destination = (fixture.game_dir / "opengl32.dll.bak").resolve()
+            genuine = (fixture.game_dir / "opengl32.dll").read_bytes()
+            unknown = b"unknown payload replacement after successful validation"
+            installer = fixture.installer()
+            installer.preflight(fixture.installation, fixture.payload)
+            installer._start_ownership()
+            transaction = installer.transaction_for(fixture.installation)
+            transaction.start("install")
+            staging = installer._prepare_copy_staging(
+                transaction, fixture.installation, destination
+            )
+
+            real_owned_file_status = installer_module._owned_file_status
+            substituted = []
+
+            def substitute_after_validation(descriptor, owned_staging):
+                status = real_owned_file_status(descriptor, owned_staging)
+                if not substituted:
+                    payload = (
+                        owned_staging.cleanup_directory / owned_staging.path.name
+                    )
+                    try:
+                        payload.unlink()
+                    except FileNotFoundError:
+                        pass
+                    payload.write_bytes(unknown)
+                    substituted.append(payload)
+                return status
+
+            with patch.object(
+                installer_module,
+                "_owned_file_status",
+                side_effect=substitute_after_validation,
+            ):
+                recovered = fixture.installer().transaction_for(
+                    fixture.installation
+                )
+                recovered.recover_incomplete()
+
+            self.assertEqual(1, len(substituted))
+            preserved = [
+                path
+                for path in fixture.root.rglob("*")
+                if path.is_file() and path.read_bytes() == unknown
+            ]
+            self.assertEqual(1, len(preserved))
+            self.assertTrue(recovered.journal.data["complete"])
+            self.assertEqual(
+                genuine, (fixture.game_dir / "opengl32.dll").read_bytes()
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_occupied_staging_handoff_keeps_recoverable_transaction_state(self):
+        fixture = FakeBottleFixture()
+        try:
+            installer = fixture.installer()
+            genuine = (fixture.game_dir / "opengl32.dll").read_bytes()
+            unknown = b"unknown cleanup handoff occupant"
+            real_rename_exclusive = installer_module._rename_exclusive
+            occupied = []
+
+            def occupy_cleanup_handoff(source, destination):
+                if not occupied:
+                    cleanup_directory = Path(destination)
+                    cleanup_directory.mkdir(mode=0o700)
+                    unknown_path = cleanup_directory / "unknown-user-file"
+                    unknown_path.write_bytes(unknown)
+                    occupied.append((Path(source), cleanup_directory, unknown_path))
+                return real_rename_exclusive(source, destination)
+
+            with patch.object(
+                installer_module,
+                "_rename_exclusive",
+                side_effect=occupy_cleanup_handoff,
+            ):
+                with self.assertRaises(PatchError) as caught:
+                    installer.install(fixture.installation, fixture.payload)
+
+            self.assertEqual("install.rollback_failed", caught.exception.code)
+            self.assertEqual(1, len(occupied))
+            staging_directory, cleanup_directory, unknown_path = occupied[0]
+            self.assertTrue(staging_directory.is_dir())
+            self.assertEqual(unknown, unknown_path.read_bytes())
+            self.assertFalse(installer.state_path(fixture.installation).exists())
+            persisted = json.loads(
+                installer.journal_path(fixture.installation).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(persisted["complete"])
+            self.assertEqual(
+                genuine, (fixture.game_dir / "opengl32.dll").read_bytes()
+            )
+
+            unknown_path.unlink()
+            cleanup_directory.rmdir()
+            recovered = fixture.installer().transaction_for(fixture.installation)
+            recovered.recover_incomplete()
+
+            self.assertTrue(recovered.journal.data["complete"])
+            self.assertFalse(staging_directory.exists())
+            self.assertFalse(cleanup_directory.exists())
+            self.assertEqual(
+                genuine, (fixture.game_dir / "opengl32.dll").read_bytes()
+            )
+        finally:
+            fixture.cleanup()
+
     def test_hard_termination_after_staging_fsync_recovers_the_owned_stage(self):
         fixture = FakeBottleFixture()
         try:

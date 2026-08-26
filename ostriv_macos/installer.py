@@ -341,6 +341,16 @@ _RENAME_EXCLUSIVE = getattr(_LIBC, "renamex_np", None)
 if _RENAME_EXCLUSIVE is not None:
     _RENAME_EXCLUSIVE.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
     _RENAME_EXCLUSIVE.restype = ctypes.c_int
+_RENAMEAT_EXCLUSIVE = getattr(_LIBC, "renameatx_np", None)
+if _RENAMEAT_EXCLUSIVE is not None:
+    _RENAMEAT_EXCLUSIVE.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    _RENAMEAT_EXCLUSIVE.restype = ctypes.c_int
 
 
 def _rename_exclusive(source: Path, destination: Path) -> None:
@@ -359,11 +369,36 @@ def _rename_exclusive(source: Path, destination: Path) -> None:
         )
 
 
+def _renameat_exclusive(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+) -> None:
+    """Atomically capture a directory entry without replacing another one."""
+    if _RENAMEAT_EXCLUSIVE is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "descriptor-relative exclusive rename is unavailable",
+        )
+    result = _RENAMEAT_EXCLUSIVE(
+        source_directory,
+        os.fsencode(source_name),
+        destination_directory,
+        os.fsencode(destination_name),
+        _RENAME_EXCL,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
 @dataclass(frozen=True)
 class _CopyStaging:
     directory: Path
     cleanup_directory: Path
     path: Path
+    capture_name: str
     directory_device: int
     directory_inode: int
     device: int
@@ -416,12 +451,22 @@ def _cleanup_owned_staging(staging: _CopyStaging) -> None:
     source_exists = os.path.lexists(staging.directory)
     cleanup_exists = os.path.lexists(staging.cleanup_directory)
     if source_exists and cleanup_exists:
-        return
+        raise OSError(
+            errno.EEXIST,
+            "copy staging cleanup handoff is occupied",
+            str(staging.cleanup_directory),
+        )
     if source_exists:
         try:
             _rename_exclusive(staging.directory, staging.cleanup_directory)
-        except FileExistsError:
-            return
+        except FileExistsError as error:
+            if os.path.lexists(staging.directory):
+                raise OSError(
+                    errno.EEXIST,
+                    "copy staging cleanup handoff is occupied",
+                    str(staging.cleanup_directory),
+                ) from error
+            cleanup_exists = os.path.lexists(staging.cleanup_directory)
         _fsync_directory(staging.directory.parent)
         if staging.cleanup_directory.parent != staging.directory.parent:
             _fsync_directory(staging.cleanup_directory.parent)
@@ -444,20 +489,29 @@ def _cleanup_owned_staging(staging: _CopyStaging) -> None:
         if entries == []:
             remove_directory = True
         elif entries == [staging.path.name]:
+            _renameat_exclusive(
+                directory_descriptor,
+                staging.path.name,
+                directory_descriptor,
+                staging.capture_name,
+            )
+            os.fsync(directory_descriptor)
+            entries = [staging.capture_name]
+        if entries == [staging.capture_name]:
             no_follow = getattr(os, "O_NOFOLLOW", 0)
             try:
                 staging_descriptor = os.open(
-                    staging.path.name,
+                    staging.capture_name,
                     os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
                     dir_fd=directory_descriptor,
                 )
                 _owned_file_status(staging_descriptor, staging)
             except OSError:
                 return
-            os.unlink(staging.path.name, dir_fd=directory_descriptor)
+            os.unlink(staging.capture_name, dir_fd=directory_descriptor)
             os.fsync(directory_descriptor)
             remove_directory = os.listdir(directory_descriptor) == []
-        else:
+        elif entries:
             return
     finally:
         if staging_descriptor is not None:
@@ -1118,6 +1172,10 @@ class Installer:
     def _staging_cleanup_name(token: str) -> str:
         return ".ostriv-macos-stage-cleanup-{}".format(token)
 
+    @staticmethod
+    def _staging_capture_name(token: str) -> str:
+        return ".payload-capture-{}".format(token)
+
     def _prepare_copy_staging(
         self,
         transaction: Transaction,
@@ -1153,6 +1211,7 @@ class Installer:
             ):
                 break
         staging = directory / "payload"
+        capture_name = self._staging_capture_name(token)
 
         record_data: Dict[str, object] = {
             "path": str(staging),
@@ -1223,6 +1282,7 @@ class Installer:
             directory,
             cleanup_directory,
             staging,
+            capture_name,
             int(record_data["directory_device"]),
             int(record_data["directory_inode"]),
             int(record_data["device"]),
@@ -1975,11 +2035,13 @@ class Installer:
             != self._staging_cleanup_name(name_match.group("token"))
         ):
             return
+        capture_name = self._staging_capture_name(name_match.group("token"))
         _cleanup_owned_staging(
             _CopyStaging(
                 directory,
                 cleanup_directory,
                 path,
+                capture_name,
                 directory_device,
                 directory_inode,
                 device,
