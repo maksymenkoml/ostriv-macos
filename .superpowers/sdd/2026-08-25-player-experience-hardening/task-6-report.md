@@ -47,3 +47,20 @@
 None found in the Task 6 scope. The actual macOS framework calls are deliberately not exercised
 in this portable test suite; their copied bridge constants and call sequence were checked against
 `patch.py` and are lazy by construction.
+
+## Fix round 1 — signal and atexit cleanup
+
+- **RED:** after adding current-disposition signal dispatch tests and a direct atexit-callback
+  test, `python3 -m unittest tests.test_launcher_profile -v` failed with two expected signal
+  disposition assertions and the unhandled `RuntimeError: Could not restore display profile`
+  from the registered atexit callback.
+- **GREEN:** the focused command then passed **10 tests**. SIGINT/SIGTERM now restore *both*
+  captured dispositions before profile cleanup and re-signal, so a returning or ignored prior
+  disposition cannot leave a wrapper permanently installed or swallow a future cross-signal.
+- **Silent atexit:** `install_signal_handlers` now registers a dedicated wrapper that catches
+  final-cleanup exceptions without output; controlled calls to `restore_once` still raise and
+  leave the recovery marker intact on failure.
+- **Full suite:** `python3 -m unittest discover -s tests -v` passed **103 tests**.
+- **Compile/no-output/diff checks:** `python3 -m py_compile ostriv_macos/launcher_runtime.py
+  tests/test_launcher_profile.py`, the direct `print(` scan of `launcher_runtime.py`, and
+  `git diff --check` all passed.

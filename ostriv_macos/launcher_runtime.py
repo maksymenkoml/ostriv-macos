@@ -219,21 +219,25 @@ class ProfileGuard:
 
 def install_signal_handlers(guard: ProfileGuard) -> None:
     """Restore profiles during normal exit and preserve SIGINT/SIGTERM semantics."""
-    atexit.register(guard.restore_once)
+    def restore_at_exit() -> None:
+        try:
+            guard.restore_once()
+        except Exception:
+            pass
+
+    atexit.register(restore_at_exit)
     previous = {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
     }
-    handling = False
 
     def cleanup_then_resignal(signum, _frame):
-        nonlocal handling
-        if handling:
-            return
-        handling = True
+        # Restore both dispositions before cleanup. A second signal therefore follows its
+        # original handler immediately instead of entering this wrapper recursively.
+        for protected_signum, previous_handler in previous.items():
+            signal.signal(protected_signum, previous_handler)
         try:
             guard.restore_once()
         finally:
-            signal.signal(signum, previous[signum])
             os.kill(os.getpid(), signum)
 
     for signum in previous:

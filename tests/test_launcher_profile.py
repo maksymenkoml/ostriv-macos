@@ -1,8 +1,10 @@
 import json
+import io
 import os
 import signal
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,6 +30,31 @@ class FakeProfiles:
         if self.set_result:
             self.current = value
         return self.set_result
+
+
+class SignalDispatcher:
+    """A small signal-system boundary fake that dispatches the current disposition."""
+
+    def __init__(self, sigint, sigterm):
+        self.handlers = {signal.SIGINT: sigint, signal.SIGTERM: sigterm}
+        self.kills = []
+
+    def getsignal(self, signum):
+        return self.handlers[signum]
+
+    def setsignal(self, signum, handler):
+        previous = self.handlers[signum]
+        self.handlers[signum] = handler
+        return previous
+
+    def kill(self, pid, signum):
+        self.kills.append((pid, signum))
+        self.dispatch(signum)
+
+    def dispatch(self, signum):
+        handler = self.handlers[signum]
+        if callable(handler):
+            handler(signum, None)
 
 
 class ProfileGuardTests(unittest.TestCase):
@@ -157,44 +184,84 @@ class LauncherConfigTests(unittest.TestCase):
 
 
 class SignalHandlerTests(unittest.TestCase):
-    def test_sigint_cleanup_restores_previous_handler_before_resignalling(self):
-        """Leaving the cleanup handler installed would recursively handle the re-signal."""
-        guard = type("Guard", (), {"calls": 0, "restore_once": lambda self: setattr(self, "calls", self.calls + 1)})()
-        previous = signal.SIG_DFL
-        registered = {}
+    def test_sigint_restores_both_dispositions_before_resignalling(self):
+        """Leaving SIGTERM wrapped after SIGINT can swallow a later real SIGTERM."""
+        previous_calls = []
 
-        def fake_signal(signum, handler):
-            old = registered.get(signum, previous)
-            registered[signum] = handler
-            return old
+        def prior_int(signum, _frame):
+            previous_calls.append(signum)
 
-        with patch("ostriv_macos.launcher_runtime.signal.getsignal", return_value=previous), patch(
-            "ostriv_macos.launcher_runtime.signal.signal", side_effect=fake_signal
-        ) as set_signal, patch("ostriv_macos.launcher_runtime.os.kill") as kill:
-            install_signal_handlers(guard)
-            registered[signal.SIGINT](signal.SIGINT, None)
+        def prior_term(signum, _frame):
+            previous_calls.append(signum)
 
-        self.assertEqual(1, guard.calls)
-        self.assertEqual(previous, registered[signal.SIGINT])
-        self.assertEqual([(signal.SIGINT, previous)], [call.args for call in set_signal.call_args_list if call.args[0] == signal.SIGINT][-1:])
-        kill.assert_called_once_with(os.getpid(), signal.SIGINT)
+        dispatcher = SignalDispatcher(prior_int, prior_term)
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "profile.json"
+            backend = FakeProfiles("/Profiles/P3.icc")
+            guard = ProfileGuard(backend, marker, "/Profiles/sRGB.icc")
+            guard.switch()
+            with patch("ostriv_macos.launcher_runtime.atexit.register"), patch(
+                "ostriv_macos.launcher_runtime.signal.getsignal", side_effect=dispatcher.getsignal
+            ), patch(
+                "ostriv_macos.launcher_runtime.signal.signal", side_effect=dispatcher.setsignal
+            ), patch("ostriv_macos.launcher_runtime.os.kill", side_effect=dispatcher.kill):
+                install_signal_handlers(guard)
+                dispatcher.dispatch(signal.SIGINT)
+                self.assertIs(prior_int, dispatcher.handlers[signal.SIGINT])
+                self.assertIs(prior_term, dispatcher.handlers[signal.SIGTERM])
+                dispatcher.dispatch(signal.SIGTERM)
 
-    def test_sigterm_cleanup_is_idempotent_with_repeated_delivery(self):
-        """A second signal must not restore the display profile twice."""
-        guard = type("Guard", (), {"calls": 0, "restore_once": lambda self: setattr(self, "calls", self.calls + 1)})()
-        registered = {}
+        self.assertEqual(["/Profiles/sRGB.icc", "/Profiles/P3.icc"], backend.set_calls)
+        self.assertEqual([signal.SIGINT, signal.SIGTERM], previous_calls)
+        self.assertEqual([(os.getpid(), signal.SIGINT)], dispatcher.kills)
 
-        def fake_signal(signum, handler):
-            old = registered.get(signum, signal.SIG_DFL)
-            registered[signum] = handler
-            return old
+    def test_sigterm_with_ignored_prior_does_not_leave_a_wrapped_signal(self):
+        """An ignored re-signal must not leave either disposition permanently wrapped."""
+        dispatcher = SignalDispatcher(signal.SIG_IGN, signal.SIG_IGN)
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "profile.json"
+            backend = FakeProfiles("/Profiles/P3.icc")
+            guard = ProfileGuard(backend, marker, "/Profiles/sRGB.icc")
+            guard.switch()
+            with patch("ostriv_macos.launcher_runtime.atexit.register"), patch(
+                "ostriv_macos.launcher_runtime.signal.getsignal", side_effect=dispatcher.getsignal
+            ), patch(
+                "ostriv_macos.launcher_runtime.signal.signal", side_effect=dispatcher.setsignal
+            ), patch("ostriv_macos.launcher_runtime.os.kill", side_effect=dispatcher.kill):
+                install_signal_handlers(guard)
+                dispatcher.dispatch(signal.SIGTERM)
+                self.assertIs(signal.SIG_IGN, dispatcher.handlers[signal.SIGINT])
+                self.assertIs(signal.SIG_IGN, dispatcher.handlers[signal.SIGTERM])
+                dispatcher.dispatch(signal.SIGINT)
 
-        with patch("ostriv_macos.launcher_runtime.signal.getsignal", return_value=signal.SIG_DFL), patch(
-            "ostriv_macos.launcher_runtime.signal.signal", side_effect=fake_signal
-        ), patch("ostriv_macos.launcher_runtime.os.kill"):
-            install_signal_handlers(guard)
-            handler = registered[signal.SIGTERM]
-            handler(signal.SIGTERM, None)
-            handler(signal.SIGTERM, None)
+        self.assertEqual(["/Profiles/sRGB.icc", "/Profiles/P3.icc"], backend.set_calls)
+        self.assertEqual([(os.getpid(), signal.SIGTERM)], dispatcher.kills)
 
-        self.assertEqual(1, guard.calls)
+
+class AtexitCleanupTests(unittest.TestCase):
+    def test_atexit_cleanup_swallows_restore_error_without_output(self):
+        """Registering restore_once directly emits an atexit traceback on final cleanup failure."""
+        registered = []
+        dispatcher = SignalDispatcher(signal.SIG_DFL, signal.SIG_DFL)
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "profile.json"
+            backend = FakeProfiles("/Profiles/P3.icc")
+            guard = ProfileGuard(backend, marker, "/Profiles/sRGB.icc")
+            guard.switch()
+            backend.set_result = False
+            with patch("ostriv_macos.launcher_runtime.atexit.register", side_effect=registered.append), patch(
+                "ostriv_macos.launcher_runtime.signal.getsignal", side_effect=dispatcher.getsignal
+            ), patch(
+                "ostriv_macos.launcher_runtime.signal.signal", side_effect=dispatcher.setsignal
+            ):
+                install_signal_handlers(guard)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                registered[0]()
+
+            self.assertEqual("", stdout.getvalue())
+            self.assertEqual("", stderr.getvalue())
+            self.assertTrue(marker.exists())
+            self.assertFalse(guard.restored)
