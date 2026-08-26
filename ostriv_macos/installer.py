@@ -16,8 +16,8 @@ import struct
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from . import __version__
 from .diagnostics import CommandRunner, PatchError, command_failure_detail
@@ -189,13 +189,33 @@ class Transaction:
         self.journal = journal
         self.handlers = handlers
         self._active_step: Optional[int] = None
+        self._recovery_plan: Optional[Dict[int, UndoRecord]] = None
+
+    def use_recovery_plan(
+        self, records: Sequence[Tuple[int, UndoRecord]]
+    ) -> None:
+        """Use only preflighted deep copies while replaying this journal."""
+        prepared: Dict[int, UndoRecord] = {}
+        for index, record in records:
+            if type(index) is not int or index in prepared:
+                raise ValueError("recovery plan record index is invalid")
+            prepared[index] = UndoRecord(record.kind, copy.deepcopy(record.data))
+        self._recovery_plan = prepared
 
     def start(self, operation: str) -> None:
         logger.info("journal start operation=%s path=%s", operation, self.journal.path)
         self.journal.start(operation)
 
-    def _undo(self, record_data: Dict[str, object]) -> None:
-        record = UndoRecord(record_data["kind"], record_data["data"])
+    def _undo(
+        self, record_data: Dict[str, object], index: Optional[int] = None
+    ) -> None:
+        if self._recovery_plan is not None:
+            if index is None or index not in self._recovery_plan:
+                raise ValueError("journal record is absent from the recovery plan")
+            planned = self._recovery_plan[index]
+            record = UndoRecord(planned.kind, copy.deepcopy(planned.data))
+        else:
+            record = UndoRecord(record_data["kind"], record_data["data"])
         self.handlers[record.kind](record)
 
     def _rollback_failed(
@@ -260,7 +280,7 @@ class Transaction:
                     item.get("undo", {}).get("kind"),
                 )
                 try:
-                    self._undo(item["undo"])
+                    self._undo(item["undo"], index)
                 except BaseException as error:
                     raise self._rollback_failed(index, item, error) from error
                 self.journal.mark_rolled_back(index)
@@ -851,7 +871,13 @@ class InstallState:
 
     @classmethod
     def from_dict(cls, data: object) -> "InstallState":
-        if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
+        field_names = {field.name for field in cls.__dataclass_fields__.values()}
+        if (
+            not isinstance(data, dict)
+            or type(data.get("schema")) is not int
+            or data.get("schema") != STATE_SCHEMA
+            or set(data) != field_names
+        ):
             raise ValueError("unsupported ownership state schema")
         required = {
             "project_version": str,
@@ -880,8 +906,32 @@ class InstallState:
             for item in data[collection_name]:
                 if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                     raise ValueError("invalid {} entry".format(collection_name))
+        for item in data["owned_files"]:
+            if set(item) not in (
+                {"path", "sha256"},
+                {"path", "sha256", "owned_directories"},
+            ) or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))) is None:
+                raise ValueError("invalid owned_files entry")
+        for item in data["backup_files"]:
+            if set(item) != {
+                "path",
+                "backup_path",
+                "original_sha256",
+                "installed_sha256",
+            } or any(
+                re.fullmatch(r"[0-9a-f]{64}", str(item.get(name, ""))) is None
+                for name in ("original_sha256", "installed_sha256")
+            ):
+                raise ValueError("invalid backup_files entry")
         names = [field.name for field in cls.__dataclass_fields__.values()]
-        return cls(**{name: data.get(name) for name in names})
+        return cls(**{name: data[name] for name in names})
+
+
+@dataclass(frozen=True)
+class _RestoreRecoveryPlan:
+    state: Optional[InstallState]
+    records: Tuple[Tuple[int, UndoRecord], ...]
+    has_final_unlink_snapshot: bool
 
 
 class WineRegistry:
@@ -1100,38 +1150,46 @@ class Installer:
         self, installation: GameInstallation, state: InstallState
     ) -> None:
         allowed_owned = self._allowed_owned_targets(installation)
+        allowed_owned_text = {str(path) for path in allowed_owned}
         owned_by_path = {}
         for item in state.owned_files:
-            path = Path(str(item["path"]))
+            path_text = str(item["path"])
+            path = Path(path_text)
             digest = item.get("sha256")
             if (
                 not path.is_absolute()
-                or path.resolve(strict=False) not in allowed_owned
+                or path_text not in allowed_owned_text
                 or not isinstance(digest, str)
             ):
                 raise ValueError("invalid owned-file inventory entry")
-            owned_by_path[path.resolve(strict=False)] = item
+            owned_by_path[path] = item
             owned_directories = item.get("owned_directories", [])
             if not isinstance(owned_directories, list) or any(
                 not isinstance(directory, str)
-                or Path(directory).resolve(strict=False)
-                not in self._allowed_settings_directories(installation)
+                or directory
+                not in {
+                    str(path)
+                    for path in self._allowed_settings_directories(installation)
+                }
                 for directory in owned_directories
             ):
                 raise ValueError("invalid owned-directory inventory entry")
 
         for item in state.backup_files:
-            target = Path(str(item["path"])).resolve(strict=False)
+            target_text = str(item["path"])
+            target = Path(target_text)
             backup_text = item.get("backup_path")
             if not isinstance(backup_text, str):
                 raise ValueError("invalid backup ownership entry")
             backup = Path(backup_text)
             owned = owned_by_path.get(target)
             if (
-                target not in allowed_owned
+                target_text not in allowed_owned_text
                 or not backup.is_absolute()
+                or backup_text
+                != str(backup.parent.resolve(strict=False) / backup.name)
                 or not self._valid_backup_relationship(
-                    target, backup.resolve(strict=False)
+                    target, backup
                 )
                 or owned is None
                 or item.get("installed_sha256") != owned.get("sha256")
@@ -1150,8 +1208,10 @@ class Installer:
             backup = Path(backup_text)
             if (
                 not backup.is_absolute()
+                or backup_text
+                != str(backup.parent.resolve(strict=False) / backup.name)
                 or not self._valid_backup_relationship(
-                    target, backup.resolve(strict=False)
+                    target, backup
                 )
             ):
                 raise ValueError("invalid configuration backup inventory")
@@ -1204,43 +1264,104 @@ class Installer:
             except FileNotFoundError:
                 pass
 
-    def _load_state(
-        self, installation: GameInstallation, error_prefix: str
-    ) -> Optional[InstallState]:
-        path = self.state_path(installation)
-        if not path.exists():
-            return None
+    def _validate_loaded_state(
+        self, installation: GameInstallation, state: InstallState
+    ) -> InstallState:
+        if state.bottle_realpath != str(installation.bottle.root.resolve()):
+            raise ValueError("ownership state belongs to another bottle")
+        if state.game_realpath != str(installation.game_dir.resolve()):
+            raise ValueError("ownership state belongs to another game")
+        self._validate_state_inventory(installation, state)
+        claimed_paths = [Path(str(item["path"])) for item in state.owned_files]
+        for item in state.backup_files:
+            backup_path = item.get("backup_path")
+            if not isinstance(backup_path, str):
+                raise ValueError("invalid backup ownership entry")
+            claimed_paths.extend((Path(str(item["path"])), Path(backup_path)))
+        for backup_path in (
+            state.original_config_backup,
+            state.original_settings_backup,
+        ):
+            if backup_path is not None:
+                claimed_paths.append(Path(backup_path))
+        claimed_paths.extend(self._launcher_paths(state.launcher_artifacts))
+        if any(
+            not path.is_absolute() or not self._allowed(installation, path)
+            for path in claimed_paths
+        ):
+            raise ValueError("ownership state claims a path outside the installation")
+        return state
+
+    def _decode_state_bytes(
+        self,
+        installation: GameInstallation,
+        data: bytes,
+        error_prefix: str,
+        source: Path,
+    ) -> InstallState:
         try:
-            state = InstallState.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            if state.bottle_realpath != str(installation.bottle.root.resolve()):
-                raise ValueError("ownership state belongs to another bottle")
-            if state.game_realpath != str(installation.game_dir.resolve()):
-                raise ValueError("ownership state belongs to another game")
-            self._validate_state_inventory(installation, state)
-            claimed_paths = [Path(str(item["path"])) for item in state.owned_files]
-            for item in state.backup_files:
-                backup_path = item.get("backup_path")
-                if not isinstance(backup_path, str):
-                    raise ValueError("invalid backup ownership entry")
-                claimed_paths.extend((Path(str(item["path"])), Path(backup_path)))
-            for backup_path in (
-                state.original_config_backup,
-                state.original_settings_backup,
-            ):
-                if backup_path is not None:
-                    claimed_paths.append(Path(backup_path))
-            claimed_paths.extend(self._launcher_paths(state.launcher_artifacts))
-            if any(
-                not path.is_absolute() or not self._allowed(installation, path)
-                for path in claimed_paths
-            ):
-                raise ValueError("ownership state claims a path outside the installation")
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            state = InstallState.from_dict(json.loads(data.decode("utf-8")))
+            return self._validate_loaded_state(installation, state)
+        except (UnicodeError, ValueError, json.JSONDecodeError) as error:
             raise PatchError(
                 "{}.state_corrupt".format(error_prefix),
                 "The installation ownership record is unreadable.",
-                "Unable to load {}: {}: {}".format(path, type(error).__name__, error),
+                "Unable to load {}: {}: {}".format(
+                    source, type(error).__name__, error
+                ),
             ) from error
+
+    def _load_state_with_bytes(
+        self, installation: GameInstallation, error_prefix: str
+    ) -> Tuple[Optional[InstallState], Optional[bytes], Optional[int]]:
+        path = self.state_path(installation)
+        if not os.path.lexists(str(path)):
+            return None, None, None
+        descriptor = None
+        try:
+            descriptor = os.open(
+                str(path),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(descriptor)
+            current = os.lstat(str(path))
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or opened.st_dev != current.st_dev
+                or opened.st_ino != current.st_ino
+            ):
+                raise OSError(errno.EPERM, "ownership state leaf is unsafe", str(path))
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                data = stream.read()
+            state = self._decode_state_bytes(
+                installation, data, error_prefix, path
+            )
+            return state, data, stat.S_IMODE(opened.st_mode)
+        except PatchError:
+            raise
+        except OSError as error:
+            raise PatchError(
+                "{}.state_corrupt".format(error_prefix),
+                "The installation ownership record is unreadable.",
+                "Unable to load {}: {}: {}".format(
+                    path, type(error).__name__, error
+                ),
+            ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _load_state(
+        self, installation: GameInstallation, error_prefix: str
+    ) -> Optional[InstallState]:
+        state, _data, _mode = self._load_state_with_bytes(
+            installation, error_prefix
+        )
         return state
 
     @staticmethod
@@ -2192,7 +2313,9 @@ class Installer:
             self._cleanup_completed_journal(transaction)
             raise
 
-    def _snapshots(self, paths: Sequence[Path]) -> List[Dict[str, object]]:
+    def _snapshots(
+        self, paths: Sequence[Path], *, include_identity: bool = False
+    ) -> List[Dict[str, object]]:
         snapshots = []
         seen = set()
         for path in paths:
@@ -2211,13 +2334,26 @@ class Installer:
                     {
                         "path": str(path),
                         "present": True,
+                        "type": "file",
                         "content": base64.b64encode(data).decode("ascii"),
                         "sha256": _bytes_digest(data),
                         "mode": stat_mode(path),
                     }
                 )
+                if include_identity:
+                    metadata = os.lstat(str(path))
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise OSError(
+                            errno.EPERM,
+                            "snapshot identity is not a regular file",
+                            str(path),
+                        )
+                    snapshots[-1]["device"] = metadata.st_dev
+                    snapshots[-1]["inode"] = metadata.st_ino
             else:
-                snapshots.append({"path": str(path), "present": False})
+                snapshots.append(
+                    {"path": str(path), "present": False, "type": "absent"}
+                )
         return snapshots
 
     def _undo_restore_snapshots(
@@ -2679,351 +2815,755 @@ class Installer:
                 "restore.registry", "Restore failed.", error.detail
             ) from error
 
-    def _preflight_journaled_restore_lock(
+    @staticmethod
+    def _restore_recovery_failure(detail: str) -> PatchError:
+        return PatchError(
+            "restore.launcher_recovery",
+            "Restore failed.",
+            detail,
+        )
+
+    @staticmethod
+    def _recovery_filesystem_safe_text(value: str) -> bool:
+        if "\0" in value or any(
+            0xD800 <= ord(character) <= 0xDFFF for character in value
+        ):
+            return False
+        try:
+            encoded = os.fsencode(value)
+            return os.fsdecode(encoded) == value
+        except (UnicodeEncodeError, UnicodeDecodeError, ValueError):
+            return False
+
+    def _recovery_file_snapshot(
+        self, value: object, location: str
+    ) -> Dict[str, object]:
+        failure = self._restore_recovery_failure
+        if not isinstance(value, dict):
+            raise failure("{} is not an object".format(location))
+        snapshot = copy.deepcopy(value)
+        path_text = snapshot.get("path")
+        present = snapshot.get("present")
+        snapshot_type = snapshot.get("type")
+        if not isinstance(path_text, str) or not path_text:
+            raise failure("{} path is invalid".format(location))
+        try:
+            path = Path(path_text)
+            lexical = path.parent.resolve(strict=False) / path.name
+        except (OSError, ValueError):
+            path = Path(".")
+            lexical = path
+        if (
+            not path.is_absolute()
+            or not self._recovery_filesystem_safe_text(path_text)
+            or path_text != str(lexical)
+        ):
+            raise failure("{} path is not lexical".format(location))
+        if type(present) is not bool:
+            raise failure("{} presence flag is invalid".format(location))
+        if present and snapshot_type == "file":
+            allowed = {
+                "path",
+                "present",
+                "type",
+                "content",
+                "sha256",
+                "mode",
+                "allowed_current_sha256",
+                "device",
+                "inode",
+            }
+            required = {"path", "present", "type", "content", "sha256", "mode"}
+            if not required.issubset(snapshot) or not set(snapshot).issubset(allowed):
+                raise failure("{} file fields are invalid".format(location))
+            content = snapshot.get("content")
+            digest = snapshot.get("sha256")
+            mode = snapshot.get("mode")
+            if (
+                not isinstance(content, str)
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or type(mode) is not int
+                or not 0 <= mode <= 0o7777
+            ):
+                raise failure("{} file metadata is invalid".format(location))
+            try:
+                data = base64.b64decode(content, validate=True)
+            except (TypeError, ValueError) as error:
+                raise failure("{} file content is invalid".format(location)) from error
+            if _bytes_digest(data) != digest:
+                raise failure("{} file digest is invalid".format(location))
+            allowed_current = snapshot.get("allowed_current_sha256", [])
+            if not isinstance(allowed_current, list) or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[0-9a-f]{64}", item) is None
+                for item in allowed_current
+            ):
+                raise failure("{} current-digest list is invalid".format(location))
+            for identity_name in ("device", "inode"):
+                identity = snapshot.get(identity_name)
+                if identity is not None and (
+                    type(identity) is not int or identity < 0
+                ):
+                    raise failure("{} identity is invalid".format(location))
+            if ("device" in snapshot) != ("inode" in snapshot):
+                raise failure("{} identity is incomplete".format(location))
+            return snapshot
+        if present and snapshot_type == "symlink":
+            target = snapshot.get("target")
+            if (
+                set(snapshot) != {"path", "present", "type", "target"}
+                or not isinstance(target, str)
+                or not target
+                or not self._recovery_filesystem_safe_text(target)
+            ):
+                raise failure("{} symlink fields are invalid".format(location))
+            return snapshot
+        if not present and snapshot_type == "absent":
+            if not set(snapshot).issubset(
+                {"path", "present", "type", "remove_sha256"}
+            ):
+                raise failure("{} absent fields are invalid".format(location))
+            remove_digest = snapshot.get("remove_sha256")
+            if remove_digest is not None and (
+                not isinstance(remove_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", remove_digest) is None
+            ):
+                raise failure("{} removal digest is invalid".format(location))
+            return snapshot
+        raise failure("{} representation is invalid".format(location))
+
+    def _recovery_inventory(
+        self,
+        value: object,
+        location: str,
+        *,
+        captured: bool,
+        present: bool = True,
+    ) -> List[Dict[str, object]]:
+        failure = self._restore_recovery_failure
+
+        if not isinstance(value, list):
+            raise failure("{} is not a list".format(location))
+        if not present:
+            if value:
+                raise failure("{} has entries for an absent tree".format(location))
+            return []
+        entries: List[Dict[str, object]] = []
+        seen = set()
+        for entry_index, raw in enumerate(value):
+            entry_location = "{}[{}]".format(location, entry_index)
+            if not isinstance(raw, dict):
+                raise failure("{} is not an object".format(entry_location))
+            entry = copy.deepcopy(raw)
+            relative_text = entry.get("relative_path")
+            if not isinstance(relative_text, str):
+                raise failure("{} relative path is invalid".format(entry_location))
+            relative = PurePosixPath(relative_text)
+            if (
+                not relative_text
+                or not self._recovery_filesystem_safe_text(relative_text)
+                or any(
+                    not self._recovery_filesystem_safe_text(part)
+                    for part in relative.parts
+                )
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or relative_text != relative.as_posix()
+                or relative in seen
+            ):
+                raise failure("{} relative path is unsafe".format(entry_location))
+            seen.add(relative)
+            item_type = entry.get("type")
+            if item_type == "directory":
+                expected = {"relative_path", "type", "mode"}
+            elif item_type == "file":
+                expected = {"relative_path", "type", "sha256", "mode"}
+                if captured:
+                    expected.add("content")
+            elif item_type == "symlink":
+                expected = {"relative_path", "type", "target"}
+            else:
+                raise failure("{} type is invalid".format(entry_location))
+            if set(entry) != expected:
+                raise failure("{} fields are invalid".format(entry_location))
+            if item_type in ("directory", "file"):
+                mode = entry.get("mode")
+                if type(mode) is not int or not 0 <= mode <= 0o7777:
+                    raise failure("{} mode is invalid".format(entry_location))
+            if item_type == "file":
+                digest = entry.get("sha256")
+                if (
+                    not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    raise failure("{} digest is invalid".format(entry_location))
+                if captured:
+                    content = entry.get("content")
+                    try:
+                        data = base64.b64decode(content, validate=True)
+                    except (TypeError, ValueError) as error:
+                        raise failure(
+                            "{} content is invalid".format(entry_location)
+                        ) from error
+                    if _bytes_digest(data) != digest:
+                        raise failure("{} digest does not match".format(entry_location))
+            if item_type == "symlink":
+                target = entry.get("target")
+                if (
+                    not isinstance(target, str)
+                    or not target
+                    or not self._recovery_filesystem_safe_text(target)
+                ):
+                    raise failure("{} target is invalid".format(entry_location))
+            entries.append(entry)
+        if present:
+            roots = [
+                item
+                for item in entries
+                if item.get("relative_path") == "."
+                and item.get("type") == "directory"
+            ]
+            if len(roots) != 1:
+                raise failure("{} has no exact directory root".format(location))
+            by_path = {
+                PurePosixPath(str(item["relative_path"])): item for item in entries
+            }
+            for relative in by_path:
+                if relative == PurePosixPath("."):
+                    continue
+                parent = relative.parent
+                while parent != PurePosixPath("."):
+                    parent_entry = by_path.get(parent)
+                    if parent_entry is None or parent_entry.get("type") != "directory":
+                        raise failure(
+                            "{} has a missing parent directory".format(location)
+                        )
+                    parent = parent.parent
+        return entries
+
+    def _recovery_tree_snapshot(
+        self, value: object, location: str
+    ) -> Dict[str, object]:
+        failure = self._restore_recovery_failure
+        if not isinstance(value, dict) or set(value) != {
+            "root",
+            "present",
+            "entries",
+        }:
+            raise failure("{} fields are invalid".format(location))
+        root = value.get("root")
+        present = value.get("present")
+        if (
+            not isinstance(root, str)
+            or not root
+            or not Path(root).is_absolute()
+            or type(present) is not bool
+        ):
+            raise failure("{} root is invalid".format(location))
+        return {
+            "root": root,
+            "present": present,
+            "entries": self._recovery_inventory(
+                value.get("entries"),
+                "{}.entries".format(location),
+                captured=True,
+                present=present,
+            ),
+        }
+
+    def _validate_recovery_record_paths(
         self,
         installation: GameInstallation,
-        state: InstallState,
-        journal: Mapping[str, object],
-        lease=None,
-    ) -> bool:
-        """Validate every active reference to the owned Restore lock."""
-        lock = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
-        lock_text = str(lock)
-        launcher_state = state.launcher_artifacts
-
-        def failure(detail: str) -> PatchError:
-            return PatchError(
-                "restore.launcher_recovery",
-                "Restore failed.",
-                detail,
-            )
-
-        owner_token = launcher_state.get("profile_owner_token")
-        expected_digest = launcher_state.get("lock_sha256")
-        if (
-            launcher_state.get("lock_path") != lock_text
-            or not isinstance(owner_token, str)
-            or re.fullmatch(r"[0-9a-f]{64}", owner_token) is None
-            or not isinstance(expected_digest, str)
-            or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
-        ):
-            raise failure("Launcher recovery lock ownership is invalid")
-        expected_data = (owner_token + "\n").encode("ascii")
-        if _bytes_digest(expected_data) != expected_digest:
-            raise failure("Launcher recovery lock digest is invalid")
-
-        def lock_relation(path_text: object, base: Optional[Path] = None) -> Optional[str]:
-            if not isinstance(path_text, str):
-                return None
-            try:
-                candidate = Path(path_text)
-                if base is not None and not candidate.is_absolute():
-                    candidate = base / candidate
-            except (TypeError, ValueError):
-                return None
-            if path_text == lock_text:
-                return "exact"
-            try:
-                if candidate.resolve(strict=False) == lock:
-                    return "alias"
-            except (OSError, RuntimeError, ValueError):
-                pass
-            try:
-                candidate_status = os.lstat(str(candidate))
-                lock_status = os.lstat(lock_text)
-            except (OSError, ValueError):
-                return None
-            if (
-                stat.S_ISREG(candidate_status.st_mode)
-                and stat.S_ISREG(lock_status.st_mode)
-                and candidate_status.st_dev == lock_status.st_dev
-                and candidate_status.st_ino == lock_status.st_ino
-            ):
-                return "alias"
-            return None
-
-        artifacts = launcher_state.get("artifacts")
-        owned_lock_artifacts = []
-        if not isinstance(artifacts, list):
-            raise failure("Launcher recovery artifact ownership is invalid")
-        for artifact in artifacts:
-            path_text = artifact.get("path") if isinstance(artifact, dict) else None
-            relation = lock_relation(path_text)
-            if relation == "alias":
-                raise failure("Launcher recovery artifact path is not lexical")
-            if relation == "exact":
-                if (
-                    not isinstance(artifact, dict)
-                    or artifact.get("sha256") != expected_digest
+        index: int,
+        name: str,
+        record: UndoRecord,
+    ) -> None:
+        """Validate the complete path grammar for one Restore undo record."""
+        failure = self._restore_recovery_failure
+        if record.kind in ("restore_file", "restore_config", "restore_settings"):
+            config = installation.bottle.root.resolve() / "cxbottle.conf"
+            settings = self._settings_path(installation)
+            if record.kind == "restore_config":
+                targets = {config}
+            elif record.kind == "restore_settings":
+                targets = {settings}
+            else:
+                targets = self._allowed_owned_targets(installation) | {
+                    self.state_path(installation),
+                    *(installation.game_dir.resolve() / item for item in DIAGNOSTIC_LOGS),
+                }
+            for snapshot in record.data["snapshots"]:
+                path = Path(str(snapshot["path"]))
+                if snapshot.get("type") not in ("file", "absent") or not (
+                    path in targets
+                    or any(
+                        self._valid_backup_relationship(target, path)
+                        for target in targets | {config, settings}
+                    )
                 ):
-                    raise failure("Launcher recovery artifact is not owned")
-                owned_lock_artifacts.append(artifact)
-        if len(owned_lock_artifacts) != 1:
-            raise failure("Launcher recovery artifact ownership is ambiguous")
+                    raise failure(
+                        "record {} {} path is outside its Restore schema".format(
+                            index, record.kind
+                        )
+                    )
+            return
+        if record.kind != "restore_launcher":
+            return
 
-        if journal.get("complete") is not False or journal.get("operation") != "restore":
-            raise failure("Launcher recovery journal is not an incomplete Restore")
+        data = record.data
+        lock = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
+        if name == "remove launcher recovery lock":
+            if set(data) != {"snapshots"} or len(data["snapshots"]) != 1:
+                raise failure("Final launcher-lock undo shape is invalid")
+            if data["snapshots"][0].get("path") != str(lock):
+                raise failure("Final launcher-lock undo path is invalid")
+            return
+        if name not in ("restore launcher", "restore legacy launcher"):
+            raise failure("record {} launcher handler identity is invalid".format(index))
+
+        allowed_snapshot_paths = {
+            str(path) for path in self._allowed_launcher_artifacts(installation)
+        }
+        if any(
+            snapshot.get("path") not in allowed_snapshot_paths
+            for snapshot in data["snapshots"]
+        ):
+            raise failure("record {} launcher snapshot path is invalid".format(index))
+        extended = set(data) != {"snapshots"}
+        if not extended:
+            return
+        expected_fields = {
+            "snapshots",
+            "restore_files",
+            "restore_trees",
+            "recreate_menu",
+        }
+        if name == "restore legacy launcher":
+            expected_fields.add("legacy_menu")
+        if set(data) != expected_fields or data["snapshots"]:
+            raise failure("record {} launcher undo shape is invalid".format(index))
+
+        app = self._launcher_app_path()
+        previous = app.with_name("." + app.name + ".ostriv-macos.previous")
+        expected_roots = (
+            [str(app)]
+            if name == "restore legacy launcher"
+            else [str(app), str(previous)]
+        )
+        roots = [str(tree["root"]) for tree in data["restore_trees"]]
+        if roots != expected_roots:
+            raise failure("record {} launcher tree roots are invalid".format(index))
+        bottle = installation.bottle.root.resolve()
+        expected_files = (
+            [str(bottle / "play-ostriv-patched.py")]
+            if name == "restore legacy launcher"
+            else [
+                str(bottle / "play-ostriv-patched.py"),
+                str(bottle / "launcher-config.json"),
+                str(lock),
+                str(bottle / ".ostriv-profile-recovery.json"),
+            ]
+        )
+        files = [str(snapshot["path"]) for snapshot in data["restore_files"]]
+        if files != expected_files:
+            raise failure("record {} launcher file paths are invalid".format(index))
+        if name == "restore legacy launcher" and (
+            data.get("legacy_menu") is not True
+            or data.get("recreate_menu") is not True
+        ):
+            raise failure("record {} legacy launcher flags are invalid".format(index))
+
+    def _recovery_undo_record(
+        self,
+        transaction: Transaction,
+        index: int,
+        item: object,
+    ) -> UndoRecord:
+        failure = self._restore_recovery_failure
+        if not isinstance(item, dict) or set(item) != {
+            "name",
+            "status",
+            "undo",
+        }:
+            raise failure("record {} fields are invalid".format(index))
+        name = item.get("name")
+        undo = item.get("undo")
+        if not isinstance(name, str) or not isinstance(undo, dict) or set(undo) != {
+            "kind",
+            "data",
+        }:
+            raise failure("record {} undo is invalid".format(index))
+        kind = undo.get("kind")
+        data = undo.get("data")
+        if (
+            not isinstance(kind, str)
+            or kind not in {
+                "restore_file",
+                "restore_config",
+                "restore_settings",
+                "restore_registry",
+                "restore_launcher",
+            }
+            or not callable(transaction.handlers.get(kind))
+            or not isinstance(data, dict)
+        ):
+            raise failure("record {} handler is invalid".format(index))
+        location = "record {} {}".format(index, kind)
+        if kind in ("restore_file", "restore_config", "restore_settings"):
+            if set(data) != {"snapshots"} or not isinstance(data["snapshots"], list):
+                raise failure("{} data fields are invalid".format(location))
+            return UndoRecord(
+                kind,
+                {
+                    "snapshots": [
+                        self._recovery_file_snapshot(
+                            snapshot,
+                            "{}.snapshots[{}]".format(location, snapshot_index),
+                        )
+                        for snapshot_index, snapshot in enumerate(data["snapshots"])
+                    ]
+                },
+            )
+        if kind == "restore_registry":
+            if set(data) != {"key", "value", "before", "after"}:
+                raise failure("{} data fields are invalid".format(location))
+            if (
+                data.get("key") != REGISTRY_KEY
+                or data.get("value") != REGISTRY_VALUE
+                or any(
+                    value is not None and not isinstance(value, str)
+                    for value in (data.get("before"), data.get("after"))
+                )
+            ):
+                raise failure("{} registry identity is invalid".format(location))
+            return UndoRecord(kind, copy.deepcopy(data))
+
+        allowed = {
+            "snapshots",
+            "restore_files",
+            "restore_trees",
+            "recreate_menu",
+            "legacy_menu",
+        }
+        if "snapshots" not in data or not set(data).issubset(allowed):
+            raise failure("{} data fields are invalid".format(location))
+        sanitized: Dict[str, object] = {}
+        for field in ("snapshots", "restore_files"):
+            if field not in data:
+                continue
+            if not isinstance(data[field], list):
+                raise failure("{}.{} is not a list".format(location, field))
+            sanitized[field] = [
+                self._recovery_file_snapshot(
+                    snapshot,
+                    "{}.{}[{}]".format(location, field, snapshot_index),
+                )
+                for snapshot_index, snapshot in enumerate(data[field])
+            ]
+        if "restore_trees" in data:
+            if not isinstance(data["restore_trees"], list):
+                raise failure("{}.restore_trees is not a list".format(location))
+            sanitized["restore_trees"] = [
+                self._recovery_tree_snapshot(
+                    tree,
+                    "{}.restore_trees[{}]".format(location, tree_index),
+                )
+                for tree_index, tree in enumerate(data["restore_trees"])
+            ]
+        for field in ("recreate_menu", "legacy_menu"):
+            if field in data:
+                if type(data[field]) is not bool:
+                    raise failure("{}.{} is invalid".format(location, field))
+                sanitized[field] = data[field]
+        if sanitized.get("legacy_menu") is True and sanitized.get("recreate_menu") is not True:
+            raise failure("{}.legacy_menu has no menu recreation".format(location))
+        return UndoRecord(kind, sanitized)
+
+    def _recovery_path_locations(
+        self, index: int, name: str, record: UndoRecord
+    ):
+        data = record.data
+        for field in ("snapshots", "restore_files"):
+            for snapshot_index, snapshot in enumerate(data.get(field, [])):
+                location = "record {} {}[{}]".format(index, field, snapshot_index)
+                path_text = snapshot["path"]
+                yield path_text, None, location, field, snapshot_index
+                if snapshot.get("type") == "symlink":
+                    yield (
+                        snapshot["target"],
+                        Path(path_text).parent,
+                        location + ".target",
+                        None,
+                        None,
+                    )
+        for tree_index, tree in enumerate(data.get("restore_trees", [])):
+            root_text = tree["root"]
+            tree_location = "record {} restore_trees[{}]".format(index, tree_index)
+            yield root_text, None, tree_location + ".root", None, None
+            for entry_index, entry in enumerate(tree["entries"]):
+                relative = Path(entry["relative_path"])
+                entry_path = Path(root_text) if relative == Path(".") else Path(root_text) / relative
+                entry_location = "{}.entries[{}]".format(tree_location, entry_index)
+                yield str(entry_path), None, entry_location, None, None
+                if entry.get("type") == "symlink":
+                    yield entry["target"], entry_path.parent, entry_location + ".target", None, None
+
+    @staticmethod
+    def _recovery_path_relation(
+        path_text: object,
+        lock: Path,
+        old_identity: Optional[Tuple[int, int]],
+        base: Optional[Path] = None,
+    ) -> Optional[str]:
+        if not isinstance(path_text, str):
+            return None
+        candidate = Path(path_text)
+        if base is not None and not candidate.is_absolute():
+            candidate = base / candidate
+        if path_text == str(lock):
+            return "exact"
+        try:
+            if candidate.resolve(strict=False) == lock:
+                return "alias"
+        except (OSError, RuntimeError, ValueError):
+            pass
+        try:
+            status = os.lstat(str(candidate))
+        except (OSError, ValueError):
+            return None
+        identities = []
+        if old_identity is not None:
+            identities.append(old_identity)
+        try:
+            lock_status = os.lstat(str(lock))
+        except OSError:
+            lock_status = None
+        if lock_status is not None:
+            identities.append((lock_status.st_dev, lock_status.st_ino))
+        if stat.S_ISREG(status.st_mode) and (status.st_dev, status.st_ino) in identities:
+            return "alias"
+        return None
+
+    def _build_restore_recovery_plan(
+        self,
+        installation: GameInstallation,
+        transaction: Transaction,
+    ) -> _RestoreRecoveryPlan:
+        failure = self._restore_recovery_failure
+        journal = transaction.journal.data
+        if (
+            set(journal) != {"schema", "operation", "complete", "records"}
+            or type(journal.get("schema")) is not int
+            or journal.get("schema") != JOURNAL_SCHEMA
+            or journal.get("complete") is not False
+            or journal.get("operation") != "restore"
+        ):
+            raise failure("Recovery journal is not an incomplete Restore")
         records = journal.get("records")
         if not isinstance(records, list):
-            raise failure("Launcher recovery journal records are invalid")
-
-        def reject_reference(
-            path_text: object,
-            location: str,
-            base: Optional[Path] = None,
-        ) -> None:
-            relation = lock_relation(path_text, base)
-            if relation == "alias":
-                raise failure(
-                    "Launcher recovery lock alias appears in {}".format(location)
-                )
-            if relation == "exact":
-                raise failure(
-                    "Launcher recovery lock appears in unexpected {}".format(location)
-                )
-
-        def reject_inventory_paths(
-            root_text: object,
-            inventory: object,
-            location: str,
-        ) -> None:
-            if not isinstance(inventory, list):
-                return
-            root = Path(root_text) if isinstance(root_text, str) else None
-            for entry_index, entry in enumerate(inventory):
-                if not isinstance(entry, dict):
-                    continue
-                entry_location = "{}[{}]".format(location, entry_index)
-                relative = entry.get("relative_path")
-                entry_path = None
-                if isinstance(relative, str):
-                    try:
-                        entry_path = (
-                            root / Path(relative) if root is not None else Path(relative)
-                        )
-                    except (TypeError, ValueError):
-                        entry_path = None
-                    reject_reference(
-                        str(entry_path) if entry_path is not None else relative,
-                        entry_location,
-                    )
-                target = entry.get("target")
-                if isinstance(target, str):
-                    reject_reference(
-                        target,
-                        "{}.target".format(entry_location),
-                        entry_path.parent
-                        if entry_path is not None
-                        else root,
-                    )
-
-        candidates = []
-        roles = {"restore": [], "finalize": []}
-        active_records = 0
-        for record_index, item in enumerate(records):
-            if not isinstance(item, dict) or item.get("status") not in (
-                "pending",
-                "applied",
-            ):
+            raise failure("Recovery journal records are invalid")
+        parsed: List[Tuple[int, str, UndoRecord]] = []
+        for index, item in enumerate(records):
+            if not isinstance(item, dict):
+                raise failure("record {} is invalid".format(index))
+            if item.get("status") not in ("pending", "applied"):
                 continue
-            active_records += 1
-            undo = item.get("undo")
-            if not isinstance(undo, dict):
-                raise failure("Launcher recovery journal undo is invalid")
-            kind = undo.get("kind")
-            data = undo.get("data")
-            if not isinstance(kind, str) or not isinstance(data, dict):
-                raise failure("Launcher recovery journal undo data is invalid")
-            name = item.get("name")
+            name = str(item.get("name", ""))
+            record = self._recovery_undo_record(transaction, index, item)
+            self._validate_recovery_record_paths(
+                installation, index, name, record
+            )
+            parsed.append((index, name, record))
 
-            for field in ("snapshots", "restore_files"):
-                snapshots = data.get(field)
-                if snapshots is None:
-                    continue
-                location = "record {} {}".format(record_index, field)
-                if not isinstance(snapshots, list):
-                    if isinstance(snapshots, dict):
-                        path_text = snapshots.get("path")
-                        reject_reference(
-                            path_text,
-                            "{}.path".format(location),
-                        )
-                        target = snapshots.get("target")
-                        if isinstance(target, str):
-                            reject_reference(
-                                target,
-                                "{}.target".format(location),
-                                Path(path_text).parent
-                                if isinstance(path_text, str)
-                                else None,
-                            )
-                    continue
-                for snapshot_index, snapshot in enumerate(snapshots):
-                    snapshot_location = "{}[{}]".format(location, snapshot_index)
-                    if not isinstance(snapshot, dict):
-                        continue
-                    path_text = snapshot.get("path")
-                    relation = lock_relation(path_text)
-                    if relation == "alias":
-                        raise failure(
-                            "Launcher recovery lock snapshot path is not lexical"
-                        )
-                    target = snapshot.get("target")
-                    if isinstance(target, str):
-                        base = (
-                            Path(path_text).parent
-                            if isinstance(path_text, str)
-                            else None
-                        )
-                        reject_reference(
-                            target,
-                            "{}.target".format(snapshot_location),
-                            base,
-                        )
-                    if relation != "exact":
-                        continue
-
-                    role = None
-                    if (
-                        kind == "restore_launcher"
-                        and name == "restore launcher"
-                        and field in ("snapshots", "restore_files")
-                    ):
-                        role = "restore"
-                    elif (
-                        kind == "restore_launcher"
-                        and name == "remove launcher recovery lock"
-                        and field == "snapshots"
-                    ):
-                        role = "finalize"
-                    if role is None:
-                        raise failure(
-                            "Launcher recovery lock snapshot is in an unexpected handler"
-                        )
-                    try:
-                        captured = base64.b64decode(
-                            snapshot["content"], validate=True
-                        )
-                    except (KeyError, TypeError, ValueError) as error:
-                        raise failure(
-                            "Launcher recovery lock snapshot is invalid"
-                        ) from error
-                    mode = snapshot.get("mode")
-                    snapshot_type = snapshot.get("type")
-                    if (
-                        snapshot.get("present") is not True
-                        or (
-                            field == "restore_files"
-                            and snapshot_type != "file"
-                        )
-                        or (
-                            field == "snapshots"
-                            and snapshot_type not in (None, "file")
-                        )
-                        or snapshot.get("sha256") != expected_digest
-                        or _bytes_digest(captured) != expected_digest
-                        or captured != expected_data
-                        or type(mode) is not int
-                        or mode != 0o600
-                    ):
-                        raise failure(
-                            "Launcher recovery lock snapshot is not owned"
-                        )
-                    candidates.append(snapshot)
-                    roles[role].append(snapshot)
-
-            trees = data.get("restore_trees")
-            if trees is not None:
-                if not isinstance(trees, list):
-                    if isinstance(trees, dict):
-                        reject_reference(
-                            trees.get("root"),
-                            "record {} restore_trees.root".format(record_index),
-                        )
-                else:
-                    for tree_index, tree in enumerate(trees):
-                        tree_location = "record {} restore_trees[{}]".format(
-                            record_index, tree_index
-                        )
-                        if not isinstance(tree, dict):
-                            continue
-                        root_text = tree.get("root")
-                        reject_reference(root_text, "{}.root".format(tree_location))
-                        reject_inventory_paths(
-                            root_text,
-                            tree.get("entries"),
-                            "{}.entries".format(tree_location),
-                        )
-
-            for key in (
-                "backup_path",
-                "cleanup_directory",
-                "destination",
-                "directory",
-                "lock_path",
-                "owned_path",
-                "owned_root",
-                "path",
-                "previous_app",
-                "recovery_marker",
-                "root",
-                "source",
+        state_path = self.state_path(installation)
+        state_text = str(state_path)
+        state_candidates = []
+        for index, name, record in parsed:
+            for path_text, _base, location, field, snapshot_index in self._recovery_path_locations(
+                index, name, record
             ):
-                reject_reference(
-                    data.get(key),
-                    "record {} {}".format(record_index, key),
+                if path_text == state_text:
+                    if field != "snapshots" or record.kind != "restore_file":
+                        raise failure("Ownership state appears in {}".format(location))
+                    snapshot = record.data["snapshots"][int(snapshot_index)]
+                    state_candidates.append((index, name, snapshot))
+                elif isinstance(path_text, str):
+                    try:
+                        aliases_state = Path(path_text).resolve(strict=False) == state_path
+                    except (OSError, RuntimeError, ValueError):
+                        aliases_state = False
+                    if aliases_state:
+                        raise failure("Ownership state path is not lexical")
+        if len(state_candidates) > 1:
+            raise failure("Ownership state journal snapshot is ambiguous")
+        live_state, live_bytes, live_mode = self._load_state_with_bytes(
+            installation, "restore"
+        )
+        recovered_state = live_state
+        if state_candidates:
+            _index, state_name, snapshot = state_candidates[0]
+            if state_name != "remove ownership state":
+                raise failure("Ownership state snapshot is in an unexpected record")
+            if (
+                snapshot.get("present") is not True
+                or snapshot.get("type") != "file"
+                or snapshot.get("mode") != 0o600
+                or set(snapshot)
+                != {"path", "present", "type", "content", "sha256", "mode"}
+            ):
+                raise failure("Ownership state snapshot is invalid")
+            state_bytes = base64.b64decode(snapshot["content"], validate=True)
+            if _bytes_digest(state_bytes) != snapshot["sha256"]:
+                raise failure("Ownership state snapshot digest is invalid")
+            try:
+                snapshot_state = self._decode_state_bytes(
+                    installation, state_bytes, "restore", state_path
                 )
-            owned_directories = data.get("owned_directories")
-            if isinstance(owned_directories, list):
-                for directory_index, path_text in enumerate(owned_directories):
-                    reject_reference(
-                        path_text,
-                        "record {} owned_directories[{}]".format(
-                            record_index, directory_index
-                        ),
-                    )
-            moved_tree = data.get("moved_tree")
-            if isinstance(moved_tree, dict):
-                for key in ("source", "destination"):
-                    reject_reference(
-                        moved_tree.get(key),
-                        "record {} moved_tree.{}".format(record_index, key),
-                    )
-                for field, root_key in (
-                    ("source_inventory", "source"),
-                    ("replacement_inventory", "destination"),
+            except PatchError as error:
+                raise failure("Ownership state snapshot schema is invalid: {}".format(error.detail)) from error
+            if live_state is None:
+                recovered_state = snapshot_state
+            elif live_bytes != state_bytes or live_mode != snapshot["mode"]:
+                raise failure("Live ownership state does not match its journal snapshot")
+        prepare_restore = getattr(self.launcher, "prepare_restore", None)
+        protected_state = recovered_state is not None and callable(prepare_restore)
+        if protected_state:
+            validator = getattr(self.launcher, "validate_recovery_state", None)
+            if not callable(validator):
+                raise failure("Launcher recovery-state validator is unavailable")
+            try:
+                validator(installation, recovered_state.launcher_artifacts)
+            except (PatchError, TypeError, ValueError) as error:
+                raise failure("Launcher recovery state is invalid: {}".format(error)) from error
+
+        lock = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
+        expected_data = None
+        expected_digest = None
+        if protected_state:
+            launcher_state = recovered_state.launcher_artifacts
+            owner_token = launcher_state.get("profile_owner_token")
+            expected_digest = launcher_state.get("lock_sha256")
+            expected_data = (str(owner_token) + "\n").encode("ascii")
+
+        restore_candidates = []
+        final_candidates = []
+        for index, name, record in parsed:
+            for path_text, _base, location, field, snapshot_index in self._recovery_path_locations(
+                index, name, record
+            ):
+                if path_text != str(lock) or field not in ("snapshots", "restore_files"):
+                    continue
+                snapshot = record.data[field][int(snapshot_index)]
+                role = None
+                if record.kind == "restore_launcher" and name == "restore launcher":
+                    role = "restore"
+                elif (
+                    record.kind == "restore_launcher"
+                    and name == "remove launcher recovery lock"
+                    and field == "snapshots"
                 ):
-                    reject_inventory_paths(
-                        moved_tree.get(root_key),
-                        moved_tree.get(field),
-                        "record {} moved_tree.{}".format(record_index, field),
-                    )
+                    role = "final"
+                if role is None or not protected_state:
+                    raise failure("Launcher lock snapshot is in unexpected {}".format(location))
+                if (
+                    snapshot.get("present") is not True
+                    or snapshot.get("type") != "file"
+                    or snapshot.get("sha256") != expected_digest
+                    or snapshot.get("mode") != 0o600
+                    or base64.b64decode(snapshot["content"], validate=True) != expected_data
+                ):
+                    raise failure("Launcher lock snapshot is not owned")
+                candidate = (index, field, int(snapshot_index), snapshot)
+                if role == "restore":
+                    restore_candidates.append(candidate)
+                else:
+                    if set(snapshot) != {
+                        "path",
+                        "present",
+                        "type",
+                        "content",
+                        "sha256",
+                        "mode",
+                        "device",
+                        "inode",
+                    }:
+                        raise failure("Final launcher lock identity is invalid")
+                    final_candidates.append(candidate)
+        if protected_state and parsed and len(restore_candidates) != 1:
+            raise failure("Launcher lock restore snapshot is ambiguous")
+        if len(final_candidates) > 1:
+            raise failure("Launcher lock final-unlink snapshot is ambiguous")
+        if protected_state and not os.path.lexists(lock) and not final_candidates:
+            raise failure("Launcher lock has no final-unlink snapshot")
+        old_identity = None
+        if final_candidates:
+            final_snapshot = final_candidates[0][3]
+            old_identity = (final_snapshot["device"], final_snapshot["inode"])
+            if os.path.lexists(lock):
+                status = os.lstat(str(lock))
+                if (
+                    not stat.S_ISREG(status.st_mode)
+                    or status.st_nlink != 1
+                    or (status.st_dev, status.st_ino) != old_identity
+                ):
+                    raise failure("Launcher lock identity changed before recovery")
+        if protected_state:
+            artifact_preflight = getattr(
+                self.launcher, "preflight_recovery_artifacts", None
+            )
+            if not callable(artifact_preflight):
+                raise failure("Launcher recovery-artifact preflight is unavailable")
+            try:
+                artifact_preflight(
+                    installation,
+                    recovered_state.launcher_artifacts,
+                    allow_missing_lock=bool(final_candidates),
+                )
+            except (OSError, PatchError, TypeError, ValueError) as error:
+                raise failure(
+                    "Launcher recovery artifacts are invalid: {}".format(error)
+                ) from error
 
-        if (
-            (active_records and len(roles["restore"]) != 1)
-            or len(roles["finalize"]) > 1
-        ):
-            raise failure("Launcher recovery lock journal ownership is ambiguous")
-        if not os.path.lexists(lock_text) and not roles["finalize"]:
-            raise failure("Launcher recovery lock has no final-unlink snapshot")
+        omitted = {
+            (index, field, snapshot_index)
+            for index, field, snapshot_index, _snapshot in (
+                restore_candidates + final_candidates
+            )
+        }
+        for index, name, record in parsed:
+            for path_text, base, location, field, snapshot_index in self._recovery_path_locations(
+                index, name, record
+            ):
+                relation = self._recovery_path_relation(
+                    path_text, lock, old_identity, base
+                )
+                if relation == "alias":
+                    raise failure("Launcher lock alias appears in {}".format(location))
+                if relation == "exact" and (
+                    field is None
+                    or (index, field, int(snapshot_index)) not in omitted
+                ):
+                    raise failure("Launcher lock appears in unexpected {}".format(location))
 
-        if lease is not None:
-            lease_path = getattr(lease, "path", None)
-            if not isinstance(lease_path, (str, Path)) or str(lease_path) != lock_text:
-                raise failure("Launcher recovery lock lease path is invalid")
-            validate_current_path = getattr(lease, "validate_current_path", None)
-            if not callable(validate_current_path):
-                raise failure("Launcher recovery lock lease cannot be validated")
-            for _candidate in candidates:
-                try:
-                    validate_current_path(expected_data, 0o600)
-                except (OSError, TypeError, ValueError) as error:
-                    raise failure(
-                        "Launcher recovery lock changed during journal recovery: {}".format(
-                            error
-                        )
-                    ) from error
-        return bool(roles["finalize"])
+        sanitized_records = []
+        for index, _name, record in parsed:
+            data = copy.deepcopy(record.data)
+            for field in ("snapshots", "restore_files"):
+                if field not in data:
+                    continue
+                data[field] = [
+                    snapshot
+                    for snapshot_index, snapshot in enumerate(data[field])
+                    if (index, field, snapshot_index) not in omitted
+                ]
+            sanitized_records.append((index, UndoRecord(record.kind, data)))
+        return _RestoreRecoveryPlan(
+            recovered_state,
+            tuple(sanitized_records),
+            bool(final_candidates),
+        )
+
 
     def _recreate_journaled_restore_lock(
         self,
@@ -3088,15 +3628,16 @@ class Installer:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def _handlers_preserving_recovery_lock(
+    def _handlers_holding_restore_lock(
         self,
         installation: GameInstallation,
         state: InstallState,
         lease,
         handlers: Mapping[str, Callable[[UndoRecord], None]],
-        journal: Mapping[str, object],
+        *,
+        sanitize_lock_snapshots: bool,
     ) -> Mapping[str, Callable[[UndoRecord], None]]:
-        """Keep an authenticated held lock inode out of Restore snapshot replay."""
+        """Revalidate the held lock before every undo and never replay it."""
         lock = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
 
         def failure(detail: str) -> PatchError:
@@ -3106,15 +3647,12 @@ class Installer:
                 detail,
             )
 
-        self._preflight_journaled_restore_lock(
-            installation,
-            state,
-            journal,
-            lease,
-        )
         owner_token = state.launcher_artifacts["profile_owner_token"]
         expected_data = (str(owner_token) + "\n").encode("ascii")
+        expected_digest = state.launcher_artifacts["lock_sha256"]
         validate_current_path = getattr(lease, "validate_current_path", None)
+        if not callable(validate_current_path):
+            raise failure("Launcher recovery lock lease cannot be validated")
 
         def validate_lease() -> None:
             try:
@@ -3126,39 +3664,50 @@ class Installer:
                     )
                 ) from error
 
-        original = handlers.get("restore_launcher")
-        if not callable(original):
-            raise failure("Launcher recovery undo handler is unavailable")
-
-        def preserve(record: UndoRecord) -> None:
-            validate_lease()
+        def sanitized(record: UndoRecord) -> UndoRecord:
             data = copy.deepcopy(record.data)
             for field in ("snapshots", "restore_files"):
                 snapshots = data.get(field)
-                if not isinstance(snapshots, list):
+                if snapshots is None:
                     continue
-                data[field] = [
-                    snapshot
-                    for snapshot in snapshots
-                    if not (
-                        isinstance(snapshot, dict)
-                        and snapshot.get("path") == str(lock)
-                    )
-                ]
-            original(UndoRecord(record.kind, data))
+                if not isinstance(snapshots, list):
+                    raise failure("Launcher recovery snapshot container is invalid")
+                kept = []
+                for snapshot in snapshots:
+                    if not isinstance(snapshot, dict) or snapshot.get("path") != str(lock):
+                        kept.append(snapshot)
+                        continue
+                    try:
+                        captured = base64.b64decode(
+                            snapshot["content"], validate=True
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise failure(
+                            "Launcher recovery lock snapshot is invalid"
+                        ) from error
+                    if (
+                        snapshot.get("present") is not True
+                        or snapshot.get("type") != "file"
+                        or snapshot.get("sha256") != expected_digest
+                        or snapshot.get("mode") != 0o600
+                        or captured != expected_data
+                    ):
+                        raise failure("Launcher recovery lock snapshot is not owned")
+                data[field] = kept
+            return UndoRecord(record.kind, data)
 
         protected = {}
         for kind, handler in handlers.items():
-            if kind == "restore_launcher":
-                protected[kind] = preserve
-                continue
-
             def guard(
                 record: UndoRecord,
                 original_handler: Callable[[UndoRecord], None] = handler,
             ) -> None:
                 validate_lease()
-                original_handler(record)
+                original_handler(
+                    sanitized(record)
+                    if sanitize_lock_snapshots and record.kind == "restore_launcher"
+                    else record
+                )
 
             protected[kind] = guard
         return protected
@@ -3174,28 +3723,33 @@ class Installer:
         )
         transaction = self.transaction_for(installation)
         recovering_incomplete = not transaction.journal.data.get("complete")
-        state = self._load_state(installation, "restore")
+        recovering_restore = (
+            recovering_incomplete
+            and transaction.journal.data.get("operation") == "restore"
+        )
+        recovery_plan = (
+            self._build_restore_recovery_plan(installation, transaction)
+            if recovering_restore
+            else None
+        )
+        if recovery_plan is not None:
+            transaction.use_recovery_plan(recovery_plan.records)
+            state = recovery_plan.state
+        else:
+            state = self._load_state(installation, "restore")
         restore_lease = None
         prepare_restore = getattr(self.launcher, "prepare_restore", None)
         preserving_recovery_lock = (
-            recovering_incomplete
-            and transaction.journal.data.get("operation") == "restore"
+            recovery_plan is not None
             and state is not None
             and callable(prepare_restore)
         )
-        has_final_unlink_snapshot = False
-        if preserving_recovery_lock:
-            has_final_unlink_snapshot = self._preflight_journaled_restore_lock(
-                installation,
-                state,
-                transaction.journal.data,
-            )
         if state is not None and callable(prepare_restore):
             if preserving_recovery_lock:
                 self._recreate_journaled_restore_lock(
                     installation,
                     state,
-                    has_final_unlink_snapshot,
+                    recovery_plan.has_final_unlink_snapshot,
                 )
             restore_lease = prepare_restore(
                 installation,
@@ -3210,12 +3764,12 @@ class Installer:
                         "Restore failed.",
                         "Launcher recovery lock lease is unavailable",
                     )
-                transaction.handlers = self._handlers_preserving_recovery_lock(
+                transaction.handlers = self._handlers_holding_restore_lock(
                     installation,
                     state,
                     restore_lease,
                     transaction.handlers,
-                    transaction.journal.data,
+                    sanitize_lock_snapshots=False,
                 )
             transaction.recover_incomplete()
             if (
@@ -3254,6 +3808,14 @@ class Installer:
             else:
                 legacy_launcher_undo = self._legacy_launcher_restore_undo(installation)
             transaction = self.transaction_for(installation)
+            if state is not None and restore_lease is not None:
+                transaction.handlers = self._handlers_holding_restore_lock(
+                    installation,
+                    state,
+                    restore_lease,
+                    transaction.handlers,
+                    sanitize_lock_snapshots=True,
+                )
             transaction.start("restore")
         except BaseException:
             if restore_lease is not None:
@@ -3340,14 +3902,63 @@ class Installer:
             finalize_restore = getattr(self.launcher, "finalize_restore", None)
             if callable(finalize_restore):
                 lock_path = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
+                owner_token = state.launcher_artifacts.get("profile_owner_token")
+                validate_lock = getattr(
+                    restore_lease, "validate_current_path", None
+                )
+                descriptor = getattr(restore_lease, "fd", None)
+                if not isinstance(owner_token, str) or not callable(validate_lock):
+                    raise PatchError(
+                        "restore.launcher_recovery",
+                        "Restore failed.",
+                        "Launcher recovery lock lease is unavailable before final unlink",
+                    )
+                try:
+                    validate_lock((owner_token + "\n").encode("ascii"), 0o600)
+                    opened_lock = os.fstat(descriptor)
+                except (OSError, TypeError, UnicodeError, ValueError) as error:
+                    raise PatchError(
+                        "restore.launcher_recovery",
+                        "Restore failed.",
+                        "Launcher recovery lock cannot be authenticated: {}".format(
+                            error
+                        ),
+                    ) from error
+                final_lock_snapshots = self._snapshots(
+                    [lock_path], include_identity=True
+                )
+                if (
+                    len(final_lock_snapshots) != 1
+                    or final_lock_snapshots[0].get("present") is not True
+                    or type(final_lock_snapshots[0].get("device")) is not int
+                    or type(final_lock_snapshots[0].get("inode")) is not int
+                    or (
+                        final_lock_snapshots[0]["device"],
+                        final_lock_snapshots[0]["inode"],
+                    )
+                    != (opened_lock.st_dev, opened_lock.st_ino)
+                    or opened_lock.st_nlink != 1
+                ):
+                    raise PatchError(
+                        "restore.launcher_recovery",
+                        "Restore failed.",
+                        "Unable to authenticate the launcher lock before final unlink",
+                    )
+                final_lock_identity = (
+                    final_lock_snapshots[0]["device"],
+                    final_lock_snapshots[0]["inode"],
+                )
                 transaction.step(
                     "remove launcher recovery lock",
                     UndoRecord(
                         "restore_launcher",
-                        {"snapshots": self._snapshots([lock_path])},
+                        {"snapshots": final_lock_snapshots},
                     ),
                     lambda: finalize_restore(
-                        installation, state.launcher_artifacts
+                        installation,
+                        state.launcher_artifacts,
+                        existing_lock=restore_lease,
+                        expected_identity=final_lock_identity,
                     ),
                 )
             state_path = self.state_path(installation)

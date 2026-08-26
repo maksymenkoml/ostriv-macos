@@ -963,6 +963,247 @@ class LauncherInstaller:
                 ),
             ) from error
 
+    def validate_recovery_state(
+        self,
+        installation: GameInstallation,
+        state: Mapping[str, object],
+    ) -> None:
+        """Authenticate the complete launcher-state schema without mutation."""
+        def valid_digest(value: object) -> bool:
+            return isinstance(value, str) and re.fullmatch(
+                r"[0-9a-f]{64}", value
+            ) is not None
+
+        def validate_inventory(value: object, *, optional: bool) -> None:
+            if not isinstance(value, list) or (not optional and not value):
+                raise ValueError("launcher recovery tree inventory is invalid")
+            by_path = {}
+            for entry in value:
+                if not isinstance(entry, dict) or not isinstance(
+                    entry.get("relative_path"), str
+                ):
+                    raise ValueError("launcher recovery tree entry is invalid")
+                relative_text = entry["relative_path"]
+                relative = PurePosixPath(relative_text)
+                item_type = entry.get("type")
+                if item_type == "directory":
+                    expected = {"relative_path", "type", "mode"}
+                elif item_type == "file":
+                    expected = {"relative_path", "type", "sha256", "mode"}
+                elif item_type == "symlink":
+                    expected = {"relative_path", "type", "target"}
+                else:
+                    raise ValueError("launcher recovery tree entry type is invalid")
+                if (
+                    set(entry) != expected
+                    or not relative_text
+                    or not _filesystem_safe_text(relative_text)
+                    or any(not _filesystem_safe_text(part) for part in relative.parts)
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or relative_text != relative.as_posix()
+                    or relative in by_path
+                ):
+                    raise ValueError("launcher recovery tree path is invalid")
+                if item_type in ("directory", "file") and (
+                    type(entry.get("mode")) is not int
+                    or not 0 <= entry["mode"] <= 0o7777
+                ):
+                    raise ValueError("launcher recovery tree mode is invalid")
+                if item_type == "file" and not valid_digest(entry.get("sha256")):
+                    raise ValueError("launcher recovery tree digest is invalid")
+                if item_type == "symlink" and (
+                    not isinstance(entry.get("target"), str)
+                    or not entry["target"]
+                    or not _filesystem_safe_text(entry["target"])
+                ):
+                    raise ValueError("launcher recovery tree target is invalid")
+                by_path[relative] = entry
+            if not value:
+                return
+            root = by_path.get(PurePosixPath("."))
+            if root is None or root.get("type") != "directory":
+                raise ValueError("launcher recovery tree root is missing")
+            for relative in by_path:
+                parent = relative.parent
+                while relative != PurePosixPath(".") and parent != PurePosixPath("."):
+                    if by_path.get(parent, {}).get("type") != "directory":
+                        raise ValueError("launcher recovery tree parent is missing")
+                    parent = parent.parent
+
+        def validate_saved_file(value: object) -> None:
+            if value is None:
+                return
+            if not isinstance(value, dict) or set(value) != {
+                "content",
+                "sha256",
+                "mode",
+            }:
+                raise ValueError("launcher recovery saved-file schema is invalid")
+            if type(value.get("mode")) is not int or not 0 <= value["mode"] <= 0o7777:
+                raise ValueError("launcher recovery saved-file mode is invalid")
+            try:
+                data = base64.b64decode(value.get("content"), validate=True)
+            except (TypeError, ValueError) as error:
+                raise ValueError("launcher recovery saved-file content is invalid") from error
+            if not valid_digest(value.get("sha256")) or _digest(data) != value["sha256"]:
+                raise ValueError("launcher recovery saved-file digest is invalid")
+
+        expected_fields = set(LauncherState.__dataclass_fields__)
+        if not isinstance(state, dict) or set(state) != expected_fields:
+            raise ValueError("launcher recovery state schema is invalid")
+        if type(state.get("schema")) is not int or state.get("schema") != 1:
+            raise ValueError("launcher recovery state schema is unsupported")
+        bottle_root = installation.bottle.root.resolve()
+        app = self._app_path()
+        exact_paths = {
+            "app": app,
+            "runtime": bottle_root / RUNTIME_NAME,
+            "config": bottle_root / CONFIG_NAME,
+            "lock_path": bottle_root / ".ostriv-launcher.lock",
+            "recovery_marker": bottle_root / ".ostriv-profile-recovery.json",
+        }
+        for key, expected in exact_paths.items():
+            if state.get(key) != str(expected):
+                raise ValueError("launcher recovery {} path is not exact".format(key))
+        previous = state.get("previous_app")
+        expected_previous = app.with_name(
+            "." + app.name + ".ostriv-macos.previous"
+        )
+        if previous is not None and previous != str(expected_previous):
+            raise ValueError("launcher recovery previous-app path is not exact")
+        if state.get("bottle_realpath") != str(bottle_root):
+            raise ValueError("launcher recovery bottle identity is invalid")
+        expected_command = "exec /usr/bin/env python3 {} {}".format(
+            shlex.quote(str(exact_paths["runtime"])),
+            shlex.quote(str(exact_paths["config"])),
+        )
+        expected_tag = "CrossOver-{}/".format(self._bottle_id(installation))
+        if (
+            state.get("menu_entry")
+            != {"name": LAUNCHER_MENU, "installed": True}
+            or state.get("plist_fields") != list(PLIST_FIELDS)
+            or state.get("command") != expected_command
+            or state.get("bottle_name") != installation.bottle.name
+            or state.get("bottle_argument") != self._command_bottle(installation)
+            or state.get("scope") != installation.bottle.scope
+            or state.get("bottle_tag") != expected_tag
+        ):
+            raise ValueError("launcher recovery identity fields are invalid")
+        digest_fields = (
+            "runtime_sha256",
+            "config_sha256",
+            "executable_sha256",
+            "plist_sha256",
+            "icon_sha256",
+            "lock_sha256",
+        )
+        if any(not valid_digest(state.get(name)) for name in digest_fields):
+            raise ValueError("launcher recovery digest fields are invalid")
+        validate_inventory(state.get("app_inventory"), optional=False)
+        validate_inventory(state.get("previous_app_inventory"), optional=True)
+        if previous is None and state.get("previous_app_inventory"):
+            raise ValueError("launcher recovery previous-app inventory is unowned")
+        validate_saved_file(state.get("previous_runtime"))
+        validate_saved_file(state.get("previous_config"))
+        owner_token = state.get("profile_owner_token")
+        lock_digest = state.get("lock_sha256")
+        if (
+            not self._valid_owner_token(owner_token)
+            or not isinstance(lock_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", lock_digest) is None
+            or _digest(self._lock_data(str(owner_token))) != lock_digest
+        ):
+            raise ValueError("launcher recovery lock identity is invalid")
+        artifacts = state.get("artifacts")
+        expected_artifact_paths = [
+            str(app),
+            str(app / "Contents/Info.plist"),
+            str(app / "Contents/MacOS/Menu Helper"),
+            str(app / "Contents/Resources/CrossOverHelper.icns"),
+            str(exact_paths["runtime"]),
+            str(exact_paths["config"]),
+            str(exact_paths["lock_path"]),
+            str(exact_paths["recovery_marker"]),
+        ]
+        if (
+            not isinstance(artifacts, list)
+            or [item.get("path") if isinstance(item, dict) else None for item in artifacts]
+            != expected_artifact_paths
+        ):
+            raise ValueError("launcher recovery artifact inventory is invalid")
+        expected_artifacts = [
+            {"path": expected_artifact_paths[0]},
+            {"path": expected_artifact_paths[1], "sha256": state["plist_sha256"]},
+            {"path": expected_artifact_paths[2], "sha256": state["executable_sha256"]},
+            {"path": expected_artifact_paths[3], "sha256": state["icon_sha256"]},
+            {"path": expected_artifact_paths[4], "sha256": state["runtime_sha256"]},
+            {"path": expected_artifact_paths[5], "sha256": state["config_sha256"]},
+            {"path": expected_artifact_paths[6], "sha256": lock_digest},
+            {"path": expected_artifact_paths[7], "reserved": True},
+        ]
+        if artifacts != expected_artifacts:
+            raise ValueError("launcher recovery artifact metadata is invalid")
+        app_digests = {
+            item["relative_path"]: item.get("sha256")
+            for item in state["app_inventory"]
+            if item.get("type") == "file"
+        }
+        if (
+            app_digests.get("Contents/Info.plist") != state["plist_sha256"]
+            or app_digests.get("Contents/MacOS/Menu Helper")
+            != state["executable_sha256"]
+            or app_digests.get("Contents/Resources/CrossOverHelper.icns")
+            != state["icon_sha256"]
+        ):
+            raise ValueError("launcher recovery app inventory is inconsistent")
+        self._validate_state_paths(
+            installation,
+            state,
+            "restore.launcher_recovery",
+            "Restore failed.",
+        )
+
+    def preflight_recovery_artifacts(
+        self,
+        installation: GameInstallation,
+        state: Mapping[str, object],
+        *,
+        allow_missing_lock: bool,
+    ) -> None:
+        """Authenticate reserved recovery leaves without creating or removing them."""
+        lock, marker = self._recovery_paths(installation)
+        owner_token = state.get("profile_owner_token")
+        if not self._valid_owner_token(owner_token):
+            raise ValueError("launcher recovery ownership token is invalid")
+        expected_lock = self._lock_data(str(owner_token))
+        if _lexists(lock):
+            metadata = lock.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or lock.read_bytes() != expected_lock
+                or _file_digest(lock) != state.get("lock_sha256")
+            ):
+                raise ValueError("launcher recovery lock is invalid or unowned")
+        elif not allow_missing_lock:
+            raise ValueError("launcher recovery lock is unexpectedly absent")
+        if _lexists(marker):
+            metadata = marker.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or not self._valid_marker(marker, str(owner_token))
+            ):
+                raise ValueError("profile recovery marker is invalid or unowned")
+            try:
+                marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError) as error:
+                raise ValueError("profile recovery marker is unreadable") from error
+            if set(marker_data) != {"owner", "original"}:
+                raise ValueError("profile recovery marker schema is invalid")
+
     def prepare_restore(
         self,
         installation: GameInstallation,
@@ -1051,6 +1292,9 @@ class LauncherInstaller:
         self,
         installation: GameInstallation,
         state: Mapping[str, object],
+        *,
+        existing_lock=None,
+        expected_identity=None,
     ) -> None:
         """Remove only the still-owned recovery lock after Restore verification."""
         lock, marker = self._recovery_paths(installation)
@@ -1078,6 +1322,36 @@ class LauncherInstaller:
                 "Restore failed.",
                 "Launcher lock changed during Restore",
             )
+        expected_data = self._lock_data(str(owner_token))
+        validate_current_path = getattr(existing_lock, "validate_current_path", None)
+        if not callable(validate_current_path):
+            raise PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                "Launcher recovery lock lease is unavailable at final unlink",
+            )
+        try:
+            validate_current_path(expected_data, 0o600)
+            descriptor = getattr(existing_lock, "fd", None)
+            if type(descriptor) is not int:
+                raise OSError("launcher lock descriptor is unavailable")
+            opened = os.fstat(descriptor)
+            current = os.lstat(str(lock))
+            if (
+                type(expected_identity) is not tuple
+                or len(expected_identity) != 2
+                or (opened.st_dev, opened.st_ino) != expected_identity
+                or (current.st_dev, current.st_ino) != expected_identity
+                or opened.st_nlink != 1
+                or current.st_nlink != 1
+            ):
+                raise OSError("launcher lock identity changed before final unlink")
+        except (OSError, TypeError, ValueError) as error:
+            raise PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                "Launcher lock changed before final unlink: {}".format(error),
+            ) from error
         lock.unlink()
         _sync_directory(lock.parent)
 
