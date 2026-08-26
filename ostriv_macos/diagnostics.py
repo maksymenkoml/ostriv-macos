@@ -29,6 +29,7 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    diagnostic: str = ""
 
 
 def decode_output(data: bytes) -> str:
@@ -80,6 +81,32 @@ def _bounded_output(
     return repr(text[:limit]) + " <truncated {} chars>".format(omitted)
 
 
+def _command_diagnostic(
+    argv: Sequence[str],
+    returncode,
+    stdout: str,
+    stderr: str,
+) -> str:
+    sensitive_values = _sensitive_values(argv)
+    return "returncode={} argv={} stdout={} stderr={}".format(
+        returncode,
+        _safe_argv(argv),
+        _bounded_output(stdout, sensitive_values),
+        _bounded_output(stderr, sensitive_values),
+    )
+
+
+def command_failure_detail(result, context: str = "") -> str:
+    detail = getattr(result, "diagnostic", "")
+    if not detail:
+        output = getattr(result, "stderr", "") or getattr(result, "stdout", "")
+        detail = "returncode={} output={}".format(
+            getattr(result, "returncode", "unknown"),
+            _bounded_output(str(output)),
+        )
+    return "{}: {}".format(context, detail) if context else detail
+
+
 class CommandRunner:
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger("ostriv_macos")
@@ -99,18 +126,21 @@ class CommandRunner:
             check=False,
             timeout=timeout,
         )
+        stdout = decode_output(result.stdout)
+        stderr = decode_output(result.stderr)
+        diagnostic = _command_diagnostic(
+            command,
+            result.returncode,
+            stdout,
+            stderr,
+        )
         decoded = CommandResult(
             result.returncode,
-            decode_output(result.stdout),
-            decode_output(result.stderr),
+            stdout,
+            stderr,
+            diagnostic,
         )
-        sensitive_values = _sensitive_values(command)
-        self.logger.info(
-            "command result returncode=%s stdout=%s stderr=%s",
-            decoded.returncode,
-            _bounded_output(decoded.stdout, sensitive_values),
-            _bounded_output(decoded.stderr, sensitive_values),
-        )
+        self.logger.info("command result %s", diagnostic)
         return decoded
 
 

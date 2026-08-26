@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional
 
-from .diagnostics import CommandRunner, PatchError
+from .diagnostics import CommandRunner, PatchError, command_failure_detail
 from .discovery import GameInstallation
 from .installer import Transaction, UndoRecord
 from .launcher_runtime import LauncherConfig
@@ -774,9 +774,7 @@ class LauncherInstaller:
                     raise PatchError(
                         "restore.launcher_menu",
                         "Restore failed.",
-                        "cxmenu purge failed: {}".format(
-                            result.stderr or result.stdout
-                        ),
+                        command_failure_detail(result, "cxmenu purge failed"),
                     )
             if record.data.get("recreate_menu") is True:
                 recreate_command = self._expected_command(installation)
@@ -794,8 +792,8 @@ class LauncherInstaller:
                     raise PatchError(
                         "restore.launcher_menu",
                         "Restore failed.",
-                        "cxmenu create failed during rollback: {}".format(
-                            result.stderr or result.stdout
+                        command_failure_detail(
+                            result, "cxmenu create failed during rollback"
                         ),
                     )
             if root is not None and record.data.get("remove_owned_tree") is True:
@@ -1564,7 +1562,7 @@ class LauncherInstaller:
                     raise PatchError(
                         "install.launcher_menu",
                         "Installation failed.",
-                        "cxmenu failed: {}".format(result.stderr or result.stdout),
+                        command_failure_detail(result, "cxmenu failed"),
                     )
 
             transaction.step(
@@ -2057,7 +2055,7 @@ class LauncherInstaller:
                 raise PatchError(
                     "restore.launcher_menu",
                     "Restore failed.",
-                    "cxmenu purge failed: {}".format(result.stderr or result.stdout),
+                    command_failure_detail(result, "cxmenu purge failed"),
                 )
 
         if state.get("legacy") is True:

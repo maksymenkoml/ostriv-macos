@@ -14,6 +14,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import ostriv_macos.installer as installer_module
+
 from ostriv_macos.cli import (
     DiagnosticContext,
     ProductionServices,
@@ -643,6 +645,77 @@ class ProductionCliIntegrationTests(unittest.TestCase):
         self.assertGreater(log_path.stat().st_size, 0)
         self.assertIn("install verification status=OK", log_path.read_text(encoding="utf-8"))
 
+    def test_real_registry_failure_keeps_final_file_log_bounded_and_redacted(self):
+        log_path = self.home / "Library/Logs/ostriv-macos/install.log"
+        runner = CommandRunner()
+        installer = Installer(
+            self.fixture.package_root,
+            self.fixture.launcher,
+            runner=runner,
+            launcher_destination=self.fixture.launcher_artifact.parent,
+        )
+        stream = io.StringIO()
+        services = ProductionServices(
+            self.fixture.package_root,
+            installer,
+            runner,
+            io.StringIO(),
+            PlayerOutput(stream, color=False),
+            home=self.home,
+            env={
+                "OSTRIV_CROSSOVER_APP": str(self.fixture.app),
+                "CX_BOTTLE_PATH": str(self.fixture.bottle_root.parent),
+            },
+        )
+
+        def fail_registry_add(argv, **_kwargs):
+            command = list(argv)
+            if Path(command[0]).name in ("mdfind", "lsregister"):
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+            if command[-1:] == ["--status"]:
+                return subprocess.CompletedProcess(command, 0, b"running\n", b"")
+            if "query" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    b"",
+                    b"reg: Unable to find the specified registry key or value\n",
+                )
+            if "add" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    9,
+                    b"",
+                    b"registry private-value failure\xff\n" + b"x" * 3000,
+                )
+            self.fail("unexpected command: {!r}".format(command))
+
+        with patch.object(Path, "home", return_value=self.home), patch.object(
+            installer_module, "REGISTRY_DATA", "private-value"
+        ), patch("ostriv_macos.cli.build_services", return_value=services), patch(
+            "ostriv_macos.diagnostics.subprocess.run", side_effect=fail_registry_add
+        ):
+            code = main([str(self.fixture.game_dir)], stdout=stream)
+
+        self.assertEqual(2, code)
+        self.assertEqual(
+            "Ostriv for macOS\n"
+            "Found: CrossOver 26.2 · Ostriv 0.5.9.60 · Bottle With Spaces\n"
+            "Package: OK\n"
+            "Installation: FAILED\n"
+            "\n"
+            "Installation failed. Try Reinstall once.\n"
+            "Log: ~/Library/Logs/ostriv-macos/install.log\n",
+            stream.getvalue(),
+        )
+        text = log_path.read_text(encoding="utf-8")
+        self.assertIn("command result returncode=9", text)
+        self.assertIn("registry <redacted> failure�", text)
+        self.assertIn("<truncated", text)
+        self.assertIn("install.registry", text)
+        self.assertNotIn("private-value", text)
+        self.assertNotIn("x" * 2049, text)
+
     def test_real_explicit_invalid_path_is_actionable_and_mutates_nothing(self):
         arbitrary = self.fixture.bottle_root / "drive_c/users/crossover/Documents"
         arbitrary.mkdir(parents=True)
@@ -1108,7 +1181,7 @@ if __name__ == "__main__":
 # Success | one controlled Steam initialization retry | LauncherOrchestrationTests.test_only_fresh_steam_api_failure_gets_one_retry; LauncherOrchestrationTests.test_graphics_and_unrelated_failures_never_retry
 # Success | exact display profile restoration and recovery | ProfileGuardTests.test_exit_restores_exact_original_profile; ProfileGuardTests.test_next_launch_recovers_factory_default_none; SignalHandlerTests.test_sigint_restores_both_dispositions_before_resignalling; SignalHandlerTests.test_sigterm_with_ignored_prior_does_not_leave_a_wrapped_signal; LauncherOrchestrationTests.test_game_runner_failure_restores_profile_and_releases_lock
 # Success | concise, actionable, non-repetitive terminal output | CliTests.test_success_is_brief_and_non_repetitive; CliTests.test_production_error_codes_map_to_one_action_at_cli_boundary
-# Success | detailed local diagnostics without raw player commands | DiagnosticsTests.test_command_runner_logs_bounded_decoded_result_and_redacts_sensitive_data; ExternalProcessRunnerTests.test_file_log_bounds_decoded_output_and_redacts_echoed_sensitive_values; InstallerTests.test_successful_install_logs_stages_verification_and_completion; TransactionTests.test_incomplete_journal_recovery_logs_start_and_completion; SteamControllerTests.test_probe_records_each_readiness_signal_in_the_launcher_file_log; LauncherOrchestrationTests.test_launcher_file_log_records_readiness_profile_and_game_boundaries; ProductionCliIntegrationTests.test_success_snapshot_stays_exact_while_file_log_receives_diagnostics
+# Success | detailed local diagnostics without raw player commands | DiagnosticsTests.test_command_runner_logs_bounded_decoded_result_and_redacts_sensitive_data; ExternalProcessRunnerTests.test_file_log_bounds_decoded_output_and_redacts_echoed_sensitive_values; InstallerTests.test_successful_install_logs_stages_verification_and_completion; TransactionTests.test_incomplete_journal_recovery_logs_start_and_completion; SteamControllerTests.test_probe_records_each_readiness_signal_in_the_launcher_file_log; LauncherOrchestrationTests.test_launcher_file_log_records_readiness_profile_and_game_boundaries; LauncherMainTests.test_expected_command_timeout_log_is_bounded_redacted_and_dialog_stays_exact; ProductionCliIntegrationTests.test_success_snapshot_stays_exact_while_file_log_receives_diagnostics; ProductionCliIntegrationTests.test_real_registry_failure_keeps_final_file_log_bounded_and_redacted
 # Success | installer, launcher, recovery, release failures automated | InstallerTests.test_failure_after_each_actual_journaled_mutation_restores_original_tree; LauncherInstallerTests.test_production_transaction_recovers_owned_pending_tree_after_restart; ReleaseArtifactTests.test_failed_build_does_not_replace_an_existing_asset
 # Constraint | patch.py is the only documented player install command | PlayerDocumentationTests.test_readme_leads_with_one_ordered_player_path
 # Constraint | runtime is standard-library-only | GlobalConstraintTests.test_runtime_imports_and_literal_commands_stay_inside_the_allowed_surface; LauncherInstallerTests.test_installed_runtime_has_no_project_import_and_survives_source_move; ReleaseArtifactTests.test_extracted_preflight_and_diagnose_need_only_the_current_python

@@ -117,6 +117,11 @@ class ExternalResult:
     returncode: int
     stdout: str
     stderr: str
+    diagnostic: str = ""
+
+
+class ExternalCommandError(RuntimeError):
+    """An external command failure safe to serialize into the launcher log."""
 
 
 class ExternalProcessRunner:
@@ -170,6 +175,31 @@ class ExternalProcessRunner:
             return repr(text)
         return repr(text[:limit]) + " <truncated {} chars>".format(len(text) - limit)
 
+    @staticmethod
+    def _decode(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return "" if value is None else str(value)
+
+    @classmethod
+    def _diagnostic(cls, command, returncode, stdout, stderr, status=None):
+        sensitive_values = cls._sensitive_values(command)
+        fields = (
+            ["returncode={}".format(returncode)]
+            if status is None
+            else ["status={}".format(status)]
+        )
+        fields.append("argv={}".format(cls._safe_argv(command)))
+        if status is not None:
+            fields.append("returncode={}".format(returncode))
+        fields.extend(
+            (
+                "output={}".format(cls._bounded(stdout, sensitive_values)),
+                "stderr={}".format(cls._bounded(stderr, sensitive_values)),
+            )
+        )
+        return " ".join(fields)
+
     def run(self, argv, timeout=None) -> ExternalResult:
         import subprocess
 
@@ -177,22 +207,38 @@ class ExternalProcessRunner:
         self.logger.info(
             "command start argv=%s timeout=%s", self._safe_argv(command), timeout
         )
-        result = subprocess.run(
-            command, capture_output=True, check=False, timeout=timeout
-        )
+        try:
+            result = subprocess.run(
+                command, capture_output=True, check=False, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as error:
+            diagnostic = self._diagnostic(
+                command,
+                "timeout",
+                self._decode(error.output),
+                self._decode(error.stderr),
+                status="timeout",
+            )
+            self.logger.error("command failure %s", diagnostic)
+            raise ExternalCommandError(diagnostic) from None
         decoded = ExternalResult(
             result.returncode,
             result.stdout.decode("utf-8", errors="replace"),
             result.stderr.decode("utf-8", errors="replace"),
         )
-        sensitive_values = self._sensitive_values(command)
-        self.logger.info(
-            "command result returncode=%s stdout=%s stderr=%s",
+        diagnostic = self._diagnostic(
+            command,
             decoded.returncode,
-            self._bounded(decoded.stdout, sensitive_values),
-            self._bounded(decoded.stderr, sensitive_values),
+            decoded.stdout,
+            decoded.stderr,
         )
-        return decoded
+        self.logger.info("command result %s", diagnostic)
+        return ExternalResult(
+            decoded.returncode,
+            decoded.stdout,
+            decoded.stderr,
+            diagnostic,
+        )
 
 
 def _display_dialog(message: str) -> None:

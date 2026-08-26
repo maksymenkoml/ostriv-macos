@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import plistlib
+import subprocess
 from unittest.mock import patch
 
 import ostriv_macos.launcher_runtime as runtime
@@ -850,6 +851,64 @@ class LauncherOrchestrationTests(unittest.TestCase):
 
 
 class LauncherMainTests(unittest.TestCase):
+    def test_expected_command_timeout_log_is_bounded_redacted_and_dialog_stays_exact(self):
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            config.game_command[:] = [
+                "wine",
+                "reg",
+                "add",
+                "/d",
+                "private-value",
+                "/f",
+            ]
+            config_path = Path(directory) / "launcher.json"
+            write_config(config, config_path)
+            events = []
+            dialogs = []
+
+            def time_out(argv, **kwargs):
+                raise subprocess.TimeoutExpired(
+                    list(argv),
+                    kwargs.get("timeout"),
+                    output=b"private-value output\xff\n" + b"x" * 3000,
+                    stderr=b"launcher timeout\x8e\n",
+                )
+
+            with patch.object(
+                runtime, "ProcessLock", side_effect=lambda _path: FakeLock(events)
+            ), patch.object(
+                runtime,
+                "ProfileGuard",
+                side_effect=lambda *_args: FakeProfile(events),
+            ), patch.object(
+                runtime, "ColorSyncProfileBackend", return_value=object()
+            ), patch.object(
+                runtime,
+                "SteamController",
+                side_effect=lambda **_kwargs: FakeSteam(events),
+            ), patch.object(
+                runtime, "install_signal_handlers", side_effect=lambda _profile: None
+            ), patch.object(
+                runtime, "_display_dialog", side_effect=dialogs.append
+            ), patch("subprocess.run", side_effect=time_out):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = main([str(config_path)])
+
+            self.assertEqual(1, code)
+            self.assertEqual(["Unable to start Ostriv."], dialogs)
+            self.assertEqual("", stdout.getvalue())
+            self.assertEqual("", stderr.getvalue())
+            text = Path(config.launcher_log).read_text(encoding="utf-8")
+            self.assertIn("command failure status=timeout", text)
+            self.assertIn("argv=[\"wine\", \"reg\", \"add\", \"/d\", \"<redacted>\", \"/f\"]", text)
+            self.assertIn("output='<redacted> output�", text)
+            self.assertIn("<truncated", text)
+            self.assertNotIn("private-value", text)
+            self.assertNotIn("x" * 2049, text)
+
     def assert_bootstrap_failure_is_generic(self, argv):
         dialogs = []
         with patch.object(runtime, "_display_dialog", side_effect=dialogs.append), patch.object(

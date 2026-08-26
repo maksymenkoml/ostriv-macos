@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from . import __version__
-from .diagnostics import CommandRunner, PatchError
+from .diagnostics import CommandRunner, PatchError, command_failure_detail
 from .discovery import Bottle, GameInstallation, is_supported_game_directory
 from .payload import PayloadEntry, validate_payload
 
@@ -727,7 +727,7 @@ class WineRegistry:
             if result.returncode != 0:
                 if self._missing(result):
                     return None
-                last_detail = result.stderr or result.stdout
+                last_detail = command_failure_detail(result)
                 continue
             for line in result.stdout.splitlines():
                 match = pattern.match(line)
@@ -747,7 +747,7 @@ class WineRegistry:
             result = self.runner.run(
                 self._base() + ["add", key, "/v", value, "/d", data, "/f"]
             )
-            last_detail = result.stderr
+            last_detail = command_failure_detail(result)
             if result.returncode == 0:
                 try:
                     if self.query(key, value) == data:
@@ -763,7 +763,7 @@ class WineRegistry:
             result = self.runner.run(
                 self._base() + ["delete", key, "/v", value, "/f"]
             )
-            last_detail = result.stderr
+            last_detail = command_failure_detail(result)
             if result.returncode == 0:
                 try:
                     if self.query(key, value, "restore.registry") is None:
@@ -1136,8 +1136,8 @@ class Installer:
             result = self.runner.run(argv)
             if result.returncode != 0:
                 issues.append(
-                    "cxbottle rejected the selected bottle: {}".format(
-                        result.stderr or result.stdout
+                    command_failure_detail(
+                        result, "cxbottle rejected the selected bottle"
                     )
                 )
         self._existing_state = self._load_state(installation, "install")
