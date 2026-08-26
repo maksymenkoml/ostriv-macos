@@ -60,15 +60,46 @@ class DiagnosticsTests(unittest.TestCase):
     @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_command_runner_captures_stderr_and_decodes_replacement(self, run):
         run.return_value = subprocess.CompletedProcess(
-            ["tool", "--check"], 3, b"OK\x8e", b"bad\xff"
+            ["wine", "--check"], 3, b"OK\x8e", b"bad\xff"
         )
-        result = CommandRunner().run(["tool", "--check"], timeout=2)
+        result = CommandRunner().run(["wine", "--check"], timeout=2)
         self.assertEqual(3, result.returncode)
         self.assertEqual("OK\ufffd", result.stdout)
         self.assertEqual("bad\ufffd", result.stderr)
         run.assert_called_once_with(
-            ["tool", "--check"], capture_output=True, check=False, timeout=2
+            ["wine", "--check"], capture_output=True, check=False, timeout=2
         )
+
+    @patch("ostriv_macos.diagnostics.subprocess.run")
+    def test_command_runner_logs_bounded_decoded_result_and_redacts_sensitive_data(
+        self, run
+    ):
+        run.return_value = subprocess.CompletedProcess(
+            ["wine", "reg", "add"],
+            7,
+            b"decoded\x8e output private-value\n" + b"x" * 5000,
+            b"failure\xff detail\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "diagnostics.log"
+            logger = configure_logger(log_path)
+
+            runner = CommandRunner()
+            runner.logger = logger
+            result = runner.run(
+                ["wine", "reg", "add", "/d", "private-value", "/f"],
+                timeout=2,
+            )
+
+            text = log_path.read_text(encoding="utf-8")
+        self.assertEqual(7, result.returncode)
+        self.assertIn('command start argv=["wine", "reg", "add", "/d", "<redacted>", "/f"]', text)
+        self.assertIn("command result returncode=7", text)
+        self.assertIn("decoded� output", text)
+        self.assertIn("failure� detail", text)
+        self.assertIn("<truncated", text)
+        self.assertNotIn("private-value", text)
+        self.assertLess(len(text), 6000)
 
     def test_logger_keeps_detail_out_of_player_output(self):
         with tempfile.TemporaryDirectory() as directory:

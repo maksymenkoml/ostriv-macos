@@ -122,17 +122,77 @@ class ExternalResult:
 class ExternalProcessRunner:
     """Run external commands without ever exposing their raw output to the player."""
 
+    ALLOWED_EXECUTABLES = frozenset({"open", "osascript", "pgrep", "wine"})
+    SENSITIVE_OPTIONS = frozenset(
+        {"--api-key", "--password", "--secret", "--token", "/d"}
+    )
+
+    def __init__(self, logger=None):
+        self.logger = logger or logging.getLogger("ostriv_macos.launcher")
+
+    @classmethod
+    def _command(cls, argv):
+        command = list(argv)
+        if not command or not isinstance(command[0], str):
+            raise ValueError("external command is empty or invalid")
+        executable = Path(command[0]).name
+        if executable not in cls.ALLOWED_EXECUTABLES:
+            raise ValueError("external executable is not allowed: {}".format(executable))
+        return command
+
+    @classmethod
+    def _safe_argv(cls, argv):
+        redacted = []
+        hide_next = False
+        for value in argv:
+            text = str(value)
+            if hide_next:
+                redacted.append("<redacted>")
+                hide_next = False
+                continue
+            redacted.append(text)
+            hide_next = text.lower() in cls.SENSITIVE_OPTIONS
+        return json.dumps(redacted, ensure_ascii=False)
+
+    @classmethod
+    def _sensitive_values(cls, argv):
+        return tuple(
+            str(argv[index + 1])
+            for index, value in enumerate(argv[:-1])
+            if str(value).lower() in cls.SENSITIVE_OPTIONS and str(argv[index + 1])
+        )
+
+    @staticmethod
+    def _bounded(text, sensitive_values=(), limit=2048):
+        for value in sensitive_values:
+            text = text.replace(value, "<redacted>")
+        if len(text) <= limit:
+            return repr(text)
+        return repr(text[:limit]) + " <truncated {} chars>".format(len(text) - limit)
+
     def run(self, argv, timeout=None) -> ExternalResult:
         import subprocess
 
-        result = subprocess.run(
-            list(argv), capture_output=True, check=False, timeout=timeout
+        command = self._command(argv)
+        self.logger.info(
+            "command start argv=%s timeout=%s", self._safe_argv(command), timeout
         )
-        return ExternalResult(
+        result = subprocess.run(
+            command, capture_output=True, check=False, timeout=timeout
+        )
+        decoded = ExternalResult(
             result.returncode,
             result.stdout.decode("utf-8", errors="replace"),
             result.stderr.decode("utf-8", errors="replace"),
         )
+        sensitive_values = self._sensitive_values(command)
+        self.logger.info(
+            "command result returncode=%s stdout=%s stderr=%s",
+            decoded.returncode,
+            self._bounded(decoded.stdout, sensitive_values),
+            self._bounded(decoded.stderr, sensitive_values),
+        )
+        return decoded
 
 
 def _display_dialog(message: str) -> None:
@@ -182,6 +242,7 @@ class SteamController:
         notify=lambda: None,
         config=None,
         runner=None,
+        logger=None,
     ) -> None:
         self._probe = probe
         self.config = config
@@ -193,6 +254,7 @@ class SteamController:
         self.transition_stable_seconds = transition_stable_seconds
         self.timeout_seconds = timeout_seconds
         self.notify = notify
+        self.logger = logger or logging.getLogger("ostriv_macos.launcher")
         self._opened = False
         self._notified = False
 
@@ -246,36 +308,49 @@ class SteamController:
 
     def probe(self) -> SteamSignals:
         if self._probe is not None:
-            return self._probe()
-        if self.config is None or self.runner is None:
-            raise TypeError("SteamController requires a probe or config and runner")
+            signals = self._probe()
+        else:
+            if self.config is None or self.runner is None:
+                raise TypeError("SteamController requires a probe or config and runner")
 
-        process = self.runner.run(
-            ["pgrep", "-f", r"steam\.exe"], timeout=5.0
-        ).returncode == 0
-        registry_command = self._wine_command(
-            "--no-update",
-            "--no-lock",
-            "reg",
-            "query",
-            r"HKCU\Software\Valve\Steam\ActiveProcess",
+            process = self.runner.run(
+                ["pgrep", "-f", r"steam\.exe"], timeout=5.0
+            ).returncode == 0
+            registry_command = self._wine_command(
+                "--no-update",
+                "--no-lock",
+                "reg",
+                "query",
+                r"HKCU\Software\Valve\Steam\ActiveProcess",
+            )
+            registry = self.runner.run(registry_command, timeout=10.0)
+            output = registry.stdout
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            active_user = False
+            for line in str(output).splitlines():
+                parts = line.split()
+                if (
+                    len(parts) == 3
+                    and parts[0] == "ActiveUser"
+                    and parts[2].startswith("0x")
+                ):
+                    try:
+                        active_user = int(parts[2], 16) != 0
+                    except ValueError:
+                        active_user = False
+            renderer = self.runner.run(
+                ["pgrep", "-f", "steamwebhelper.exe.*type=renderer"], timeout=5.0
+            ).returncode == 0
+            signals = SteamSignals(process, active_user, renderer)
+        self.logger.info(
+            "steam probe process=%s active_user=%s renderer=%s ready=%s",
+            signals.process,
+            signals.active_user,
+            signals.renderer,
+            signals.ready,
         )
-        registry = self.runner.run(registry_command, timeout=10.0)
-        output = registry.stdout
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", errors="replace")
-        active_user = False
-        for line in str(output).splitlines():
-            parts = line.split()
-            if len(parts) == 3 and parts[0] == "ActiveUser" and parts[2].startswith("0x"):
-                try:
-                    active_user = int(parts[2], 16) != 0
-                except ValueError:
-                    active_user = False
-        renderer = self.runner.run(
-            ["pgrep", "-f", "steamwebhelper.exe.*type=renderer"], timeout=5.0
-        ).returncode == 0
-        return SteamSignals(process, active_user, renderer)
+        return signals
 
     def ensure_ready(
         self, timeout_seconds: Optional[float] = None, retry: bool = False
@@ -648,6 +723,7 @@ def run_launcher(
         actual_steam = steam or SteamController(
             config=config,
             runner=actual_runner,
+            logger=logger,
             notify=lambda: _send_notification(
                 config.messages.get(
                     "steam_wait", "Waiting for Steam to finish starting."
@@ -655,22 +731,42 @@ def run_launcher(
                 actual_runner,
             ),
         )
-        logger.info("launcher state: recover")
+        logger.info("launcher boundary=recovery status=start")
         actual_profile.recover()
-        logger.info("launcher state: steam readiness")
+        logger.info("launcher boundary=recovery status=OK")
+        logger.info("launcher boundary=steam_readiness status=start")
         actual_steam.ensure_ready()
+        logger.info("launcher boundary=steam_readiness status=OK")
         (install_handlers or install_signal_handlers)(actual_profile)
+        logger.info("launcher boundary=profile_switch status=start")
         actual_profile.switch()
+        logger.info("launcher boundary=profile_switch status=OK")
 
         game_log = Path(config.game_log)
         offset = _log_offset(game_log)
-        run_game(config, actual_runner)
+        logger.info("launcher boundary=game_launch status=start attempt=1 offset=%s", offset)
+        result = run_game(config, actual_runner)
+        logger.info(
+            "launcher boundary=game_launch status=finished attempt=1 returncode=%s",
+            getattr(result, "returncode", "unknown"),
+        )
         final_state = classify_launch(read_new_log(game_log, offset))
+        logger.info("launcher classification=%s attempt=1", final_state)
         if final_state == "steam_api":
+            logger.info("launcher boundary=steam_retry_readiness status=start")
             actual_steam.ensure_ready(retry=True)
+            logger.info("launcher boundary=steam_retry_readiness status=OK")
             offset = _log_offset(game_log)
-            run_game(config, actual_runner)
+            logger.info(
+                "launcher boundary=game_launch status=start attempt=2 offset=%s", offset
+            )
+            result = run_game(config, actual_runner)
+            logger.info(
+                "launcher boundary=game_launch status=finished attempt=2 returncode=%s",
+                getattr(result, "returncode", "unknown"),
+            )
             final_state = classify_launch(read_new_log(game_log, offset))
+            logger.info("launcher classification=%s attempt=2", final_state)
         return 0
     except Exception:
         if logger is not None:

@@ -178,9 +178,10 @@ limiter). Applies live. The *root* fix belongs in winemac — tagging the surfac
 
 **The launcher automates it.** The installer creates `~/Applications/CrossOver/Ostriv
 (patched).app` plus a cxmenu entry. Its command runs the packaged runtime copied into the bottle
-with a separate JSON configuration: recover a previous marker → save the exact current profile →
-set sRGB (`ColorSyncDeviceSetCustomProfiles`, per-user, no admin) → establish stable Steam
-readiness → run `wine --bottle <bottle> --check --wait-children --start
+with a separate JSON configuration: recover a previous marker → establish stable Steam readiness
+→ install cleanup handlers → save the exact current profile → set sRGB
+(`ColorSyncDeviceSetCustomProfiles`, per-user, no admin) → run
+`wine --bottle <bottle> --check --wait-children --start
 "C:/…/ostriv.exe"` → restore the original profile in every handled exit path.
 
 Hard-won implementation facts:

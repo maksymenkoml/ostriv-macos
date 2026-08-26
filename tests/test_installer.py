@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import ostriv_macos.installer as installer_module
-from ostriv_macos.diagnostics import CommandResult, PatchError
+from ostriv_macos.diagnostics import CommandResult, PatchError, configure_logger
 from ostriv_macos.discovery import Bottle, CrossOverInstall, GameInstallation
 from ostriv_macos.installer import (
     BOTTLE_ENV,
@@ -287,6 +287,23 @@ class FakeBottleFixture:
 
 
 class InstallerTests(unittest.TestCase):
+    def test_successful_install_logs_stages_verification_and_completion(self):
+        fixture = FakeBottleFixture()
+        self.addCleanup(fixture.cleanup)
+        log_path = fixture.root / "install.log"
+        configure_logger(log_path)
+
+        fixture.installer().install(fixture.installation, fixture.payload)
+
+        text = log_path.read_text(encoding="utf-8")
+        self.assertGreater(len(text), 0)
+        self.assertIn("install start bottle=Bottle With Spaces", text)
+        self.assertIn("install stage=payload_validation status=OK", text)
+        self.assertIn("install stage=preflight status=OK", text)
+        self.assertIn("install verification start", text)
+        self.assertIn("install verification status=OK", text)
+        self.assertIn("install complete bottle=Bottle With Spaces", text)
+
     def test_staging_cleanup_preserves_payload_substituted_after_validation(self):
         fixture = FakeBottleFixture()
         try:

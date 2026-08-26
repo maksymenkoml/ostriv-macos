@@ -3,6 +3,7 @@ import io
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -105,6 +106,44 @@ class ReleaseArtifactTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual("", result.stdout)
             self.assertEqual("", result.stderr)
+
+    def test_extracted_preflight_and_diagnose_need_only_the_current_python(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / ASSET_NAME
+            build_release(archive)
+            unpacked = root / "unpacked"
+            with zipfile.ZipFile(archive) as bundle:
+                safe_extract(bundle, unpacked)
+            isolated_bin = root / "bin"
+            isolated_bin.mkdir()
+            python = isolated_bin / "python3"
+            python.symlink_to(Path(sys.executable).resolve())
+            environment = {
+                "HOME": str(root / "empty-home"),
+                "PATH": str(isolated_bin),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+
+            for option in ("--preflight", "--diagnose"):
+                with self.subTest(option=option):
+                    result = subprocess.run(
+                        [str(python), "patch.py", option],
+                        cwd=unpacked,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertEqual("", result.stderr)
+                    if option == "--preflight":
+                        self.assertEqual("", result.stdout)
+                    else:
+                        self.assertEqual(1, result.stdout.count("Ostriv for macOS"))
+                        self.assertEqual(1, result.stdout.count("Logs:"))
 
     def test_builder_rejects_any_asset_name_other_than_the_public_contract(self):
         # Catches accidentally publishing a differently named artifact that the
@@ -366,6 +405,27 @@ class WorkflowTests(unittest.TestCase):
 
 
 class PlayerDocumentationTests(unittest.TestCase):
+    def test_technical_launcher_sequence_puts_readiness_before_profile_switch(self):
+        technical = (REPOSITORY_ROOT / "docs/technical.md").read_text(encoding="utf-8")
+        display = technical.split("## Display color profile", 1)[1].split(
+            "## Fullscreen", 1
+        )[0]
+        automation = " ".join(
+            display.split("**The launcher automates it.**", 1)[1]
+            .split("Hard-won implementation facts:", 1)[0]
+            .split()
+        )
+        actions = (
+            "recover a previous marker",
+            "establish stable Steam readiness",
+            "save the exact current profile",
+            "set sRGB",
+            "run `wine",
+            "restore the original profile",
+        )
+        positions = [automation.index(action) for action in actions]
+        self.assertEqual(sorted(positions), positions)
+
     def test_readme_leads_with_one_ordered_player_path(self):
         # Catches player instructions being duplicated or hidden below contributor setup.
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")

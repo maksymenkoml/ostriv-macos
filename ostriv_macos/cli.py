@@ -331,7 +331,7 @@ def build_services(package_root: Path, logger, stdin: IO[str], output: PlayerOut
     from .installer import Installer
     from .launcher import LauncherInstaller
 
-    runner = CommandRunner()
+    runner = CommandRunner(logger=logger)
     launcher = LauncherInstaller(package_root, runner=runner)
     installer = Installer(package_root, launcher, runner=runner)
     return ProductionServices(package_root, installer, runner, stdin, output)

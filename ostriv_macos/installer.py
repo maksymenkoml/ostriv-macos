@@ -196,6 +196,7 @@ class Transaction:
         self._active_step: Optional[int] = None
 
     def start(self, operation: str) -> None:
+        logger.info("journal start operation=%s path=%s", operation, self.journal.path)
         self.journal.start(operation)
 
     def _undo(self, record_data: Dict[str, object]) -> None:
@@ -225,19 +226,23 @@ class Transaction:
         undo: UndoRecord,
         action: Callable[[], None],
     ) -> None:
+        logger.info("journal step begin name=%s", name)
         index = self.journal.begin(name, undo)
         previous_step = self._active_step
         self._active_step = index
         try:
             action()
             self.journal.mark_applied(index)
+            logger.info("journal step applied name=%s", name)
         except BaseException:
+            logger.warning("journal step failed name=%s", name)
             item = self.journal.data["records"][index]
             try:
                 self._undo(item["undo"])
             except BaseException as error:
                 raise self._rollback_failed(index, item, error) from error
             self.journal.mark_rolled_back(index)
+            logger.info("journal step rolled_back name=%s", name)
             raise
         finally:
             self._active_step = previous_step
@@ -248,19 +253,31 @@ class Transaction:
         self.journal.checkpoint_undo(self._active_step, undo)
 
     def rollback(self) -> None:
+        operation = self.journal.data.get("operation")
+        logger.info("journal rollback start operation=%s", operation)
         for index in range(len(self.journal.data["records"]) - 1, -1, -1):
             item = self.journal.data["records"][index]
             if item["status"] in ("pending", "applied"):
+                logger.info(
+                    "journal rollback record name=%s index=%s kind=%s",
+                    item.get("name"),
+                    index,
+                    item.get("undo", {}).get("kind"),
+                )
                 try:
                     self._undo(item["undo"])
                 except BaseException as error:
                     raise self._rollback_failed(index, item, error) from error
                 self.journal.mark_rolled_back(index)
         self.journal.commit()
+        logger.info("journal rollback complete operation=%s", operation)
 
     def recover_incomplete(self) -> None:
         if not self.journal.data.get("complete"):
+            operation = self.journal.data.get("operation")
+            logger.info("journal recovery start operation=%s", operation)
             self.rollback()
+            logger.info("journal recovery complete operation=%s", operation)
 
 
 BOTTLE_ENV = {
@@ -1758,6 +1775,11 @@ class Installer:
         payload: Sequence[PayloadEntry],
         launcher_state: Mapping[str, object],
     ) -> InstallState:
+        logger.info(
+            "install verification start bottle=%s payload_files=%s",
+            installation.bottle.name,
+            len(payload),
+        )
         failures = []
         for entry in payload:
             name = Path(entry.relative_path).name
@@ -1834,6 +1856,7 @@ class Installer:
                 "original_digest": _file_digest(settings),
                 "installed_digest": _file_digest(settings),
             }
+        logger.info("install verification status=OK bottle=%s", installation.bottle.name)
         return InstallState(
             schema=STATE_SCHEMA,
             project_version=__version__,
@@ -1883,8 +1906,16 @@ class Installer:
         installation: GameInstallation,
         payload: Sequence[PayloadEntry],
     ) -> InstallState:
+        logger.info(
+            "install start bottle=%s game=%s payload_files=%s",
+            installation.bottle.name,
+            installation.game_dir.resolve(),
+            len(payload),
+        )
         validate_payload(self.package_root, payload)
+        logger.info("install stage=payload_validation status=OK")
         self.preflight(installation, payload)
+        logger.info("install stage=preflight status=OK")
         transaction = self.transaction_for(installation)
         transaction.recover_incomplete()
         self._existing_state = self._load_state(installation, "install")
@@ -1901,8 +1932,10 @@ class Installer:
             self.write_install_state(transaction, installation, state)
             transaction.journal.commit()
             self._cleanup_completed_journal(transaction)
+            logger.info("install complete bottle=%s", installation.bottle.name)
             return state
         except BaseException:
+            logger.exception("install failed bottle=%s", installation.bottle.name)
             transaction.rollback()
             self._cleanup_completed_journal(transaction)
             raise
@@ -2304,6 +2337,11 @@ class Installer:
             ) from error
 
     def restore(self, installation: GameInstallation) -> None:
+        logger.info(
+            "restore start bottle=%s game=%s",
+            installation.bottle.name,
+            installation.game_dir.resolve(),
+        )
         transaction = self.transaction_for(installation)
         transaction.recover_incomplete()
         self._cleanup_completed_journal(transaction)
@@ -2325,6 +2363,8 @@ class Installer:
                 )
                 transaction.journal.commit()
                 self._cleanup_completed_journal(transaction)
+                logger.info("restore verification status=OK mode=legacy")
+                logger.info("restore complete bottle=%s", installation.bottle.name)
                 return
 
             transaction.step(
@@ -2393,6 +2433,7 @@ class Installer:
                 if str(item["path"]) not in handled:
                     self._journal_remove_owned(transaction, installation, item)
             self._verify_restored(installation, state)
+            logger.info("restore verification status=OK mode=owned")
             state_path = self.state_path(installation)
             state_digest = _file_digest(state_path)
             transaction.step(
@@ -2402,7 +2443,9 @@ class Installer:
             )
             transaction.journal.commit()
             self._cleanup_completed_journal(transaction)
+            logger.info("restore complete bottle=%s", installation.bottle.name)
         except BaseException:
+            logger.exception("restore failed bottle=%s", installation.bottle.name)
             transaction.rollback()
             self._cleanup_completed_journal(transaction)
             raise

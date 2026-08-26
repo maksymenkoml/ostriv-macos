@@ -296,6 +296,39 @@ class TransactionTests(unittest.TestCase):
         self.assertIn("cannot restore backup", caught.exception.detail)
         self.assertIn("cannot restore backup", log_path.read_text(encoding="utf-8"))
 
+    def test_successful_rollback_logs_each_reversed_journal_boundary(self):
+        log_path = Path(self.temp.name) / "rollback.log"
+        configure_logger(log_path)
+        transaction = Transaction(InstallJournal(self.path), self.handlers)
+        transaction.start("install")
+        transaction.step(
+            "copy driver", UndoRecord("event", {"undo": "restore driver"}), lambda: None
+        )
+
+        transaction.rollback()
+
+        text = log_path.read_text(encoding="utf-8")
+        self.assertIn("journal start operation=install", text)
+        self.assertIn("journal step begin name=copy driver", text)
+        self.assertIn("journal step applied name=copy driver", text)
+        self.assertIn("journal rollback start operation=install", text)
+        self.assertIn("journal rollback record name=copy driver", text)
+        self.assertIn("journal rollback complete operation=install", text)
+
+    def test_incomplete_journal_recovery_logs_start_and_completion(self):
+        log_path = Path(self.temp.name) / "recovery.log"
+        configure_logger(log_path)
+        journal = InstallJournal(self.path)
+        journal.start("install")
+        journal.begin("copy driver", UndoRecord("event", {"undo": "restore driver"}))
+
+        Transaction(journal, self.handlers).recover_incomplete()
+
+        text = log_path.read_text(encoding="utf-8")
+        self.assertIn("journal recovery start operation=install", text)
+        self.assertIn("journal rollback record name=copy driver", text)
+        self.assertIn("journal recovery complete operation=install", text)
+
 
 if __name__ == "__main__":
     unittest.main()

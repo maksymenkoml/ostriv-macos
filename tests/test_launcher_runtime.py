@@ -81,6 +81,24 @@ def write_config(config, path):
 
 
 class SteamControllerTests(unittest.TestCase):
+    def test_probe_records_each_readiness_signal_in_the_launcher_file_log(self):
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "launcher.log"
+            logger = runtime._create_launcher_log(log_path)
+            controller = SteamController(
+                config=make_config(directory),
+                runner=ProbeRunner(process=True, renderer=False),
+            )
+            controller.logger = logger
+
+            signals = controller.probe()
+
+            self.assertEqual(SteamSignals(True, True, False), signals)
+            self.assertIn(
+                "steam probe process=True active_user=True renderer=False ready=False",
+                log_path.read_text(encoding="utf-8"),
+            )
+
     def test_probe_requires_process_active_user_and_renderer(self):
         """Ignoring any one Steam signal would report a half-started client as ready."""
         expected = [
@@ -393,6 +411,37 @@ class SteamControllerTests(unittest.TestCase):
             self.assertEqual([(["open", str(app)], 10.0)], calls)
 
 
+class ExternalProcessRunnerTests(unittest.TestCase):
+    @patch("subprocess.run")
+    def test_file_log_bounds_decoded_output_and_redacts_echoed_sensitive_values(
+        self, run
+    ):
+        run.return_value = FakeResult(
+            9,
+            b"private-value result\xff\n" + b"x" * 5000,
+            b"launcher failure\x8e\n",
+        )
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "launcher.log"
+            runner = runtime.ExternalProcessRunner(
+                logger=runtime._create_launcher_log(log_path)
+            )
+
+            result = runner.run(
+                ["wine", "reg", "add", "/d", "private-value", "/f"], timeout=2
+            )
+
+            text = log_path.read_text(encoding="utf-8")
+        self.assertEqual(9, result.returncode)
+        self.assertIn("private-value", result.stdout)
+        self.assertIn("command result returncode=9", text)
+        self.assertIn("result�", text)
+        self.assertIn("launcher failure�", text)
+        self.assertIn("<truncated", text)
+        self.assertNotIn("private-value", text)
+        self.assertLess(len(text), 6000)
+
+
 class ProcessLockTests(unittest.TestCase):
     def test_second_launcher_is_rejected_until_first_lock_closes(self):
         """Allowing two holders would let double-click launches race profile and game state."""
@@ -565,6 +614,41 @@ class FakeLogger:
 
 
 class LauncherOrchestrationTests(unittest.TestCase):
+    def test_launcher_file_log_records_readiness_profile_and_game_boundaries(self):
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            Path(config.game_log).write_bytes(b"old log\n")
+            events = []
+
+            code = run_launcher(
+                config,
+                lock=FakeLock(events),
+                runner=FakeGameRunner(events, config.game_log, [b"normal exit\n"]),
+                steam=FakeSteam(events),
+                profile=FakeProfile(events),
+                dialog=lambda _message: self.fail("unexpected dialog"),
+                install_handlers=lambda _profile: events.append("handlers"),
+            )
+
+            self.assertEqual(0, code)
+            text = Path(config.launcher_log).read_text(encoding="utf-8")
+            boundaries = (
+                "launcher boundary=recovery status=start",
+                "launcher boundary=recovery status=OK",
+                "launcher boundary=steam_readiness status=start",
+                "launcher boundary=steam_readiness status=OK",
+                "launcher boundary=profile_switch status=start",
+                "launcher boundary=profile_switch status=OK",
+                "launcher boundary=game_launch status=start attempt=1",
+                "launcher boundary=game_launch status=finished attempt=1 returncode=0",
+                "launcher classification=other attempt=1",
+                "launcher final state: other",
+            )
+            for item in boundaries:
+                self.assertIn(item, text)
+            positions = [text.index(item) for item in boundaries]
+            self.assertEqual(sorted(positions), positions)
+
     def test_lock_failure_shows_one_message_and_short_circuits_every_adapter(self):
         """Doing work after a failed lock would let a double click mutate shared state."""
         events = []

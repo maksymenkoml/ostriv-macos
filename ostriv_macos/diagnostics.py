@@ -1,9 +1,19 @@
+import json
 import logging
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Optional, Sequence
+
+
+ALLOWED_EXTERNAL_EXECUTABLES = frozenset(
+    {"cxbottle", "cxmenu", "lsregister", "mdfind", "wine"}
+)
+_SENSITIVE_OPTIONS = frozenset(
+    {"--api-key", "--password", "--secret", "--token", "/d"}
+)
+_DIAGNOSTIC_LIMIT = 2048
 
 
 class PatchError(Exception):
@@ -25,23 +35,83 @@ def decode_output(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _validate_external_argv(argv: Sequence[str], allowed=ALLOWED_EXTERNAL_EXECUTABLES):
+    command = list(argv)
+    if not command or not isinstance(command[0], str):
+        raise ValueError("external command is empty or invalid")
+    executable = Path(command[0]).name
+    if executable not in allowed:
+        raise ValueError("external executable is not allowed: {}".format(executable))
+    return command
+
+
+def _safe_argv(argv: Sequence[str]) -> str:
+    redacted = []
+    hide_next = False
+    for value in argv:
+        text = str(value)
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+            continue
+        redacted.append(text)
+        hide_next = text.lower() in _SENSITIVE_OPTIONS
+    return json.dumps(redacted, ensure_ascii=False)
+
+
+def _sensitive_values(argv: Sequence[str]):
+    return tuple(
+        str(argv[index + 1])
+        for index, value in enumerate(argv[:-1])
+        if str(value).lower() in _SENSITIVE_OPTIONS and str(argv[index + 1])
+    )
+
+
+def _bounded_output(
+    text: str,
+    sensitive_values=(),
+    limit: int = _DIAGNOSTIC_LIMIT,
+) -> str:
+    for value in sensitive_values:
+        text = text.replace(value, "<redacted>")
+    if len(text) <= limit:
+        return repr(text)
+    omitted = len(text) - limit
+    return repr(text[:limit]) + " <truncated {} chars>".format(omitted)
+
+
 class CommandRunner:
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        self.logger = logger or logging.getLogger("ostriv_macos")
+
     def run(
         self,
         argv: Sequence[str],
         timeout: Optional[float] = None,
     ) -> CommandResult:
+        command = _validate_external_argv(argv)
+        self.logger.info(
+            "command start argv=%s timeout=%s", _safe_argv(command), timeout
+        )
         result = subprocess.run(
-            list(argv),
+            command,
             capture_output=True,
             check=False,
             timeout=timeout,
         )
-        return CommandResult(
+        decoded = CommandResult(
             result.returncode,
             decode_output(result.stdout),
             decode_output(result.stderr),
         )
+        sensitive_values = _sensitive_values(command)
+        self.logger.info(
+            "command result returncode=%s stdout=%s stderr=%s",
+            decoded.returncode,
+            _bounded_output(decoded.stdout, sensitive_values),
+            _bounded_output(decoded.stderr, sensitive_values),
+        )
+        return decoded
 
 
 def configure_logger(path: Path) -> logging.Logger:
