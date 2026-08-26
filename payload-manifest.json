@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "files": [
+    {
+      "path": "prebuilt/dxil.dll",
+      "size": 1503072,
+      "sha256": "cbcfe883a09fd0ca1f98abdf3a9553b560895e3283a136da82a8381253a169df",
+      "pe": true
+    },
+    {
+      "path": "prebuilt/libgallium_wgl.dll",
+      "size": 45716642,
+      "sha256": "816817bc20216fa07840dbba86ef25ec1715f6899df635f1f1aec9af209cf8b3",
+      "pe": true
+    },
+    {
+      "path": "prebuilt/libwinpthread-1.dll",
+      "size": 343646,
+      "sha256": "1bb16e85f19c34629364de7407b3531201e787d803df0db6e46d01d2e8a277ac",
+      "pe": true
+    },
+    {
+      "path": "prebuilt/opengl32.dll",
+      "size": 539467,
+      "sha256": "3b5c1e578c8b41dab765fcc90e5981917a8ea22105dee67d410633b3f5af2c3f",
+      "pe": true
+    },
+    {
+      "path": "assets/settings.data",
+      "size": 1332,
+      "sha256": "08bdbb1bb0aacdbc2d4aff6d0a22d653af90516ab151cd4e3ec60847e2efd8e1",
+      "pe": false
+    }
+  ]
+}
