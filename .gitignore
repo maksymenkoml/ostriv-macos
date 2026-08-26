@@ -4,3 +4,4 @@ __pycache__/
 .idea/
 *.tmp
 .DS_Store
+.worktrees/
