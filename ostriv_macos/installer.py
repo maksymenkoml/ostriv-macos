@@ -808,18 +808,21 @@ class Installer:
 
     def _launcher_app_path(self) -> Path:
         if self.launcher_destination.suffix == ".app":
-            return self.launcher_destination.resolve(strict=False)
-        return (self.launcher_destination / "Ostriv (patched).app").resolve(
-            strict=False
-        )
+            return (
+                self.launcher_destination.parent.resolve(strict=False)
+                / self.launcher_destination.name
+            )
+        return self.launcher_destination.resolve(strict=False) / "Ostriv (patched).app"
 
     def _allowed_launcher_artifacts(
         self, installation: GameInstallation
     ) -> set:
         app = self._launcher_app_path()
         bottle = installation.bottle.root.resolve()
+        previous = app.with_name("." + app.name + ".ostriv-macos.previous")
         return {
             app,
+            previous,
             app / "launcher",
             app / "Contents/Info.plist",
             app / "Contents/MacOS/Menu Helper",
@@ -948,6 +951,12 @@ class Installer:
     def undo_handlers(
         self, installation: GameInstallation
     ) -> Mapping[str, Callable[[UndoRecord], None]]:
+        restore_launcher = lambda record: self._undo_restore_snapshots(
+            installation, record
+        )
+        launcher_undo = getattr(self.launcher, "undo_handler", None)
+        if callable(launcher_undo):
+            restore_launcher = launcher_undo(installation, restore_launcher)
         return {
             "remove_path": lambda record: self._undo_remove_path(installation, record),
             "remove_staging": lambda record: self._undo_remove_staging(
@@ -963,9 +972,7 @@ class Installer:
             "restore_settings": lambda record: self._undo_restore_named(
                 installation, record
             ),
-            "restore_launcher": lambda record: self._undo_restore_snapshots(
-                installation, record
-            ),
+            "restore_launcher": restore_launcher,
         }
 
     def transaction_for(self, installation: GameInstallation) -> Transaction:
@@ -1031,6 +1038,9 @@ class Installer:
         self, installation: GameInstallation, payload: Sequence[PayloadEntry]
     ) -> None:
         issues = []
+        launcher_preflight = getattr(self.launcher, "preflight", None)
+        if callable(launcher_preflight):
+            launcher_preflight(installation)
         expected_payload = {
             *("prebuilt/{}".format(name) for name in DRIVER_NAMES),
             "assets/settings.data",
@@ -2180,6 +2190,9 @@ class Installer:
             for item in artifacts:
                 if isinstance(item, dict) and isinstance(item.get("path"), str):
                     paths.append(Path(item["path"]))
+        previous = launcher_state.get("previous_app")
+        if isinstance(previous, str):
+            paths.append(Path(previous))
         return paths
 
     def _verify_restored(
@@ -2256,11 +2269,15 @@ class Installer:
                 return
 
             launcher_paths = self._launcher_paths(state.launcher_artifacts)
+            launcher_undo = {"snapshots": self._snapshots(launcher_paths)}
+            restore_undo_data = getattr(self.launcher, "restore_undo_data", None)
+            if callable(restore_undo_data):
+                launcher_undo.update(
+                    restore_undo_data(installation, state.launcher_artifacts)
+                )
             transaction.step(
                 "restore launcher",
-                UndoRecord(
-                    "restore_launcher", {"snapshots": self._snapshots(launcher_paths)}
-                ),
+                UndoRecord("restore_launcher", launcher_undo),
                 lambda: self.launcher.restore(installation, state.launcher_artifacts),
             )
             handled = set()
@@ -2465,12 +2482,15 @@ class Installer:
                     {"path": str(legacy_runtime)},
                 ],
             }
+            launcher_undo = {
+                "snapshots": self._snapshots([legacy_app, legacy_runtime])
+            }
+            restore_undo_data = getattr(self.launcher, "restore_undo_data", None)
+            if callable(restore_undo_data):
+                launcher_undo.update(restore_undo_data(installation, legacy_state))
             transaction.step(
                 "restore legacy launcher",
-                UndoRecord(
-                    "restore_launcher",
-                    {"snapshots": self._snapshots([legacy_app, legacy_runtime])},
-                ),
+                UndoRecord("restore_launcher", launcher_undo),
                 lambda: self.launcher.restore(installation, legacy_state),
             )
 
