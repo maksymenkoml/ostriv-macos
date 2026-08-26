@@ -1,9 +1,16 @@
+import copy
+import importlib
+import io
 import json
+import logging
+import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+import ostriv_macos.installer as installer_module
 from ostriv_macos.diagnostics import PatchError, configure_logger
 from ostriv_macos.installer import InstallJournal, Transaction, UndoRecord, atomic_write_json
 
@@ -74,6 +81,28 @@ class TransactionTests(unittest.TestCase):
             json.loads(self.path.read_text(encoding="utf-8")),
         )
 
+    @unittest.skipIf(os.name == "nt", "Windows does not support opening directories this way")
+    def test_atomic_write_syncs_containing_directory_after_replacement(self):
+        opened_directories = []
+        real_open = os.open
+
+        def record_directory_open(*args):
+            descriptor = real_open(*args)
+            if args[0] == str(self.path.parent):
+                opened_directories.append(descriptor)
+            return descriptor
+
+        with patch("ostriv_macos.installer.os.open", side_effect=record_directory_open), patch(
+            "ostriv_macos.installer.os.fsync", wraps=os.fsync
+        ) as sync:
+            atomic_write_json(self.path, {"records": []})
+
+        self.assertEqual(1, len(opened_directories))
+        self.assertIn(
+            ((opened_directories[0],), {}),
+            [(call.args, call.kwargs) for call in sync.call_args_list],
+        )
+
     def test_atomic_write_cleans_temporary_file_when_replacement_fails(self):
         with patch("ostriv_macos.installer.os.replace", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
@@ -125,6 +154,94 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual("install.recovery_required", caught.exception.code)
         self.assertEqual("install", journal.data["operation"])
         self.assertEqual(1, len(journal.data["records"]))
+
+    def test_save_failure_does_not_change_any_in_memory_journal_state(self):
+        mutations = {
+            "start": lambda journal: journal.start("install"),
+            "begin": lambda journal: journal.begin(
+                "copy", UndoRecord("event", {"undo": "restore"})
+            ),
+            "mark_applied": lambda journal: journal.mark_applied(0),
+            "mark_rolled_back": lambda journal: journal.mark_rolled_back(0),
+            "commit": lambda journal: journal.commit(),
+        }
+
+        for name, mutation in mutations.items():
+            with self.subTest(mutation=name):
+                path = Path(self.temp.name) / name / "journal.json"
+                journal = InstallJournal(path)
+                if name != "start":
+                    journal.start("install")
+                if name in ("mark_applied", "mark_rolled_back", "commit"):
+                    journal.begin("copy", UndoRecord("event", {"undo": "restore"}))
+                before_object = journal.data
+                before_data = copy.deepcopy(journal.data)
+                before_disk = path.read_bytes() if path.exists() else None
+
+                with patch(
+                    "ostriv_macos.installer.atomic_write_json",
+                    side_effect=OSError("disk full"),
+                ):
+                    with self.assertRaises(OSError):
+                        mutation(journal)
+
+                self.assertIs(before_object, journal.data)
+                self.assertEqual(before_data, journal.data)
+                actual_disk = path.read_bytes() if path.exists() else None
+                self.assertEqual(before_disk, actual_disk)
+
+    def test_commit_save_failure_leaves_operation_recoverable(self):
+        journal = InstallJournal(self.path)
+        journal.start("install")
+        journal.begin("copy", UndoRecord("event", {"undo": "restore"}))
+        before_disk = self.path.read_bytes()
+        before_object = journal.data
+
+        with patch(
+            "ostriv_macos.installer.atomic_write_json", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                journal.commit()
+
+        self.assertIs(before_object, journal.data)
+        self.assertFalse(journal.data["complete"])
+        with self.assertRaises(PatchError) as caught:
+            journal.start("reinstall")
+        self.assertEqual("install.recovery_required", caught.exception.code)
+        self.assertEqual(before_disk, self.path.read_bytes())
+
+    def test_rollback_failure_is_silent_before_logger_configuration(self):
+        package_logger = logging.getLogger("ostriv_macos")
+        original_handlers = package_logger.handlers[:]
+        original_level = package_logger.level
+        original_propagate = package_logger.propagate
+        for handler in original_handlers:
+            package_logger.removeHandler(handler)
+        package_logger.setLevel(logging.NOTSET)
+        package_logger.propagate = True
+        try:
+            module = importlib.reload(installer_module)
+            transaction = module.Transaction(
+                module.InstallJournal(self.path),
+                {"event": lambda record: (_ for _ in ()).throw(RuntimeError("broken"))},
+            )
+            transaction.start("install")
+            transaction.step(
+                "copy", module.UndoRecord("event", {"undo": "restore"}), lambda: None
+            )
+
+            with redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(PatchError):
+                    transaction.rollback()
+
+            self.assertEqual("", stderr.getvalue())
+        finally:
+            for handler in package_logger.handlers[:]:
+                package_logger.removeHandler(handler)
+            for handler in original_handlers:
+                package_logger.addHandler(handler)
+            package_logger.setLevel(original_level)
+            package_logger.propagate = original_propagate
 
     def test_repeated_rollback_does_not_execute_an_undo_handler_twice(self):
         transaction = Transaction(InstallJournal(self.path), self.handlers)

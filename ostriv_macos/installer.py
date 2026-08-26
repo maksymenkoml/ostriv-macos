@@ -1,5 +1,6 @@
 """Durable, recoverable installation transactions."""
 
+import copy
 import json
 import logging
 import os
@@ -17,6 +18,9 @@ RECOVERY_REQUIRED_MESSAGE = "A previous installation needs recovery."
 ROLLBACK_FAILED_MESSAGE = "Installation recovery failed. Restore before trying again."
 
 logger = logging.getLogger("ostriv_macos")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,12 @@ def atomic_write_json(path: Path, data: Dict[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp_name, str(path))
+        if os.name != "nt":
+            directory_descriptor = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -95,8 +105,9 @@ class InstallJournal:
             ):
                 raise ValueError("journal record {} undo data is invalid".format(index))
 
-    def _save(self) -> None:
-        atomic_write_json(self.path, self.data)
+    def _save(self, candidate: Dict[str, object]) -> None:
+        atomic_write_json(self.path, candidate)
+        self.data = candidate
 
     def start(self, operation: str) -> None:
         if self.data["records"] and not self.data.get("complete"):
@@ -105,16 +116,17 @@ class InstallJournal:
                 RECOVERY_REQUIRED_MESSAGE,
                 "Cannot replace incomplete journal at {}".format(self.path),
             )
-        self.data = {
+        candidate = {
             "schema": JOURNAL_SCHEMA,
             "operation": operation,
             "complete": False,
             "records": [],
         }
-        self._save()
+        self._save(candidate)
 
     def begin(self, name: str, undo: UndoRecord) -> int:
-        records = self.data["records"]
+        candidate = copy.deepcopy(self.data)
+        records = candidate["records"]
         records.append(
             {
                 "name": name,
@@ -122,20 +134,23 @@ class InstallJournal:
                 "undo": {"kind": undo.kind, "data": undo.data},
             }
         )
-        self._save()
+        self._save(candidate)
         return len(records) - 1
 
     def mark_applied(self, index: int) -> None:
-        self.data["records"][index]["status"] = "applied"
-        self._save()
+        candidate = copy.deepcopy(self.data)
+        candidate["records"][index]["status"] = "applied"
+        self._save(candidate)
 
     def mark_rolled_back(self, index: int) -> None:
-        self.data["records"][index]["status"] = "rolled_back"
-        self._save()
+        candidate = copy.deepcopy(self.data)
+        candidate["records"][index]["status"] = "rolled_back"
+        self._save(candidate)
 
     def commit(self) -> None:
-        self.data["complete"] = True
-        self._save()
+        candidate = copy.deepcopy(self.data)
+        candidate["complete"] = True
+        self._save(candidate)
 
 
 class Transaction:
