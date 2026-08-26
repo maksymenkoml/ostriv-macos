@@ -37,6 +37,22 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def lock_identity_integrity(owner_token, lock_digest, device, inode):
+    identity = json.dumps(
+        [
+            "ostriv-restore-lock-identity-v1",
+            owner_token,
+            lock_digest,
+            device,
+            inode,
+            0o600,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return digest(identity)
+
+
 def settings_bytes(multisampling=1, marker=b"user-settings-tail"):
     key = b"bMultisampling"
     return b"\x05\x00fixture-prefix" + struct.pack("<i", len(key)) + key + bytes(
@@ -478,6 +494,27 @@ class FakeBottleFixture:
 
 
 class InstallerTests(unittest.TestCase):
+    def assert_recovery_rejected_before_mutation(
+        self,
+        fixture,
+        installer,
+        profiles,
+    ):
+        journal_path = installer.journal_path(fixture.installation)
+        journal_before = journal_path.read_bytes()
+        filesystem_before = fixture.snapshot()
+        profile_before = (profiles.current, list(profiles.calls))
+        calls_before = list(fixture.runner.calls)
+
+        with self.assertRaises(PatchError) as caught:
+            installer.restore(fixture.installation)
+
+        self.assertEqual("restore.launcher_recovery", caught.exception.code)
+        self.assertEqual(journal_before, journal_path.read_bytes())
+        self.assertEqual(filesystem_before, fixture.snapshot())
+        self.assertEqual(profile_before, (profiles.current, profiles.calls))
+        self.assertEqual(calls_before, fixture.runner.calls)
+
     def test_successful_install_logs_stages_verification_and_completion(self):
         fixture = FakeBottleFixture()
         self.addCleanup(fixture.cleanup)
@@ -1306,6 +1343,39 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_restore_restart_accepts_rolled_back_state_suffix(self):
+        """A retry may resume after the newest undo was durably marked rolled back."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            _launcher, installer = real_launcher_for_restore(fixture, profiles)
+            before = fixture.snapshot()
+            installer.install(fixture.installation, fixture.payload)
+            state_path = installer.state_path(fixture.installation)
+
+            interrupt_restore_after_state_unlink(
+                installer, fixture.installation
+            )
+
+            transaction = installer.transaction_for(fixture.installation)
+            index = len(transaction.journal.data["records"]) - 1
+            item = transaction.journal.data["records"][index]
+            self.assertEqual("remove ownership state", item["name"])
+            undo = item["undo"]
+            transaction.handlers[undo["kind"]](
+                UndoRecord(undo["kind"], undo["data"])
+            )
+            transaction.journal.mark_rolled_back(index)
+            self.assertTrue(state_path.is_file())
+
+            installer.restore(fixture.installation)
+
+            self.assertEqual(before, fixture.snapshot())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
+            self.assertEqual([], profiles.calls)
+        finally:
+            fixture.cleanup()
+
     def test_restore_restart_rejects_unauthenticated_state_snapshot_before_mutation(self):
         """Every state-snapshot boundary is authenticated before protected recovery."""
         mutation_names = (
@@ -1808,6 +1878,313 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(0o600, stat.S_IMODE(current_alias.st_mode))
         finally:
             fixture.cleanup()
+
+    def _assert_owned_lock_at_allowed_path_rejected(
+        self, *, identity_integrity
+    ):
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            journal_path = installer.journal_path(fixture.installation)
+            state_path = installer.state_path(fixture.installation)
+            lock = Path(str(state.launcher_artifacts["lock_path"]))
+            allowed_path = fixture.game_dir.resolve() / "dxil.dll"
+            expected = lock.read_bytes()
+
+            def unlink_with_allowed_survivor(*_args, **_kwargs):
+                os.link(lock, allowed_path)
+                lock.unlink()
+
+            with patch.object(
+                launcher,
+                "finalize_restore",
+                side_effect=unlink_with_allowed_survivor,
+            ):
+                interrupt_restore_after_final_lock_unlink(
+                    installer, fixture.installation
+                )
+
+            self.assertFalse(os.path.lexists(lock))
+            survivor = allowed_path.lstat()
+            self.assertTrue(stat.S_ISREG(survivor.st_mode))
+            self.assertEqual(1, survivor.st_nlink)
+            self.assertEqual(0o600, stat.S_IMODE(survivor.st_mode))
+            self.assertEqual(expected, allowed_path.read_bytes())
+
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            removal = active_record_snapshot(
+                journal, "remove dxil.dll", allowed_path
+            )
+            removal.clear()
+            removal.update(
+                {
+                    "path": str(allowed_path),
+                    "present": False,
+                    "type": "absent",
+                    "remove_sha256": digest(expected),
+                }
+            )
+            final_snapshot = active_record_snapshot(
+                journal, "remove launcher recovery lock", lock
+            )
+            self.assertEqual(
+                (survivor.st_dev, survivor.st_ino),
+                (final_snapshot["device"], final_snapshot["inode"]),
+            )
+            final_snapshot["inode"] += 1
+            if identity_integrity == "missing":
+                final_snapshot.pop("identity_integrity")
+            elif identity_integrity == "rebound":
+                final_snapshot["identity_integrity"] = lock_identity_integrity(
+                    state.launcher_artifacts["profile_owner_token"],
+                    state.launcher_artifacts["lock_sha256"],
+                    final_snapshot["device"],
+                    final_snapshot["inode"],
+                )
+                recovered_state = json.loads(
+                    state_path.read_text(encoding="utf-8")
+                )
+                next(
+                    item
+                    for item in recovered_state["owned_files"]
+                    if item["path"] == str(allowed_path)
+                )["sha256"] = digest(expected)
+                state_path.write_text(
+                    json.dumps(
+                        recovered_state,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            journal_path.write_text(
+                json.dumps(
+                    journal,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            self.assert_recovery_rejected_before_mutation(
+                fixture, installer, profiles
+            )
+            self.assertFalse(os.path.lexists(lock))
+            self.assertTrue(state_path.is_file())
+            current = allowed_path.lstat()
+            self.assertEqual(
+                (survivor.st_dev, survivor.st_ino),
+                (current.st_dev, current.st_ino),
+            )
+            self.assertEqual(expected, allowed_path.read_bytes())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_restart_rejects_owned_lock_at_allowed_path_with_inconsistent_identity(self):
+        """Stale identity integrity cannot authorize deleting owned lock bytes elsewhere."""
+        self._assert_owned_lock_at_allowed_path_rejected(
+            identity_integrity="stale"
+        )
+
+    def test_restore_restart_rejects_bare_final_lock_identity(self):
+        """A device/inode pair without its state-bound integrity is never trusted."""
+        self._assert_owned_lock_at_allowed_path_rejected(
+            identity_integrity="missing"
+        )
+
+    def test_restore_restart_rejects_owned_lock_content_with_rebound_identity(self):
+        """Owned lock content remains protected even under self-consistent metadata."""
+        self._assert_owned_lock_at_allowed_path_rejected(
+            identity_integrity="rebound"
+        )
+
+    def test_restore_restart_rejects_registry_semantic_and_topology_drift(self):
+        """Authenticated state fixes the one exact registry rollback transition."""
+        mutation_names = (
+            "key",
+            "value",
+            "before",
+            "after",
+            "original_absence",
+            "missing",
+            "duplicate",
+            "order",
+        )
+        for mutation_name in mutation_names:
+            with self.subTest(mutation=mutation_name):
+                fixture = FakeBottleFixture(
+                    prior_registry=None
+                    if mutation_name == "original_absence"
+                    else "builtin"
+                )
+                try:
+                    profiles = FakeRestoreProfiles()
+                    _launcher, installer = real_launcher_for_restore(
+                        fixture, profiles
+                    )
+                    installer.install(fixture.installation, fixture.payload)
+                    interrupt_restore_after_state_unlink(
+                        installer, fixture.installation
+                    )
+                    journal_path = installer.journal_path(fixture.installation)
+                    journal = json.loads(
+                        journal_path.read_text(encoding="utf-8")
+                    )
+                    registry_index = next(
+                        index
+                        for index, item in enumerate(journal["records"])
+                        if item["name"] == "restore registry override"
+                    )
+                    registry_record = journal["records"][registry_index]
+                    registry_data = registry_record["undo"]["data"]
+                    if mutation_name == "key":
+                        registry_data["key"] = r"HKCU\Software\Wrong"
+                    elif mutation_name == "value":
+                        registry_data["value"] = "wrong-value"
+                    elif mutation_name == "before":
+                        registry_data["before"] = "self-consistent-wrong-installed"
+                    elif mutation_name == "after":
+                        registry_data["after"] = "self-consistent-wrong-original"
+                    elif mutation_name == "original_absence":
+                        self.assertIsNone(registry_data["after"])
+                        registry_data["after"] = "fabricated-original"
+                    elif mutation_name == "missing":
+                        journal["records"].pop(registry_index)
+                    elif mutation_name == "duplicate":
+                        journal["records"].insert(
+                            registry_index + 1,
+                            json.loads(json.dumps(registry_record)),
+                        )
+                    else:
+                        following = registry_index + 1
+                        journal["records"][registry_index], journal["records"][following] = (
+                            journal["records"][following],
+                            journal["records"][registry_index],
+                        )
+                    journal_path.write_text(
+                        json.dumps(
+                            journal,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    self.assert_recovery_rejected_before_mutation(
+                        fixture, installer, profiles
+                    )
+                finally:
+                    fixture.cleanup()
+
+    def test_restore_restart_rejects_state_inconsistent_undo_semantics(self):
+        """Parsed file and launcher undo data must describe authenticated state."""
+        mutation_names = (
+            "owned_file",
+            "app_id",
+            "backup_file",
+            "backup_original",
+            "config",
+            "settings",
+            "launcher_runtime",
+            "launcher_config",
+            "launcher_tree",
+            "launcher_menu",
+        )
+        for mutation_name in mutation_names:
+            with self.subTest(mutation=mutation_name):
+                fixture = FakeBottleFixture()
+                try:
+                    profiles = FakeRestoreProfiles()
+                    _launcher, installer = real_launcher_for_restore(
+                        fixture, profiles
+                    )
+                    installer.install(fixture.installation, fixture.payload)
+                    interrupt_restore_after_state_unlink(
+                        installer, fixture.installation
+                    )
+                    journal_path = installer.journal_path(fixture.installation)
+                    journal = json.loads(
+                        journal_path.read_text(encoding="utf-8")
+                    )
+
+                    def record(name):
+                        return next(
+                            item
+                            for item in journal["records"]
+                            if item["name"] == name
+                        )
+
+                    injected = b"state-inconsistent-journal-bytes"
+                    if mutation_name == "owned_file":
+                        snapshot = record("remove dxil.dll")["undo"]["data"][
+                            "snapshots"
+                        ][0]
+                    elif mutation_name == "app_id":
+                        snapshot = record("remove steam_appid.txt")["undo"][
+                            "data"
+                        ]["snapshots"][0]
+                    elif mutation_name == "backup_file":
+                        snapshot = record("restore opengl32.dll")["undo"]["data"][
+                            "snapshots"
+                        ][0]
+                    elif mutation_name == "backup_original":
+                        snapshot = record("restore opengl32.dll")["undo"]["data"][
+                            "snapshots"
+                        ][1]
+                    elif mutation_name == "config":
+                        snapshot = record("restore cxbottle.conf")["undo"]["data"][
+                            "snapshots"
+                        ][0]
+                    elif mutation_name == "settings":
+                        snapshot = record("restore settings.data")["undo"]["data"][
+                            "snapshots"
+                        ][0]
+                    elif mutation_name == "launcher_runtime":
+                        snapshot = record("restore launcher")["undo"]["data"][
+                            "restore_files"
+                        ][0]
+                    elif mutation_name == "launcher_config":
+                        snapshot = record("restore launcher")["undo"]["data"][
+                            "restore_files"
+                        ][1]
+                    elif mutation_name == "launcher_tree":
+                        snapshot = next(
+                            item
+                            for item in record("restore launcher")["undo"]["data"][
+                                "restore_trees"
+                            ][0]["entries"]
+                            if item.get("type") == "file"
+                        )
+                    else:
+                        record("restore launcher")["undo"]["data"][
+                            "recreate_menu"
+                        ] = False
+                        snapshot = None
+                    if snapshot is not None:
+                        snapshot["content"] = base64.b64encode(injected).decode(
+                            "ascii"
+                        )
+                        snapshot["sha256"] = digest(injected)
+                    journal_path.write_text(
+                        json.dumps(
+                            journal,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    self.assert_recovery_rejected_before_mutation(
+                        fixture, installer, profiles
+                    )
+                finally:
+                    fixture.cleanup()
 
     def test_restore_restart_rejects_dict_restore_trees_before_lock_recreation(self):
         """Malformed tree containers are rejected before any recovery mutation."""

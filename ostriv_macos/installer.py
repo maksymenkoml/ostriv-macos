@@ -2824,6 +2824,29 @@ class Installer:
         )
 
     @staticmethod
+    def _restore_lock_identity_integrity(
+        owner_token: str,
+        lock_digest: str,
+        device: int,
+        inode: int,
+        mode: int = 0o600,
+    ) -> str:
+        """Bind the pre-unlink lock inode to its authenticated ownership data."""
+        identity = json.dumps(
+            [
+                "ostriv-restore-lock-identity-v1",
+                owner_token,
+                lock_digest,
+                device,
+                inode,
+                mode,
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return _bytes_digest(identity)
+
+    @staticmethod
     def _recovery_filesystem_safe_text(value: str) -> bool:
         if "\0" in value or any(
             0xD800 <= ord(character) <= 0xDFFF for character in value
@@ -2872,6 +2895,7 @@ class Installer:
                 "allowed_current_sha256",
                 "device",
                 "inode",
+                "identity_integrity",
             }
             required = {"path", "present", "type", "content", "sha256", "mode"}
             if not required.issubset(snapshot) or not set(snapshot).issubset(allowed):
@@ -2906,8 +2930,25 @@ class Installer:
                     type(identity) is not int or identity < 0
                 ):
                     raise failure("{} identity is invalid".format(location))
-            if ("device" in snapshot) != ("inode" in snapshot):
+            identity_fields = {
+                name
+                for name in ("device", "inode", "identity_integrity")
+                if name in snapshot
+            }
+            if identity_fields and identity_fields != {
+                "device",
+                "inode",
+                "identity_integrity",
+            }:
                 raise failure("{} identity is incomplete".format(location))
+            if identity_fields and (
+                not isinstance(snapshot["identity_integrity"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", snapshot["identity_integrity"]
+                )
+                is None
+            ):
+                raise failure("{} identity integrity is invalid".format(location))
             return snapshot
         if present and snapshot_type == "symlink":
             target = snapshot.get("target")
@@ -3310,11 +3351,87 @@ class Installer:
                     yield entry["target"], entry_path.parent, entry_location + ".target", None, None
 
     @staticmethod
+    def _recovery_regular_file(
+        path: Path, maximum_size: int
+    ) -> Optional[Tuple[bytes, int]]:
+        """Return stable single-link no-follow contents and mode for one leaf."""
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            return None
+        descriptor = None
+        try:
+            before = os.lstat(str(path))
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                return None
+            descriptor = os.open(
+                str(path),
+                os.O_RDONLY
+                | no_follow
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or identity != (before.st_dev, before.st_ino)
+            ):
+                return None
+            data = b""
+            while len(data) <= maximum_size:
+                chunk = os.read(descriptor, maximum_size + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            after = os.fstat(descriptor)
+            current = os.lstat(str(path))
+            modes = {
+                stat.S_IMODE(item.st_mode)
+                for item in (before, opened, after, current)
+            }
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (after.st_dev, after.st_ino) != identity
+                or (current.st_dev, current.st_ino) != identity
+                or after.st_nlink != 1
+                or current.st_nlink != 1
+                or len(modes) != 1
+            ):
+                return None
+            return data, modes.pop()
+        except (OSError, ValueError):
+            return None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @classmethod
+    def _recovery_owned_lock_copy(
+        cls,
+        candidate: Path,
+        expected_data: Optional[bytes],
+        expected_digest: Optional[str],
+    ) -> bool:
+        """Read a referenced regular leaf without following it and identify lock bytes."""
+        if expected_data is None or expected_digest is None:
+            return False
+        observed = cls._recovery_regular_file(candidate, len(expected_data))
+        return (
+            observed is not None
+            and observed[1] == 0o600
+            and observed[0] == expected_data
+            and _bytes_digest(observed[0]) == expected_digest
+        )
+
+    @classmethod
     def _recovery_path_relation(
+        cls,
         path_text: object,
         lock: Path,
         old_identity: Optional[Tuple[int, int]],
         base: Optional[Path] = None,
+        expected_data: Optional[bytes] = None,
+        expected_digest: Optional[str] = None,
     ) -> Optional[str]:
         if not isinstance(path_text, str):
             return None
@@ -3343,7 +3460,364 @@ class Installer:
             identities.append((lock_status.st_dev, lock_status.st_ino))
         if stat.S_ISREG(status.st_mode) and (status.st_dev, status.st_ino) in identities:
             return "alias"
+        if cls._recovery_owned_lock_copy(
+            candidate, expected_data, expected_digest
+        ):
+            return "alias"
         return None
+
+    @classmethod
+    def _recovery_snapshot_matches_live(
+        cls, snapshot: Mapping[str, object]
+    ) -> bool:
+        """Authenticate a captured leaf against the current no-follow leaf."""
+        path = Path(str(snapshot.get("path", "")))
+        snapshot_type = snapshot.get("type")
+        if snapshot_type == "absent":
+            return not os.path.lexists(str(path))
+        try:
+            before = os.lstat(str(path))
+        except (OSError, ValueError):
+            return False
+        if snapshot_type == "symlink":
+            try:
+                return stat.S_ISLNK(before.st_mode) and os.readlink(
+                    path
+                ) == snapshot.get("target")
+            except (OSError, ValueError):
+                return False
+        if snapshot_type != "file" or not stat.S_ISREG(before.st_mode):
+            return False
+        try:
+            expected = base64.b64decode(snapshot.get("content"), validate=True)
+        except (TypeError, ValueError):
+            return False
+        observed = cls._recovery_regular_file(path, len(expected))
+        return (
+            observed is not None
+            and observed[1] == snapshot.get("mode")
+            and observed[0] == expected
+            and _bytes_digest(observed[0]) == snapshot.get("sha256")
+        )
+
+    def _recovery_snapshot_has_semantic_content(
+        self,
+        snapshot: Mapping[str, object],
+        expected_digests: Sequence[str],
+    ) -> bool:
+        return (
+            snapshot.get("type") == "file"
+            and snapshot.get("sha256") in expected_digests
+        ) or self._recovery_snapshot_matches_live(snapshot)
+
+    def _expected_restore_recovery_records(
+        self,
+        installation: GameInstallation,
+        state: InstallState,
+    ) -> List[Tuple[str, str, str, object]]:
+        """Describe the only state-consistent forward Restore journal prefix."""
+        expected: List[Tuple[str, str, str, object]] = [
+            ("restore launcher", "restore_launcher", "launcher", None)
+        ]
+        handled = set()
+        config = installation.bottle.root.resolve() / "cxbottle.conf"
+        settings = self._settings_path(installation)
+        for item in reversed(state.backup_files):
+            path = Path(str(item["path"]))
+            kind = "restore_file"
+            if path == config:
+                kind = "restore_config"
+            elif path == settings:
+                kind = "restore_settings"
+            expected.append(
+                ("restore {}".format(path.name), kind, "backup", item)
+            )
+            handled.add(str(path))
+        if state.original_config_backup and str(config) not in handled:
+            expected.append(
+                (
+                    "restore {}".format(config.name),
+                    "restore_config",
+                    "backup",
+                    {
+                        "path": str(config),
+                        "backup_path": state.original_config_backup,
+                        "installed_sha256": state.installed_config_digest,
+                        "original_sha256": state.original_config_digest,
+                    },
+                )
+            )
+            handled.add(str(config))
+        if state.original_settings_backup and str(settings) not in handled:
+            expected.append(
+                (
+                    "restore {}".format(settings.name),
+                    "restore_settings",
+                    "backup",
+                    {
+                        "path": str(settings),
+                        "backup_path": state.original_settings_backup,
+                        "installed_sha256": state.installed_settings_digest,
+                        "original_sha256": state.original_settings_digest,
+                    },
+                )
+            )
+            handled.add(str(settings))
+        if state.prior_registry_value != REGISTRY_DATA:
+            expected.append(
+                (
+                    "restore registry override",
+                    "restore_registry",
+                    "registry",
+                    None,
+                )
+            )
+        for item in reversed(state.owned_files):
+            path = Path(str(item["path"]))
+            if str(path) not in handled:
+                expected.append(
+                    (
+                        "remove {}".format(path.name),
+                        "restore_file",
+                        "owned",
+                        item,
+                    )
+                )
+        if callable(getattr(self.launcher, "finalize_restore", None)):
+            expected.append(
+                (
+                    "remove launcher recovery lock",
+                    "restore_launcher",
+                    "final_lock",
+                    None,
+                )
+            )
+        expected.append(
+            (
+                "remove ownership state",
+                "restore_file",
+                "state",
+                None,
+            )
+        )
+        return expected
+
+    def _validate_recovery_backup_semantics(
+        self,
+        record: UndoRecord,
+        item: Mapping[str, object],
+        location: str,
+    ) -> None:
+        failure = self._restore_recovery_failure
+        snapshots = record.data["snapshots"]
+        path = str(item["path"])
+        backup = str(item["backup_path"])
+        installed = str(item["installed_sha256"])
+        original = str(item["original_sha256"])
+        if len(snapshots) != 2 or [
+            snapshot.get("path") for snapshot in snapshots
+        ] != [path, backup]:
+            raise failure("{} backup snapshot identity is invalid".format(location))
+        target, saved = snapshots
+        if target.get("allowed_current_sha256") != [original] or not (
+            self._recovery_snapshot_has_semantic_content(
+                target, (installed, original)
+            )
+        ):
+            raise failure("{} target snapshot is state-inconsistent".format(location))
+        if "allowed_current_sha256" in saved or not (
+            self._recovery_snapshot_has_semantic_content(saved, (original,))
+        ):
+            raise failure("{} backup snapshot is state-inconsistent".format(location))
+
+    def _validate_recovery_owned_semantics(
+        self,
+        record: UndoRecord,
+        item: Mapping[str, object],
+        location: str,
+    ) -> None:
+        failure = self._restore_recovery_failure
+        snapshots = record.data["snapshots"]
+        if len(snapshots) != 1 or snapshots[0].get("path") != str(item["path"]):
+            raise failure("{} owned snapshot identity is invalid".format(location))
+        snapshot = snapshots[0]
+        if snapshot.get("type") == "absent":
+            if set(snapshot) != {"path", "present", "type"} or not (
+                self._recovery_snapshot_matches_live(snapshot)
+            ):
+                raise failure("{} absent owned snapshot is invalid".format(location))
+            return
+        if any(
+            name in snapshot
+            for name in (
+                "allowed_current_sha256",
+                "device",
+                "inode",
+                "identity_integrity",
+            )
+        ) or not self._recovery_snapshot_has_semantic_content(
+            snapshot, (str(item["sha256"]),)
+        ):
+            raise failure("{} owned snapshot is state-inconsistent".format(location))
+
+    @staticmethod
+    def _recovery_inventory_without_content(
+        entries: Sequence[Mapping[str, object]],
+    ) -> List[Dict[str, object]]:
+        normalized = []
+        for entry in entries:
+            item = copy.deepcopy(dict(entry))
+            item.pop("content", None)
+            normalized.append(item)
+        return normalized
+
+    def _validate_recovery_launcher_semantics(
+        self,
+        installation: GameInstallation,
+        state: InstallState,
+        record: UndoRecord,
+        location: str,
+    ) -> None:
+        failure = self._restore_recovery_failure
+        data = record.data
+        launcher_state = state.launcher_artifacts
+        if data.get("snapshots") != [] or data.get("recreate_menu") is not True:
+            raise failure("{} launcher flags are state-inconsistent".format(location))
+        trees = data.get("restore_trees", [])
+        files = data.get("restore_files", [])
+        if len(trees) != 2 or len(files) != 4:
+            raise failure("{} launcher cardinality is invalid".format(location))
+        app_tree, previous_tree = trees
+        app_inventory = self._recovery_inventory_without_content(
+            app_tree["entries"]
+        )
+        if (
+            app_tree.get("root") != launcher_state["app"]
+            or app_tree.get("present") is not True
+            or app_inventory != launcher_state["app_inventory"]
+        ):
+            raise failure("{} launcher app snapshot is state-inconsistent".format(location))
+        expected_previous = launcher_state.get("previous_app_inventory", [])
+        previous_path = self._launcher_app_path().with_name(
+            "." + self._launcher_app_path().name + ".ostriv-macos.previous"
+        )
+        if (
+            previous_tree.get("root") != str(previous_path)
+            or previous_tree.get("present") is not bool(expected_previous)
+            or self._recovery_inventory_without_content(previous_tree["entries"])
+            != expected_previous
+        ):
+            raise failure(
+                "{} previous launcher snapshot is state-inconsistent".format(
+                    location
+                )
+            )
+        runtime, config, lock, marker = files
+        previous_runtime = launcher_state.get("previous_runtime")
+        previous_config = launcher_state.get("previous_config")
+        runtime_digests = [str(launcher_state["runtime_sha256"])]
+        config_digests = [str(launcher_state["config_sha256"])]
+        if isinstance(previous_runtime, dict):
+            runtime_digests.append(str(previous_runtime.get("sha256", "")))
+        if isinstance(previous_config, dict):
+            config_digests.append(str(previous_config.get("sha256", "")))
+        if not self._recovery_snapshot_has_semantic_content(
+            runtime, tuple(runtime_digests)
+        ):
+            raise failure("{} launcher runtime snapshot is state-inconsistent".format(location))
+        if not self._recovery_snapshot_has_semantic_content(
+            config, tuple(config_digests)
+        ):
+            raise failure("{} launcher config snapshot is state-inconsistent".format(location))
+        expected_lock_data = (
+            str(launcher_state["profile_owner_token"]) + "\n"
+        ).encode("ascii")
+        if (
+            lock.get("present") is not True
+            or lock.get("type") != "file"
+            or lock.get("sha256") != launcher_state["lock_sha256"]
+            or lock.get("mode") != 0o600
+            or base64.b64decode(lock.get("content"), validate=True)
+            != expected_lock_data
+        ):
+            raise failure("{} launcher lock snapshot is state-inconsistent".format(location))
+        if set(marker) != {"path", "present", "type"} or (
+            marker.get("present") is not False
+            or marker.get("type") != "absent"
+        ):
+            raise failure("{} launcher marker snapshot is state-inconsistent".format(location))
+
+    def _reconcile_restore_recovery_records(
+        self,
+        installation: GameInstallation,
+        records: Sequence[Mapping[str, object]],
+        parsed: Sequence[Tuple[int, str, UndoRecord]],
+        state: InstallState,
+        *,
+        validate_launcher: bool,
+    ) -> None:
+        """Reject state-inconsistent Restore undo data before any replay mutation."""
+        failure = self._restore_recovery_failure
+        expected = self._expected_restore_recovery_records(installation, state)
+        if len(records) > len(expected):
+            raise failure("Restore journal has extra records")
+        rolled_back = False
+        pending_indexes = []
+        active_indexes = []
+        for index, item in enumerate(records):
+            status = item.get("status")
+            if status == "rolled_back":
+                rolled_back = True
+            else:
+                if rolled_back:
+                    raise failure("Restore journal active records are not a prefix")
+                active_indexes.append(index)
+                if status == "pending":
+                    pending_indexes.append(index)
+            expected_name, expected_kind, _semantic, _payload = expected[index]
+            undo = item.get("undo")
+            if (
+                item.get("name") != expected_name
+                or not isinstance(undo, dict)
+                or undo.get("kind") != expected_kind
+            ):
+                raise failure("Restore journal topology differs at record {}".format(index))
+        if len(pending_indexes) > 1 or (
+            pending_indexes and pending_indexes[-1] != active_indexes[-1]
+        ):
+            raise failure("Restore journal pending-record topology is invalid")
+        parsed_by_index = {index: record for index, _name, record in parsed}
+        if set(parsed_by_index) != set(active_indexes):
+            raise failure("Restore recovery plan does not cover every active record")
+        for index in active_indexes:
+            _name, _kind, semantic, payload = expected[index]
+            record = parsed_by_index[index]
+            location = "record {} {}".format(index, semantic)
+            if semantic == "registry":
+                expected_data = {
+                    "key": REGISTRY_KEY,
+                    "value": REGISTRY_VALUE,
+                    "before": REGISTRY_DATA,
+                    "after": state.prior_registry_value,
+                }
+                if record.data != expected_data:
+                    raise failure(
+                        "{} rollback transition is state-inconsistent".format(
+                            location
+                        )
+                    )
+            elif semantic == "backup":
+                self._validate_recovery_backup_semantics(
+                    record, payload, location
+                )
+            elif semantic == "owned":
+                self._validate_recovery_owned_semantics(
+                    record, payload, location
+                )
+            elif semantic == "launcher" and validate_launcher:
+                self._validate_recovery_launcher_semantics(
+                    installation, state, record, location
+                )
 
     def _build_restore_recovery_plan(
         self,
@@ -3436,6 +3910,26 @@ class Installer:
                 validator(installation, recovered_state.launcher_artifacts)
             except (PatchError, TypeError, ValueError) as error:
                 raise failure("Launcher recovery state is invalid: {}".format(error)) from error
+        if recovered_state is not None:
+            self._reconcile_restore_recovery_records(
+                installation,
+                records,
+                parsed,
+                recovered_state,
+                validate_launcher=protected_state,
+            )
+        elif any(
+            item.get("name")
+            in {
+                "restore launcher",
+                "restore registry override",
+                "remove launcher recovery lock",
+                "remove ownership state",
+            }
+            for item in records
+            if isinstance(item, dict)
+        ):
+            raise failure("Restore ownership state is unavailable")
 
         lock = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
         expected_data = None
@@ -3487,6 +3981,7 @@ class Installer:
                         "mode",
                         "device",
                         "inode",
+                        "identity_integrity",
                     }:
                         raise failure("Final launcher lock identity is invalid")
                     final_candidates.append(candidate)
@@ -3499,6 +3994,14 @@ class Installer:
         old_identity = None
         if final_candidates:
             final_snapshot = final_candidates[0][3]
+            expected_integrity = self._restore_lock_identity_integrity(
+                str(owner_token),
+                str(expected_digest),
+                final_snapshot["device"],
+                final_snapshot["inode"],
+            )
+            if final_snapshot["identity_integrity"] != expected_integrity:
+                raise failure("Final launcher lock identity integrity is invalid")
             old_identity = (final_snapshot["device"], final_snapshot["inode"])
             if os.path.lexists(lock):
                 status = os.lstat(str(lock))
@@ -3536,7 +4039,12 @@ class Installer:
                 index, name, record
             ):
                 relation = self._recovery_path_relation(
-                    path_text, lock, old_identity, base
+                    path_text,
+                    lock,
+                    old_identity,
+                    base,
+                    expected_data,
+                    expected_digest,
                 )
                 if relation == "alias":
                     raise failure("Launcher lock alias appears in {}".format(location))
@@ -3944,6 +4452,14 @@ class Installer:
                         "Restore failed.",
                         "Unable to authenticate the launcher lock before final unlink",
                     )
+                final_lock_snapshots[0]["identity_integrity"] = (
+                    self._restore_lock_identity_integrity(
+                        owner_token,
+                        str(state.launcher_artifacts.get("lock_sha256")),
+                        final_lock_snapshots[0]["device"],
+                        final_lock_snapshots[0]["inode"],
+                    )
+                )
                 final_lock_identity = (
                     final_lock_snapshots[0]["device"],
                     final_lock_snapshots[0]["inode"],
