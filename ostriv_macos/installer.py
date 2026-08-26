@@ -30,6 +30,7 @@ JOURNAL_CORRUPT_MESSAGE = "The installation journal is unreadable. Restore befor
 RECOVERY_REQUIRED_MESSAGE = "A previous installation needs recovery."
 ROLLBACK_FAILED_MESSAGE = "Installation recovery failed. Restore before trying again."
 _JOURNAL_REPLACED_ATTRIBUTE = "_ostriv_journal_replaced"
+_RESTORE_LOCK_IDENTITY_MAX = (1 << 64) - 1
 
 logger = logging.getLogger("ostriv_macos")
 if not logger.handlers:
@@ -2824,14 +2825,39 @@ class Installer:
         )
 
     @staticmethod
+    def _restore_lock_identity_components(
+        device: object, inode: object
+    ) -> Tuple[int, int]:
+        """Return one concrete platform-safe device/inode identity."""
+        if (
+            type(device) is not int
+            or not 0 <= device <= _RESTORE_LOCK_IDENTITY_MAX
+            or type(inode) is not int
+            or not 0 < inode <= _RESTORE_LOCK_IDENTITY_MAX
+        ):
+            raise ValueError("invalid restore lock identity")
+        return device, inode
+
+    @classmethod
     def _restore_lock_identity_integrity(
-        owner_token: str,
-        lock_digest: str,
-        device: int,
-        inode: int,
-        mode: int = 0o600,
+        cls,
+        owner_token: object,
+        lock_digest: object,
+        device: object,
+        inode: object,
+        mode: object = 0o600,
     ) -> str:
         """Bind the pre-unlink lock inode to its authenticated ownership data."""
+        device, inode = cls._restore_lock_identity_components(device, inode)
+        if (
+            type(owner_token) is not str
+            or not owner_token
+            or type(lock_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", lock_digest) is None
+            or type(mode) is not int
+            or mode != 0o600
+        ):
+            raise ValueError("invalid restore lock identity integrity input")
         identity = json.dumps(
             [
                 "ostriv-restore-lock-identity-v1",
@@ -2924,12 +2950,6 @@ class Installer:
                 for item in allowed_current
             ):
                 raise failure("{} current-digest list is invalid".format(location))
-            for identity_name in ("device", "inode"):
-                identity = snapshot.get(identity_name)
-                if identity is not None and (
-                    type(identity) is not int or identity < 0
-                ):
-                    raise failure("{} identity is invalid".format(location))
             identity_fields = {
                 name
                 for name in ("device", "inode", "identity_integrity")
@@ -2949,6 +2969,15 @@ class Installer:
                 is None
             ):
                 raise failure("{} identity integrity is invalid".format(location))
+            if identity_fields:
+                try:
+                    self._restore_lock_identity_components(
+                        snapshot["device"], snapshot["inode"]
+                    )
+                except ValueError as error:
+                    raise failure(
+                        "{} identity is invalid".format(location)
+                    ) from error
             return snapshot
         if present and snapshot_type == "symlink":
             target = snapshot.get("target")
@@ -3405,23 +3434,79 @@ class Installer:
             if descriptor is not None:
                 os.close(descriptor)
 
-    @classmethod
-    def _recovery_owned_lock_copy(
-        cls,
+    @staticmethod
+    def _recovery_protected_lock_content(
         candidate: Path,
         expected_data: Optional[bytes],
         expected_digest: Optional[str],
-    ) -> bool:
-        """Read a referenced regular leaf without following it and identify lock bytes."""
+    ) -> Optional[bool]:
+        """Classify exact lock content without granting mutation ownership."""
         if expected_data is None or expected_digest is None:
             return False
-        observed = cls._recovery_regular_file(candidate, len(expected_data))
-        return (
-            observed is not None
-            and observed[1] == 0o600
-            and observed[0] == expected_data
-            and _bytes_digest(observed[0]) == expected_digest
-        )
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            return None
+        descriptor = None
+        try:
+            before = os.lstat(str(candidate))
+            if not stat.S_ISREG(before.st_mode):
+                return False
+            descriptor = os.open(
+                str(candidate),
+                os.O_RDONLY
+                | no_follow
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or identity != (before.st_dev, before.st_ino)
+            ):
+                return None
+            maximum_size = len(expected_data)
+            data = b""
+            while len(data) <= maximum_size:
+                chunk = os.read(
+                    descriptor, maximum_size + 1 - len(data)
+                )
+                if not chunk:
+                    break
+                data += chunk
+            after = os.fstat(descriptor)
+            current = os.lstat(str(candidate))
+            statuses = (before, opened, after, current)
+            modes = {stat.S_IMODE(item.st_mode) for item in statuses}
+            link_counts = {item.st_nlink for item in statuses}
+            sizes = {item.st_size for item in statuses}
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or any(
+                    (item.st_dev, item.st_ino) != identity
+                    for item in (after, current)
+                )
+                or len(modes) != 1
+                or len(link_counts) != 1
+                or next(iter(link_counts)) < 1
+                or len(sizes) != 1
+            ):
+                return None
+            size = next(iter(sizes))
+            if size > maximum_size:
+                return False
+            if len(data) != size:
+                return None
+            return (
+                modes.pop() == 0o600
+                and data == expected_data
+                and _bytes_digest(data) == expected_digest
+            )
+        except (OSError, ValueError):
+            return None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     @classmethod
     def _recovery_path_relation(
@@ -3460,9 +3545,12 @@ class Installer:
             identities.append((lock_status.st_dev, lock_status.st_ino))
         if stat.S_ISREG(status.st_mode) and (status.st_dev, status.st_ino) in identities:
             return "alias"
-        if cls._recovery_owned_lock_copy(
+        protected_content = cls._recovery_protected_lock_content(
             candidate, expected_data, expected_digest
-        ):
+        )
+        if protected_content is None:
+            return "unsafe"
+        if protected_content:
             return "alias"
         return None
 
@@ -4048,6 +4136,12 @@ class Installer:
                 )
                 if relation == "alias":
                     raise failure("Launcher lock alias appears in {}".format(location))
+                if relation == "unsafe":
+                    raise failure(
+                        "Launcher lock content could not be classified in {}".format(
+                            location
+                        )
+                    )
                 if relation == "exact" and (
                     field is None
                     or (index, field, int(snapshot_index)) not in omitted

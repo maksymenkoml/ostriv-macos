@@ -514,6 +514,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(filesystem_before, fixture.snapshot())
         self.assertEqual(profile_before, (profiles.current, profiles.calls))
         self.assertEqual(calls_before, fixture.runner.calls)
+        return caught.exception
 
     def test_successful_install_logs_stages_verification_and_completion(self):
         fixture = FakeBottleFixture()
@@ -1880,7 +1881,7 @@ class InstallerTests(unittest.TestCase):
             fixture.cleanup()
 
     def _assert_owned_lock_at_allowed_path_rejected(
-        self, *, identity_integrity
+        self, *, identity_integrity, multiply_linked=False
     ):
         fixture = FakeBottleFixture()
         try:
@@ -1891,10 +1892,13 @@ class InstallerTests(unittest.TestCase):
             state_path = installer.state_path(fixture.installation)
             lock = Path(str(state.launcher_artifacts["lock_path"]))
             allowed_path = fixture.game_dir.resolve() / "dxil.dll"
+            second_link = fixture.bottle_root / "second-lock-inode-name"
             expected = lock.read_bytes()
 
             def unlink_with_allowed_survivor(*_args, **_kwargs):
                 os.link(lock, allowed_path)
+                if multiply_linked:
+                    os.link(lock, second_link)
                 lock.unlink()
 
             with patch.object(
@@ -1909,9 +1913,15 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(os.path.lexists(lock))
             survivor = allowed_path.lstat()
             self.assertTrue(stat.S_ISREG(survivor.st_mode))
-            self.assertEqual(1, survivor.st_nlink)
+            self.assertEqual(2 if multiply_linked else 1, survivor.st_nlink)
             self.assertEqual(0o600, stat.S_IMODE(survivor.st_mode))
             self.assertEqual(expected, allowed_path.read_bytes())
+            if multiply_linked:
+                linked = second_link.lstat()
+                self.assertEqual(
+                    (survivor.st_dev, survivor.st_ino),
+                    (linked.st_dev, linked.st_ino),
+                )
 
             journal = json.loads(journal_path.read_text(encoding="utf-8"))
             removal = active_record_snapshot(
@@ -1921,9 +1931,11 @@ class InstallerTests(unittest.TestCase):
             removal.update(
                 {
                     "path": str(allowed_path),
-                    "present": False,
-                    "type": "absent",
-                    "remove_sha256": digest(expected),
+                    "present": True,
+                    "type": "file",
+                    "content": base64.b64encode(expected).decode("ascii"),
+                    "sha256": digest(expected),
+                    "mode": 0o600,
                 }
             )
             final_snapshot = active_record_snapshot(
@@ -1943,23 +1955,23 @@ class InstallerTests(unittest.TestCase):
                     final_snapshot["device"],
                     final_snapshot["inode"],
                 )
-                recovered_state = json.loads(
-                    state_path.read_text(encoding="utf-8")
-                )
-                next(
-                    item
-                    for item in recovered_state["owned_files"]
-                    if item["path"] == str(allowed_path)
-                )["sha256"] = digest(expected)
-                state_path.write_text(
-                    json.dumps(
-                        recovered_state,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
+            recovered_state = json.loads(
+                state_path.read_text(encoding="utf-8")
+            )
+            next(
+                item
+                for item in recovered_state["owned_files"]
+                if item["path"] == str(allowed_path)
+            )["sha256"] = digest(expected)
+            state_path.write_text(
+                json.dumps(
+                    recovered_state,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             journal_path.write_text(
                 json.dumps(
                     journal,
@@ -1970,17 +1982,50 @@ class InstallerTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assert_recovery_rejected_before_mutation(
+            state_before = state_path.read_bytes()
+            protected_paths = [allowed_path]
+            if multiply_linked:
+                protected_paths.append(second_link)
+            protected_before = {
+                path: (
+                    stat.S_IFMT(path.lstat().st_mode),
+                    stat.S_IMODE(path.lstat().st_mode),
+                    path.lstat().st_dev,
+                    path.lstat().st_ino,
+                    path.lstat().st_nlink,
+                    path.read_bytes(),
+                )
+                for path in protected_paths
+            }
+
+            error = self.assert_recovery_rejected_before_mutation(
                 fixture, installer, profiles
             )
+            if identity_integrity == "rebound":
+                self.assertIn("Launcher lock alias appears in", error.detail)
             self.assertFalse(os.path.lexists(lock))
             self.assertTrue(state_path.is_file())
+            self.assertEqual(state_before, state_path.read_bytes())
             current = allowed_path.lstat()
             self.assertEqual(
                 (survivor.st_dev, survivor.st_ino),
                 (current.st_dev, current.st_ino),
             )
             self.assertEqual(expected, allowed_path.read_bytes())
+            self.assertEqual(
+                protected_before,
+                {
+                    path: (
+                        stat.S_IFMT(path.lstat().st_mode),
+                        stat.S_IMODE(path.lstat().st_mode),
+                        path.lstat().st_dev,
+                        path.lstat().st_ino,
+                        path.lstat().st_nlink,
+                        path.read_bytes(),
+                    )
+                    for path in protected_paths
+                },
+            )
         finally:
             fixture.cleanup()
 
@@ -2001,6 +2046,86 @@ class InstallerTests(unittest.TestCase):
         self._assert_owned_lock_at_allowed_path_rejected(
             identity_integrity="rebound"
         )
+
+    def test_restore_restart_rejects_multiply_linked_owned_lock_content(self):
+        """Every name for exact protected lock content survives failed recovery."""
+        self._assert_owned_lock_at_allowed_path_rejected(
+            identity_integrity="rebound",
+            multiply_linked=True,
+        )
+
+    def test_restore_restart_rejects_invalid_final_lock_identity_components(self):
+        """Only concrete bounded stat identities may authenticate final unlink."""
+        mutations = (
+            ("null_pair", "both", None),
+            ("null_device", "device", None),
+            ("null_inode", "inode", None),
+            ("bool_device", "device", True),
+            ("bool_inode", "inode", True),
+            ("negative_device", "device", -1),
+            ("negative_inode", "inode", -1),
+            ("string_device", "device", "1"),
+            ("string_inode", "inode", "1"),
+            ("overlarge_device", "device", 1 << 64),
+            ("overlarge_inode", "inode", 1 << 64),
+            ("zero_inode", "inode", 0),
+        )
+        for mutation_name, component, value in mutations:
+            with self.subTest(mutation=mutation_name):
+                fixture = FakeBottleFixture()
+                try:
+                    profiles = FakeRestoreProfiles()
+                    _launcher, installer = real_launcher_for_restore(
+                        fixture, profiles
+                    )
+                    state = installer.install(
+                        fixture.installation, fixture.payload
+                    )
+                    state_path = installer.state_path(fixture.installation)
+                    journal_path = installer.journal_path(fixture.installation)
+                    lock = Path(str(state.launcher_artifacts["lock_path"]))
+
+                    interrupt_restore_after_final_lock_unlink(
+                        installer, fixture.installation
+                    )
+
+                    journal = json.loads(
+                        journal_path.read_text(encoding="utf-8")
+                    )
+                    final_snapshot = active_record_snapshot(
+                        journal, "remove launcher recovery lock", lock
+                    )
+                    if component == "both":
+                        final_snapshot["device"] = value
+                        final_snapshot["inode"] = value
+                    else:
+                        final_snapshot[component] = value
+                    final_snapshot["identity_integrity"] = (
+                        lock_identity_integrity(
+                            state.launcher_artifacts["profile_owner_token"],
+                            state.launcher_artifacts["lock_sha256"],
+                            final_snapshot["device"],
+                            final_snapshot["inode"],
+                        )
+                    )
+                    journal_path.write_text(
+                        json.dumps(
+                            journal,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    state_before = state_path.read_bytes()
+
+                    self.assert_recovery_rejected_before_mutation(
+                        fixture, installer, profiles
+                    )
+                    self.assertEqual(state_before, state_path.read_bytes())
+                    self.assertFalse(os.path.lexists(lock))
+                finally:
+                    fixture.cleanup()
 
     def test_restore_restart_rejects_registry_semantic_and_topology_drift(self):
         """Authenticated state fixes the one exact registry rollback transition."""
