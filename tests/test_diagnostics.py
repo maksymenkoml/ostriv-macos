@@ -37,6 +37,26 @@ class DiagnosticsTests(unittest.TestCase):
         output.stage("Package", "OK")
         self.assertEqual("Ostriv for macOS\nPackage: OK\n", stream.getvalue())
 
+    def test_success_owns_one_blank_line_outcome_and_short_log_path(self):
+        stream = io.StringIO()
+        output = PlayerOutput(stream, color=False)
+        output.success(Path.home() / "Library/Logs/ostriv-macos/install.log")
+        self.assertEqual(
+            "\n"
+            "Ready. Quit and reopen CrossOver once, then open Ostriv (patched).\n"
+            "Log: ~/Library/Logs/ostriv-macos/install.log\n",
+            stream.getvalue(),
+        )
+
+    def test_failure_omits_log_line_when_path_is_not_supplied(self):
+        stream = io.StringIO()
+        output = PlayerOutput(stream, color=False)
+        output.failure("The download is incomplete. Download the release ZIP again.")
+        self.assertEqual(
+            "\nThe download is incomplete. Download the release ZIP again.\n",
+            stream.getvalue(),
+        )
+
     @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_command_runner_captures_stderr_and_decodes_replacement(self, run):
         run.return_value = subprocess.CompletedProcess(

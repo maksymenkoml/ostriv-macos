@@ -81,3 +81,24 @@ class PlayerOutput:
         self._stages.add(label)
         suffix = " · " + detail if detail else ""
         self._line("{}: {}{}".format(label, status, suffix))
+
+    @staticmethod
+    def _shorten(path: Path) -> str:
+        try:
+            relative = path.expanduser().relative_to(Path.home())
+        except ValueError:
+            return str(path)
+        return "~" if not relative.parts else "~/" + str(relative)
+
+    def success(self, log_path: Path) -> None:
+        self._line()
+        self._line(
+            "Ready. Quit and reopen CrossOver once, then open Ostriv (patched)."
+        )
+        self._line("Log: {}".format(self._shorten(log_path)))
+
+    def failure(self, message: str, log_path: Optional[Path] = None) -> None:
+        self._line()
+        self._line(message)
+        if log_path is not None:
+            self._line("Log: {}".format(self._shorten(log_path)))
