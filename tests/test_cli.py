@@ -1093,9 +1093,9 @@ class GlobalConstraintTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         runtime = [root / "patch.py", *sorted((root / "ostriv_macos").glob("*.py"))]
         allowed_imports = {
-            "argparse", "ast", "atexit", "base64", "bz2", "collections",
+            "argparse", "ast", "atexit", "base64", "bz2", "collections", "csv",
             "configparser", "copy", "ctypes", "dataclasses", "datetime", "errno",
-            "fcntl", "hashlib", "json", "logging", "os", "ostriv_macos", "pathlib",
+            "fcntl", "hashlib", "io", "json", "logging", "os", "ostriv_macos", "pathlib",
             "platform", "plistlib", "re", "secrets", "shlex", "shutil", "signal",
             "stat", "struct", "subprocess", "sys", "tempfile", "termios", "time",
             "traceback", "tty", "typing",
@@ -1121,7 +1121,7 @@ class GlobalConstraintTests(unittest.TestCase):
                 ):
                     literal_executables.add(Path(node.args[0].elts[0].value).name)
         self.assertEqual(set(), imported - allowed_imports)
-        self.assertEqual(set(), literal_executables - {"open", "osascript", "pgrep"})
+        self.assertEqual(set(), literal_executables - {"open", "osascript"})
 
     @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_runtime_command_boundaries_reject_network_and_unlisted_tools(self, run):

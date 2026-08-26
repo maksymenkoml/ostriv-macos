@@ -5,14 +5,15 @@ keep working after the release directory that supplied it has gone away.
 """
 
 import atexit
+import csv
 import ctypes
 import fcntl
 import hashlib
+import io
 import json
 import logging
 import os
 import plistlib
-import re
 import signal
 import stat
 import sys
@@ -44,6 +45,25 @@ class ProcessLock:
         self.path = Path(path)
         self.fd = None
 
+    def _validate_descriptor_path(self, descriptor: int) -> None:
+        opened = os.fstat(descriptor)
+        current = os.lstat(str(self.path))
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+        ):
+            raise OSError("launcher lock path changed after open")
+
+    def validate_current_path(self) -> None:
+        """Prove the held descriptor still names the current lock pathname."""
+        if self.fd is None:
+            raise OSError("launcher lock is not acquired")
+        self._validate_descriptor_path(self.fd)
+
     def acquire(self) -> bool:
         if self.fd is not None:
             return True
@@ -61,6 +81,7 @@ class ProcessLock:
             if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
                 raise OSError("launcher lock is not an owned regular file")
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._validate_descriptor_path(descriptor)
         except BlockingIOError:
             os.close(descriptor)
             return False
@@ -78,6 +99,7 @@ class ProcessLock:
 
 MAX_LOG_EVIDENCE_BYTES = 256 * 1024
 LOG_TOKEN_TAIL_BYTES = 64 * 1024
+_AMBIGUOUS_LOG_EVIDENCE = "<changed log generation outside bounded evidence>"
 
 
 @dataclass(frozen=True)
@@ -177,7 +199,12 @@ def read_new_log(path: Path, generation) -> str:
             and status.st_size == generation.size
             and _matches_generation_samples(path, generation)
         ):
-            return ""
+            current_mtime_ns = getattr(
+                status, "st_mtime_ns", int(status.st_mtime * 1_000_000_000)
+            )
+            if current_mtime_ns == generation.mtime_ns:
+                return ""
+            return _AMBIGUOUS_LOG_EVIDENCE
         append_only = (
             same_identity
             and status.st_size >= generation.size
@@ -190,6 +217,8 @@ def read_new_log(path: Path, generation) -> str:
 
 
 def classify_launch(text: str) -> str:
+    if text == _AMBIGUOUS_LOG_EVIDENCE:
+        return "ambiguous_log"
     if "SteamAPI_Init() failed" in text:
         return "steam_api"
     if "windows_createWindow FAILED" in text:
@@ -240,7 +269,7 @@ class ExternalCommandError(RuntimeError):
 class ExternalProcessRunner:
     """Run external commands without ever exposing their raw output to the player."""
 
-    ALLOWED_EXECUTABLES = frozenset({"open", "osascript", "pgrep", "wine"})
+    ALLOWED_EXECUTABLES = frozenset({"open", "osascript", "wine"})
     SENSITIVE_OPTIONS = frozenset(
         {"--api-key", "--password", "--secret", "--token", "/d"}
     )
@@ -467,6 +496,20 @@ class SteamController:
         self.runner.run(command, timeout=10.0)
         return True
 
+    @staticmethod
+    def _task_images(output) -> set:
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        images = set()
+        try:
+            rows = csv.reader(io.StringIO(str(output)[: MAX_LOG_EVIDENCE_BYTES]))
+            for row in rows:
+                if row:
+                    images.add(row[0].lstrip("\ufeff").strip().lower())
+        except csv.Error:
+            return set()
+        return images
+
     def probe(self) -> SteamSignals:
         if self._probe is not None:
             signals = self._probe()
@@ -474,17 +517,17 @@ class SteamController:
             if self.config is None or self.runner is None:
                 raise TypeError("SteamController requires a probe or config and runner")
 
-            scope = self.config.bottle_realpath or self.config.bottle_tag
-            escaped_scope = re.escape(scope)
-
-            def scoped_pattern(marker: str) -> str:
-                if not escaped_scope:
-                    return r"(?!)"
-                return r"({0}.*{1}|{1}.*{0})".format(marker, escaped_scope)
-
-            process = self.runner.run(
-                ["pgrep", "-f", scoped_pattern(r"steam\.exe")], timeout=5.0
-            ).returncode == 0
+            task_command = self._wine_command(
+                "--no-update",
+                "--no-lock",
+                "tasklist",
+                "/fo",
+                "csv",
+                "/nh",
+            )
+            tasks = self.runner.run(task_command, timeout=10.0)
+            images = self._task_images(tasks.stdout) if tasks.returncode == 0 else set()
+            process = "steam.exe" in images
             registry_command = self._wine_command(
                 "--no-update",
                 "--no-lock",
@@ -508,14 +551,7 @@ class SteamController:
                         active_user = int(parts[2], 16) != 0
                     except ValueError:
                         active_user = False
-            renderer = self.runner.run(
-                [
-                    "pgrep",
-                    "-f",
-                    scoped_pattern(r"steamwebhelper\.exe.*type=renderer"),
-                ],
-                timeout=5.0,
-            ).returncode == 0
+            renderer = "steamwebhelper.exe" in images
             signals = SteamSignals(process, active_user, renderer)
         self.logger.info(
             "steam probe process=%s active_user=%s renderer=%s ready=%s",
@@ -954,7 +990,10 @@ def run_launcher(
             final_state = classify_launch(read_new_log(game_log, generation))
             logger.info("launcher classification=%s attempt=2", final_state)
         returncode = getattr(result, "returncode", None)
-        if final_state in ("steam_api", "graphics_context") or returncode != 0:
+        if (
+            final_state in ("steam_api", "graphics_context", "ambiguous_log")
+            or returncode != 0
+        ):
             raise LauncherRuntimeError(
                 "game_failed",
                 "Game launch failed: classification={} returncode={}".format(

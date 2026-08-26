@@ -2788,6 +2788,7 @@ class Installer:
             installation, "restore.settings_path", "Restore failed."
         )
         transaction = self.transaction_for(installation)
+        recovering_incomplete = not transaction.journal.data.get("complete")
         state = self._load_state(installation, "restore")
         restore_lease = None
         prepare_restore = getattr(self.launcher, "prepare_restore", None)
@@ -2796,11 +2797,15 @@ class Installer:
                 installation, state, transaction
             )
             restore_lease = prepare_restore(
-                installation, state.launcher_artifacts
+                installation,
+                state.launcher_artifacts,
+                recover_profile=not recovering_incomplete,
             )
         try:
             transaction.recover_incomplete()
-            self._cleanup_completed_journal(transaction)
+            if recovering_incomplete and restore_lease is not None:
+                restore_lease.close()
+                restore_lease = None
             state = self._load_state(installation, "restore")
             if (
                 restore_lease is None
@@ -2810,6 +2815,7 @@ class Installer:
                 restore_lease = prepare_restore(
                     installation, state.launcher_artifacts
                 )
+            self._cleanup_completed_journal(transaction)
             launcher_undo = None
             legacy_launcher_undo = None
             if state is not None:

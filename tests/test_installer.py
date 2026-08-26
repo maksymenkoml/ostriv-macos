@@ -23,6 +23,7 @@ from ostriv_macos.installer import (
     WineRegistry,
 )
 from ostriv_macos.launcher import LauncherInstaller
+from ostriv_macos.launcher_runtime import ProcessLock
 from ostriv_macos.payload import PayloadEntry
 
 
@@ -1017,13 +1018,25 @@ class InstallerTests(unittest.TestCase):
             fixture.cleanup()
 
     def test_restore_restart_recovers_journaled_lock_unlink_before_reacquiring(self):
-        """A hard kill after owned-lock unlink must leave a restartable Restore journal."""
+        """Restarted Restore must hold the inode restored by journal recovery."""
         fixture = FakeBottleFixture()
         try:
             profiles = FakeRestoreProfiles()
             _launcher, installer = real_launcher_for_restore(fixture, profiles)
+            before = fixture.snapshot()
             state = installer.install(fixture.installation, fixture.payload)
             lock = Path(str(state.launcher_artifacts["lock_path"]))
+            marker = Path(str(state.launcher_artifacts["recovery_marker"]))
+            original_profile = "/Profiles/Player Custom.icc"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "owner": state.launcher_artifacts["profile_owner_token"],
+                        "original": original_profile,
+                    }
+                ),
+                encoding="utf-8",
+            )
             armed = [True]
 
             class HardKill(BaseException):
@@ -1065,11 +1078,35 @@ class InstallerTests(unittest.TestCase):
                 )
                 self.assertFalse(journal["complete"])
 
+            restart_transactions = []
+            contender_acquired = []
+
+            def restart_transaction_for(installation):
+                transaction = Transaction(
+                    InstallJournal(installer.journal_path(installation)),
+                    installer.undo_handlers(installation),
+                )
+                restart_transactions.append(transaction)
+                if len(restart_transactions) == 2:
+                    contender = ProcessLock(lock)
+                    try:
+                        contender_acquired.append(contender.acquire())
+                    finally:
+                        contender.close()
+                return transaction
+
+            with patch.object(
+                installer, "transaction_for", side_effect=restart_transaction_for
+            ):
                 installer.restore(fixture.installation)
 
+            self.assertEqual([False], contender_acquired)
+            self.assertEqual([original_profile], profiles.calls)
+            self.assertEqual(original_profile, profiles.current)
             self.assertFalse(lock.exists())
             self.assertFalse(installer.state_path(fixture.installation).exists())
             self.assertFalse(installer.journal_path(fixture.installation).exists())
+            self.assertEqual(before, fixture.snapshot())
         finally:
             fixture.cleanup()
 

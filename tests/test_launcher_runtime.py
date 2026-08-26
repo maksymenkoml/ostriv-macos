@@ -54,10 +54,15 @@ class ProbeRunner:
     def run(self, argv, timeout=None):
         argv = list(argv)
         self.calls.append((argv, timeout))
-        if argv[:2] == ["pgrep", "-f"] and "steamwebhelper" not in argv[-1]:
-            return FakeResult(0 if self.process else 1)
-        if argv[:2] == ["pgrep", "-f"]:
-            return FakeResult(0 if self.renderer else 1)
+        if "tasklist" in argv:
+            rows = []
+            if self.process:
+                rows.append('"steam.exe","417","Console","1","12,000 K"')
+            if self.renderer:
+                rows.append(
+                    '"steamwebhelper.exe","418","Console","1","24,000 K"'
+                )
+            return FakeResult(0, "\n".join(rows))
         return FakeResult(0, self.registry)
 
 
@@ -447,29 +452,129 @@ class SteamControllerTests(unittest.TestCase):
             self.assertFalse(controller._open_configured_steam())
             self.assertEqual([], calls)
 
-    def test_process_and_renderer_probes_include_selected_canonical_bottle_scope(self):
-        """Global Steam processes cannot satisfy a different selected bottle."""
+    def test_selected_bottle_task_query_reports_its_process_and_renderer(self):
+        """Selected tasks remain detectable when their argv has BottleID but no root."""
         config = make_config("/private/tmp/selected")
-        object.__setattr__(config, "bottle_realpath", "/Bottles/selected-id")
+        expected_task = [
+            "/Applications/CrossOver.app/wine",
+            "--bottle",
+            "Ostriv",
+            "--scope",
+            "managed",
+            "--no-update",
+            "--no-lock",
+            "tasklist",
+            "/fo",
+            "csv",
+            "/nh",
+        ]
+        expected_registry = [
+            "/Applications/CrossOver.app/wine",
+            "--bottle",
+            "Ostriv",
+            "--scope",
+            "managed",
+            "--no-update",
+            "--no-lock",
+            "reg",
+            "query",
+            r"HKCU\Software\Valve\Steam\ActiveProcess",
+        ]
         calls = []
 
-        class ScopedRunner:
+        class RepresentativeRunner:
             def run(self, argv, timeout=None):
                 argv = list(argv)
                 calls.append(argv)
+                if argv == expected_task:
+                    return FakeResult(
+                        0,
+                        '"steam.exe","417","Console","1","12,000 K"\n'
+                        '"steamwebhelper.exe","418","Console","1","24,000 K"\n',
+                    )
+                if argv == expected_registry:
+                    return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
                 if argv[:2] == ["pgrep", "-f"]:
-                    matched_selected = re.escape(config.bottle_realpath) in argv[-1]
-                    return FakeResult(1 if matched_selected else 0)
-                return FakeResult(0, b"ActiveUser    REG_DWORD    0x1\n")
+                    representative = (
+                        "/CrossOver-selected-id/steamwebhelper.exe --type=renderer"
+                        if "steamwebhelper" in argv[-1]
+                        else "/CrossOver-selected-id/steam.exe"
+                    )
+                    return FakeResult(0 if re.search(argv[-1], representative) else 1)
+                raise AssertionError(argv)
 
-        signals = SteamController(config=config, runner=ScopedRunner()).probe()
+        signals = SteamController(config=config, runner=RepresentativeRunner()).probe()
 
-        self.assertEqual(SteamSignals(False, True, False), signals)
-        pgrep_patterns = [argv[-1] for argv in calls if argv[:2] == ["pgrep", "-f"]]
-        self.assertEqual(2, len(pgrep_patterns))
-        self.assertTrue(
-            all(re.escape(config.bottle_realpath) in pattern for pattern in pgrep_patterns)
+        self.assertEqual(SteamSignals(True, True, True), signals)
+        self.assertEqual([expected_task, expected_registry], calls)
+
+    def test_other_and_same_named_bottle_tasks_cannot_satisfy_selected_readiness(self):
+        """Only the owning CrossOver and resolved bottle command may supply tasks."""
+        cases = (
+            (
+                "other bottle",
+                "/Applications/CrossOver.app/wine",
+                "Another Bottle",
+            ),
+            (
+                "same name in other CrossOver",
+                "/Applications/Other CrossOver.app/wine",
+                "Ostriv",
+            ),
         )
+        for label, other_wine, other_bottle in cases:
+            with self.subTest(label=label):
+                config = make_config("/private/tmp/selected")
+                selected_task = [
+                    config.wine,
+                    "--bottle",
+                    config.bottle_argument,
+                    "--scope",
+                    "managed",
+                    "--no-update",
+                    "--no-lock",
+                    "tasklist",
+                    "/fo",
+                    "csv",
+                    "/nh",
+                ]
+                other_task = [
+                    other_wine,
+                    "--bottle",
+                    other_bottle,
+                    "--scope",
+                    "managed",
+                    "--no-update",
+                    "--no-lock",
+                    "tasklist",
+                    "/fo",
+                    "csv",
+                    "/nh",
+                ]
+                calls = []
+
+                class OtherBottleRunner:
+                    def run(self, argv, timeout=None):
+                        argv = list(argv)
+                        calls.append(argv)
+                        if argv == selected_task:
+                            return FakeResult(0, "")
+                        if argv == other_task:
+                            return FakeResult(
+                                0,
+                                '"steam.exe","517","Console","1","12,000 K"\n'
+                                '"steamwebhelper.exe","518","Console","1","24,000 K"\n',
+                            )
+                        if argv[:2] == ["pgrep", "-f"]:
+                            return FakeResult(0)
+                        return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
+
+                signals = SteamController(
+                    config=config, runner=OtherBottleRunner()
+                ).probe()
+
+                self.assertEqual(SteamSignals(False, True, False), signals)
+                self.assertNotIn(other_task, calls)
 
 
 class ExternalProcessRunnerTests(unittest.TestCase):
@@ -519,6 +624,28 @@ class ProcessLockTests(unittest.TestCase):
             self.assertTrue(alias.is_symlink())
             self.assertFalse(target.exists())
 
+    def test_lock_rejects_path_replaced_after_open_without_deleting_replacement(self):
+        """A held descriptor must still name the current single-link lock inode."""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "launcher.lock"
+            path.write_bytes(b"owned\n")
+            lock = ProcessLock(path)
+
+            def substitute_after_lock(_descriptor, _operation):
+                path.unlink()
+                path.write_bytes(b"unowned replacement\n")
+
+            try:
+                with patch.object(
+                    runtime.fcntl, "flock", side_effect=substitute_after_lock
+                ):
+                    with self.assertRaisesRegex(OSError, "lock path changed"):
+                        lock.acquire()
+            finally:
+                lock.close()
+
+            self.assertEqual(b"unowned replacement\n", path.read_bytes())
+
     def test_second_launcher_is_rejected_until_first_lock_closes(self):
         """Allowing two holders would let double-click launches race profile and game state."""
         with TemporaryDirectory() as directory:
@@ -565,7 +692,10 @@ class ProcessLockTests(unittest.TestCase):
     def test_repeat_acquire_is_idempotent_without_opening_another_descriptor(self):
         """A repeat acquire must not overwrite and leak the held lock descriptor."""
         with TemporaryDirectory() as directory:
-            lock = ProcessLock(Path(directory) / "launcher.lock")
+            path = Path(directory) / "launcher.lock"
+            path.write_bytes(b"")
+            status = path.stat()
+            lock = ProcessLock(path)
             opened = []
             flocked = []
             closed = []
@@ -584,7 +714,7 @@ class ProcessLockTests(unittest.TestCase):
             with patch.object(runtime.os, "open", side_effect=open_once), patch.object(
                 runtime.os,
                 "fstat",
-                return_value=type("Status", (), {"st_mode": 0o100600, "st_nlink": 1})(),
+                return_value=status,
             ), patch.object(
                 runtime.fcntl, "flock", side_effect=flock_once
             ), patch.object(runtime.os, "close", side_effect=closed.append):
@@ -764,6 +894,29 @@ class FakeGameRunner:
         with self.log_path.open("ab") as stream:
             stream.write(addition)
         return FakeResult(self.returncodes.pop(0))
+
+
+class MiddleOverwriteRunner:
+    """Represent Ostriv overwriting only an unsampled part of a large run log."""
+
+    def __init__(self, events, log_path):
+        self.events = events
+        self.log_path = Path(log_path)
+        self.calls = 0
+
+    def run(self, argv, timeout=None):
+        self.calls += 1
+        self.events.append(("launch", self.calls, list(argv)))
+        before = self.log_path.stat()
+        with self.log_path.open("r+b") as stream:
+            stream.seek(runtime.LOG_TOKEN_TAIL_BYTES * 2)
+            stream.write(b"SteamAPI_Init() failed")
+            stream.flush()
+        os.utime(
+            self.log_path,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+        )
+        return FakeResult(0)
 
 
 class FakeLogger:
@@ -1005,6 +1158,36 @@ class LauncherOrchestrationTests(unittest.TestCase):
                 self.assertEqual(1, events.count("restore"))
                 self.assertEqual("unlock", events[-1])
 
+    def test_large_middle_only_overwrite_is_typed_terminal_and_cleans_up(self):
+        """Changed metadata without sampled evidence must never become launch success."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            Path(config.game_log).write_bytes(
+                b"h" * runtime.LOG_TOKEN_TAIL_BYTES
+                + b"m" * (runtime.LOG_TOKEN_TAIL_BYTES * 2)
+                + b"t" * runtime.LOG_TOKEN_TAIL_BYTES
+            )
+            events = []
+            runner = MiddleOverwriteRunner(events, config.game_log)
+
+            with self.assertRaises(LauncherRuntimeError) as caught:
+                run_launcher(
+                    config,
+                    lock=FakeLock(events),
+                    log_factory=lambda _path: FakeLogger(events),
+                    runner=runner,
+                    steam=FakeSteam(events),
+                    profile=FakeProfile(events),
+                    dialog=lambda _message: self.fail("main owns failure dialogs"),
+                    install_handlers=lambda _profile: None,
+                )
+
+            self.assertEqual("game_failed", caught.exception.message_key)
+            self.assertLessEqual(len(caught.exception.detail), 256)
+            self.assertEqual(1, runner.calls)
+            self.assertEqual(1, events.count("restore"))
+            self.assertEqual("unlock", events[-1])
+
     def test_first_steam_marker_is_classified_before_nonzero_result_and_retries_once(self):
         """Only attempt one's fresh Steam marker may override nonzero into one retry."""
         with TemporaryDirectory() as directory:
@@ -1087,6 +1270,55 @@ class LauncherOrchestrationTests(unittest.TestCase):
 
 
 class LauncherMainTests(unittest.TestCase):
+    def test_main_maps_ambiguous_large_log_generation_to_one_game_action(self):
+        """A bounded-but-changed game log must fail silently except for one action."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            action = "Ostriv could not start. Quit and reopen CrossOver, then try again."
+            config.messages["game_failed"] = action
+            Path(config.game_log).write_bytes(
+                b"h" * runtime.LOG_TOKEN_TAIL_BYTES
+                + b"m" * (runtime.LOG_TOKEN_TAIL_BYTES * 2)
+                + b"t" * runtime.LOG_TOKEN_TAIL_BYTES
+            )
+            config_path = Path(directory) / "launcher.json"
+            write_config(config, config_path)
+            events = []
+            dialogs = []
+            runner = MiddleOverwriteRunner(events, config.game_log)
+
+            with patch.object(
+                runtime, "ProcessLock", side_effect=lambda _path: FakeLock(events)
+            ), patch.object(
+                runtime, "ExternalProcessRunner", return_value=runner
+            ), patch.object(
+                runtime, "ColorSyncProfileBackend", return_value=object()
+            ), patch.object(
+                runtime,
+                "ProfileGuard",
+                side_effect=lambda *_args: FakeProfile(events),
+            ), patch.object(
+                runtime,
+                "SteamController",
+                side_effect=lambda **_kwargs: FakeSteam(events),
+            ), patch.object(
+                runtime, "install_signal_handlers", side_effect=lambda _profile: None
+            ), patch.object(
+                runtime, "_display_dialog", side_effect=dialogs.append
+            ):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = main([str(config_path)])
+
+            self.assertEqual(1, code)
+            self.assertEqual([action], dialogs)
+            self.assertEqual("", stdout.getvalue())
+            self.assertEqual("", stderr.getvalue())
+            self.assertEqual(1, runner.calls)
+            self.assertEqual(1, events.count("restore"))
+            self.assertEqual("unlock", events[-1])
+
     def test_expected_command_timeout_log_is_bounded_redacted_and_dialog_stays_exact(self):
         with TemporaryDirectory() as directory:
             config = make_config(directory)

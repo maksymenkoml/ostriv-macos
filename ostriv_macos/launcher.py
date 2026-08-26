@@ -967,8 +967,10 @@ class LauncherInstaller:
         self,
         installation: GameInstallation,
         state: Mapping[str, object],
+        *,
+        recover_profile: bool = True,
     ):
-        """Acquire the launcher lock and consume a validated owned profile marker."""
+        """Acquire the launcher lock and optionally recover an owned profile marker."""
         lock = None
         try:
             self._validate_state_paths(
@@ -1006,7 +1008,10 @@ class LauncherInstaller:
             if not lock.acquire():
                 raise ValueError("launcher is active for the selected bottle")
             validate_owned_leaves()
-            if _lexists(marker):
+            validate_current_path = getattr(lock, "validate_current_path", None)
+            if callable(validate_current_path):
+                validate_current_path()
+            if recover_profile and _lexists(marker):
                 from .launcher_runtime import (
                     ColorSyncProfileBackend,
                     ProfileGuard,
