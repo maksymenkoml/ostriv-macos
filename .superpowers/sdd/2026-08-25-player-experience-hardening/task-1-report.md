@@ -54,3 +54,60 @@ The implementation is standard-library-only and stays within the requested reusa
 ## Concerns
 
 No concerns for Task 1. Final success/failure composition remains intentionally deferred to Task 9.
+
+## Fix Round 1
+
+### Covering test
+
+`DiagnosticsTests.test_logger_does_not_propagate_technical_detail_to_root` installs a root console handler, logs technical detail through the configured logger, and asserts the root/player stream remains empty.
+
+### RED
+
+Command:
+
+```text
+python3 -m unittest tests.test_diagnostics.DiagnosticsTests.test_logger_does_not_propagate_technical_detail_to_root -v
+```
+
+Relevant output:
+
+```text
+test_logger_does_not_propagate_technical_detail_to_root (tests.test_diagnostics.DiagnosticsTests.test_logger_does_not_propagate_technical_detail_to_root) ... FAIL
+AssertionError: '' != 'payload.invalid: Git LFS pointer\n'
+Ran 1 test in 0.002s
+FAILED (failures=1)
+```
+
+### GREEN and full suite
+
+Changed `ostriv_macos/diagnostics.py` to set `logger.propagate = False` and close replaced handlers before installing a new file handler. Changed `tests/test_diagnostics.py` with the propagation regression test.
+
+Focused command:
+
+```text
+python3 -m unittest tests.test_diagnostics -v
+```
+
+Exact result:
+
+```text
+Ran 6 tests in 0.003s
+OK
+```
+
+Full-suite command:
+
+```text
+python3 -m unittest discover -v
+```
+
+Exact result:
+
+```text
+Ran 6 tests in 0.007s
+OK
+```
+
+### Commit and self-review
+
+Committed as `fix: isolate diagnostics logger from root output` (SHA recorded after commit). The test covers the reported propagation break; technical detail remains in the file log only, and handler cleanup avoids stale descriptors and resource warnings. `git diff --check` passed.

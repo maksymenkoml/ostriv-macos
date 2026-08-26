@@ -47,8 +47,11 @@ class CommandRunner:
 def configure_logger(path: Path) -> logging.Logger:
     path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("ostriv_macos")
-    logger.handlers.clear()
+    for old_handler in logger.handlers[:]:
+        logger.removeHandler(old_handler)
+        old_handler.close()
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
     handler = logging.FileHandler(
         str(path), encoding="utf-8", errors="backslashreplace"
     )

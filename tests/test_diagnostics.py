@@ -1,4 +1,5 @@
 import io
+import logging
 import subprocess
 import tempfile
 import unittest
@@ -61,6 +62,19 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertEqual("Payload: FAILED · Download the release ZIP again.\n", stream.getvalue())
             self.assertIn("Git LFS pointer", log_path.read_text(encoding="utf-8"))
             self.assertNotIn("Git LFS", stream.getvalue())
+
+    def test_logger_does_not_propagate_technical_detail_to_root(self):
+        root = logging.getLogger()
+        root_stream = io.StringIO()
+        root_handler = logging.StreamHandler(root_stream)
+        root.addHandler(root_handler)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                logger = configure_logger(Path(directory) / "diagnostics.log")
+                logger.error("payload.invalid: Git LFS pointer")
+            self.assertEqual("", root_stream.getvalue())
+        finally:
+            root.removeHandler(root_handler)
 
 
 if __name__ == "__main__":
