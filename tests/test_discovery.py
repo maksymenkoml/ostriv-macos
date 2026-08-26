@@ -278,6 +278,23 @@ class DiscoveryTests(unittest.TestCase):
             resolve_explicit_game(game, [self.crossover()])
         self.assertEqual("discovery.explicit_not_in_bottle", raised.exception.code)
 
+    def test_explicit_writable_directory_inside_bottle_is_not_an_ostriv_installation(self):
+        bottle = make_bottle(self.home / "Volumes/T7/GAMES/Bottles", "External")
+        arbitrary = bottle / "drive_c/users/crossover/Documents"
+        arbitrary.mkdir(parents=True)
+        with self.assertRaises(PatchError) as raised:
+            resolve_explicit_game(arbitrary, [self.crossover()])
+        self.assertEqual("discovery.explicit_not_ostriv", raised.exception.code)
+
+    def test_explicit_ostriv_named_file_outside_drive_c_is_rejected(self):
+        bottle = make_bottle(self.home / "Volumes/T7/GAMES/Bottles", "External")
+        arbitrary = bottle / "metadata"
+        arbitrary.mkdir()
+        (arbitrary / "ostriv.exe").write_bytes(b"MZ")
+        with self.assertRaises(PatchError) as raised:
+            resolve_explicit_game(arbitrary, [self.crossover()])
+        self.assertEqual("discovery.explicit_not_ostriv", raised.exception.code)
+
 
 if __name__ == "__main__":
     unittest.main()

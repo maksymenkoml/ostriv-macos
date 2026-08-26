@@ -1165,6 +1165,26 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_preflight_rejects_arbitrary_in_bottle_directory_without_mutation(self):
+        fixture = FakeBottleFixture()
+        try:
+            arbitrary = fixture.bottle_root / "drive_c/users/crossover/Documents"
+            arbitrary.mkdir(parents=True)
+            installation = GameInstallation(
+                fixture.bottle, arbitrary, fixture.installation.version
+            )
+            before = fixture.snapshot()
+            installer = fixture.installer()
+            with self.assertRaises(PatchError) as caught:
+                installer.install(installation, fixture.payload)
+            self.assertEqual("install.preflight", caught.exception.code)
+            self.assertIn("ostriv.exe", caught.exception.detail)
+            self.assertEqual([], installer.transactions)
+            self.assertEqual(before, fixture.snapshot())
+            self.assertFalse((fixture.bottle_root / ".ostriv-macos-journal.json").exists())
+        finally:
+            fixture.cleanup()
+
     def test_missing_required_payload_inventory_fails_before_transaction(self):
         for missing in ("prebuilt/dxil.dll", "assets/settings.data"):
             with self.subTest(missing=missing):

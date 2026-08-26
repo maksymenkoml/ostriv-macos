@@ -97,6 +97,11 @@ class PlayerOutput:
         )
         self._line("Log: {}".format(self._shorten(log_path)))
 
+    def restored(self, log_path: Path) -> None:
+        self._line()
+        self._line("Restored. Open Ostriv normally in CrossOver.")
+        self._line("Log: {}".format(self._shorten(log_path)))
+
     def failure(self, message: str, log_path: Optional[Path] = None) -> None:
         self._line()
         self._line(message)

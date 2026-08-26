@@ -57,8 +57,17 @@ class DiagnosticSummary:
     log_paths: Tuple[Path, ...]
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise PatchError(
+            "cli.arguments",
+            "The options were not recognized.",
+            message,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(add_help=True)
+    parser = _ArgumentParser(add_help=True)
     parser.add_argument("game_path", nargs="?")
     parser.add_argument("--diagnose", action="store_true")
     parser.add_argument("--preflight", action="store_true", help=argparse.SUPPRESS)
@@ -148,6 +157,7 @@ def _diagnostic_launcher(game, home: Path) -> str:
 def diagnose(context: DiagnosticContext) -> DiagnosticSummary:
     """Read direct package and CrossOver state without starting any process."""
     from .discovery import (
+        CrossOverInstall,
         configured_bottle_roots,
         discover_bottles,
         discover_games,
@@ -171,9 +181,18 @@ def diagnose(context: DiagnosticContext) -> DiagnosticSummary:
         crossover = "not found"
 
     roots = tuple(configured_bottle_roots(home, context.env))
+    bottle_sources = list(crossovers)
+    if not bottle_sources:
+        bottle_sources.append(
+            CrossOverInstall(
+                context.system_app,
+                context.system_app / "Contents/SharedSupport/CrossOver",
+                None,
+            )
+        )
     bottles = []
     seen_bottles = set()
-    for item in crossovers:
+    for item in bottle_sources:
         for bottle in discover_bottles(item, home, context.env):
             if bottle.root not in seen_bottles:
                 seen_bottles.add(bottle.root)
@@ -334,6 +353,33 @@ def _game_label(installation) -> str:
     )
 
 
+def _player_action(error: PatchError) -> str:
+    code = error.code
+    if code == "cli.arguments":
+        return "The options were not recognized. Run patch.py --help and try again."
+    if code.startswith("payload.") or code == "install.payload_inventory":
+        return "The download is incomplete. Download the release ZIP again."
+    if code in ("install.journal_corrupt", "install.rollback_failed"):
+        return error.player_message
+    if code == "install.recovery_required":
+        return "A previous installation needs recovery. Run Restore, then try again."
+    if code == "discovery.no_crossover":
+        return "CrossOver could not be found. Install CrossOver, then try again."
+    if code == "discovery.no_game":
+        return error.player_message
+    if code.startswith("discovery."):
+        return "The selected folder is not a supported Ostriv installation. Choose the Ostriv folder in CrossOver, then try again."
+    if code == "install.preflight":
+        return "Installation cannot start. Check CrossOver and the selected Ostriv folder, then try again."
+    if code.endswith(".state_corrupt"):
+        return "The installation record is unreadable. Reinstall Ostriv in this bottle, then try again."
+    if code.startswith("restore."):
+        return "Restore failed. Run Restore once more."
+    if code.startswith("install."):
+        return "Installation failed. Try Reinstall once."
+    return "The operation failed. Try again."
+
+
 def select(
     prompt: str,
     options: Sequence[str],
@@ -458,10 +504,14 @@ def run_interactive(
         else:
             services.install(installation, payload)
     except Exception:
-        output.stage("Installation", "FAILED")
+        output.stage("Restoration" if restore else "Installation", "FAILED")
         raise
-    output.stage("Installation", "OK")
-    output.success(log_path)
+    if restore:
+        output.stage("Restoration", "OK")
+        output.restored(log_path)
+    else:
+        output.stage("Installation", "OK")
+        output.success(log_path)
     return 0
 
 
@@ -471,7 +521,17 @@ def main(
     stdin: IO[str] = sys.stdin,
     stdout: IO[str] = sys.stdout,
 ) -> int:
-    args = build_parser().parse_args(argv)
+    output = PlayerOutput(stdout)
+    try:
+        args = build_parser().parse_args(argv)
+    except KeyboardInterrupt:
+        output.title()
+        output.failure("Cancelled.")
+        return 130
+    except PatchError as error:
+        output.title()
+        output.failure(_player_action(error))
+        return 2
     package_root = Path(__file__).resolve().parent.parent
     log_path = Path.home() / "Library/Logs/ostriv-macos/install.log"
 
@@ -485,11 +545,12 @@ def main(
         except PatchError as error:
             logger.error("%s: %s", error.code, error.detail or error.player_message)
             return 2
+        except KeyboardInterrupt:
+            return 130
         except Exception:
             logger.exception("unexpected preflight failure")
             return 3
 
-    output = PlayerOutput(stdout)
     output.title()
     if args.diagnose:
         _null_logger()
@@ -503,11 +564,24 @@ def main(
                     ),
                     output,
                 )
+        except KeyboardInterrupt:
+            output.failure("Diagnosis cancelled.")
+            return 130
         except Exception:
             output._line("Diagnosis: some state could not be read.")
         return 0
 
-    logger = _null_logger() if services is not None else configure_logger(log_path)
+    try:
+        logger = _null_logger() if services is not None else configure_logger(log_path)
+    except KeyboardInterrupt:
+        output.failure("Cancelled.")
+        return 130
+    except Exception:
+        logger = _null_logger()
+        output.failure(
+            "The installer could not start. Check permissions for ~/Library/Logs, then try again."
+        )
+        return 3
     try:
         active = services or build_services(package_root, logger, stdin, output)
         return run_interactive(
@@ -518,7 +592,7 @@ def main(
         return 130
     except PatchError as error:
         logger.error("%s: %s", error.code, error.detail or error.player_message)
-        output.failure(error.player_message, log_path)
+        output.failure(_player_action(error), log_path)
         return 2
     except Exception:
         logger.exception("unexpected installer failure")

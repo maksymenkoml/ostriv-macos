@@ -21,7 +21,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from . import __version__
 from .diagnostics import CommandRunner, PatchError
-from .discovery import Bottle, GameInstallation
+from .discovery import Bottle, GameInstallation, is_supported_game_directory
 from .payload import PayloadEntry, validate_payload
 
 
@@ -1067,6 +1067,11 @@ class Installer:
             config,
             settings,
         ]
+        if not is_supported_game_directory(game_dir, bottle_root):
+            issues.append(
+                "Selected game directory is not a supported Ostriv installation: "
+                "{} (ostriv.exe must be inside drive_c)".format(game_dir)
+            )
         for destination in mutable_destinations:
             if destination.is_symlink():
                 issues.append(

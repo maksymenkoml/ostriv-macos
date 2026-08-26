@@ -292,6 +292,22 @@ def discover_games(bottles: Iterable[Bottle]) -> List[GameInstallation]:
     return games
 
 
+def is_supported_game_directory(game_dir: Path, bottle_root: Path) -> bool:
+    """Return whether *game_dir* is a canonical Ostriv directory in drive_c."""
+    try:
+        candidate = game_dir.resolve()
+        drive_c = (bottle_root / "drive_c").resolve()
+        executable = candidate / "ostriv.exe"
+        return (
+            candidate.is_dir()
+            and drive_c in candidate.parents
+            and executable.is_file()
+            and not executable.is_symlink()
+        )
+    except OSError:
+        return False
+
+
 def resolve_explicit_game(
     game_dir: Path, crossovers: Sequence[CrossOverInstall]
 ) -> GameInstallation:
@@ -302,6 +318,12 @@ def resolve_explicit_game(
     current = candidate
     while current != current.parent:
         if _valid_bottle(current):
+            if not is_supported_game_directory(candidate, current):
+                raise PatchError(
+                    "discovery.explicit_not_ostriv",
+                    "The selected folder is not a supported Ostriv installation.",
+                    str(game_dir),
+                )
             if not crossovers:
                 raise PatchError(
                     "discovery.no_crossover",
