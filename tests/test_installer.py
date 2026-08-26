@@ -287,6 +287,123 @@ class FakeBottleFixture:
 
 
 class InstallerTests(unittest.TestCase):
+    def test_hard_termination_after_staging_fsync_recovers_the_owned_stage(self):
+        fixture = FakeBottleFixture()
+        try:
+            destination = (fixture.game_dir / "opengl32.dll.bak").resolve()
+            genuine = (fixture.game_dir / "opengl32.dll").read_bytes()
+            installer = fixture.installer()
+            installer.preflight(fixture.installation, fixture.payload)
+            installer._start_ownership()
+
+            class TerminateBeforeApplied(Transaction):
+                def step(inner_self, name, undo, action):
+                    index = inner_self.journal.begin(name, undo)
+                    inner_self._active_step = index
+                    try:
+                        action()
+                    finally:
+                        inner_self._active_step = None
+                    if (
+                        undo.kind == "remove_staging"
+                        and undo.data.get("destination") == str(destination)
+                    ):
+                        raise SystemExit("simulated hard termination after staging fsync")
+                    inner_self.journal.mark_applied(index)
+
+            interrupted = TerminateBeforeApplied(
+                InstallJournal(installer.journal_path(fixture.installation)),
+                installer.undo_handlers(fixture.installation),
+            )
+            interrupted.start("install")
+            with self.assertRaisesRegex(SystemExit, "after staging fsync"):
+                installer.stage_driver_files(
+                    interrupted, fixture.installation, fixture.payload
+                )
+
+            persisted = json.loads(
+                installer.journal_path(fixture.installation).read_text(
+                    encoding="utf-8"
+                )
+            )
+            cleanup = next(
+                item
+                for item in persisted["records"]
+                if item["undo"]["kind"] == "remove_staging"
+            )
+            staging = Path(cleanup["undo"]["data"]["path"])
+            staging_directory = Path(
+                cleanup["undo"]["data"].get("directory", staging.parent)
+            )
+            self.assertTrue(staging.is_file())
+
+            fixture.installer().transaction_for(
+                fixture.installation
+            ).recover_incomplete()
+
+            self.assertFalse(staging.exists())
+            self.assertFalse(staging_directory.exists())
+            self.assertEqual(
+                genuine, (fixture.game_dir / "opengl32.dll").read_bytes()
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_staging_cleanup_preserves_directory_substituted_at_atomic_handoff(self):
+        fixture = FakeBottleFixture()
+        try:
+            destination = (fixture.game_dir / "opengl32.dll.bak").resolve()
+            genuine = (fixture.game_dir / "opengl32.dll").read_bytes()
+            unknown = b"unknown replacement at the cleanup boundary"
+            installer = fixture.installer()
+            installer.preflight(fixture.installation, fixture.payload)
+            installer._start_ownership()
+            transaction = installer.transaction_for(fixture.installation)
+            transaction.start("install")
+            staging = installer._prepare_copy_staging(
+                transaction, fixture.installation, destination
+            )
+
+            real_rename_exclusive = getattr(
+                installer_module, "_rename_exclusive", None
+            )
+            substituted = []
+
+            def substitute_at_handoff(source, destination_path):
+                if Path(source) == staging.directory and not substituted:
+                    staging.path.unlink()
+                    staging.directory.rmdir()
+                    staging.directory.mkdir(mode=0o700)
+                    replacement = staging.directory / "unknown-user-file"
+                    replacement.write_bytes(unknown)
+                    substituted.append(replacement)
+                if real_rename_exclusive is None:
+                    raise AssertionError("atomic staging handoff was not implemented")
+                return real_rename_exclusive(source, destination_path)
+
+            with patch.object(
+                installer_module,
+                "_rename_exclusive",
+                side_effect=substitute_at_handoff,
+                create=True,
+            ):
+                fixture.installer().transaction_for(
+                    fixture.installation
+                ).recover_incomplete()
+
+            self.assertEqual(1, len(substituted))
+            preserved = [
+                path
+                for path in fixture.root.rglob("*")
+                if path.is_file() and path.read_bytes() == unknown
+            ]
+            self.assertEqual(1, len(preserved))
+            self.assertEqual(
+                genuine, (fixture.game_dir / "opengl32.dll").read_bytes()
+            )
+        finally:
+            fixture.cleanup()
+
     def test_incomplete_copy_journal_removes_owned_staging_file(self):
         fixture = FakeBottleFixture()
         try:
@@ -312,7 +429,11 @@ class InstallerTests(unittest.TestCase):
                     self.assertEqual(1, len(cleanup_records))
                     cleanup_data = cleanup_records[0]["undo"]["data"]
                     staging = Path(cleanup_data["path"])
-                    self.assertEqual(destination.parent, staging.parent)
+                    staging_directory = Path(
+                        cleanup_data.get("directory", staging.parent)
+                    )
+                    self.assertEqual(destination.parent, staging_directory.parent)
+                    self.assertEqual(staging_directory, staging.parent)
                     staging_status = staging.lstat()
                     self.assertEqual(staging_status.st_dev, cleanup_data["device"])
                     self.assertEqual(staging_status.st_ino, cleanup_data["inode"])
@@ -418,7 +539,12 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(1, len(substituted))
             self.assertEqual(victim_original, victim.read_bytes())
             self.assertEqual(genuine, destination.read_bytes())
-            self.assertTrue(substituted[0].is_symlink())
+            preserved_symlinks = [
+                path
+                for path in fixture.root.rglob("*")
+                if path.is_symlink() and path.resolve() == victim.resolve()
+            ]
+            self.assertEqual(1, len(preserved_symlinks))
             self.assertEqual(
                 [],
                 [
@@ -457,6 +583,7 @@ class InstallerTests(unittest.TestCase):
                     records[cleanup_indexes[0]]["undo"]["data"]["path"]
                 )
                 self.assertFalse(staging.exists())
+                self.assertFalse(staging.parent.exists())
         finally:
             fixture.cleanup()
 
@@ -467,18 +594,17 @@ class InstallerTests(unittest.TestCase):
 
             real_replace = os.replace
 
-            def fail_before_driver_replace(source, destination):
+            def fail_before_driver_replace(source, destination, *args, **kwargs):
                 if (
-                    Path(destination).resolve()
-                    == (fixture.game_dir / "opengl32.dll").resolve()
-                    and Path(source).name.startswith(".opengl32.dll.")
+                    Path(destination).name == "opengl32.dll"
+                    and Path(source).name == "payload"
                 ):
                     self.assertEqual(
                         b"genuine opengl",
                         (fixture.game_dir / "opengl32.dll").read_bytes(),
                     )
                     raise OSError("injected staging copy failure")
-                return real_replace(source, destination)
+                return real_replace(source, destination, *args, **kwargs)
 
             with patch.object(
                 installer_module.os,

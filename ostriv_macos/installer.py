@@ -2,6 +2,7 @@
 
 import copy
 import base64
+import ctypes
 import errno
 import hashlib
 import json
@@ -165,6 +166,14 @@ class InstallJournal:
         candidate["records"][index]["status"] = "applied"
         self._save(candidate)
 
+    def checkpoint_undo(self, index: int, undo: UndoRecord) -> None:
+        candidate = copy.deepcopy(self.data)
+        item = candidate["records"][index]
+        if item["status"] != "pending":
+            raise ValueError("only a pending journal record can be checkpointed")
+        item["undo"] = {"kind": undo.kind, "data": undo.data}
+        self._save(candidate)
+
     def mark_rolled_back(self, index: int) -> None:
         candidate = copy.deepcopy(self.data)
         candidate["records"][index]["status"] = "rolled_back"
@@ -184,6 +193,7 @@ class Transaction:
     ):
         self.journal = journal
         self.handlers = handlers
+        self._active_step: Optional[int] = None
 
     def start(self, operation: str) -> None:
         self.journal.start(operation)
@@ -216,6 +226,8 @@ class Transaction:
         action: Callable[[], None],
     ) -> None:
         index = self.journal.begin(name, undo)
+        previous_step = self._active_step
+        self._active_step = index
         try:
             action()
             self.journal.mark_applied(index)
@@ -227,6 +239,13 @@ class Transaction:
                 raise self._rollback_failed(index, item, error) from error
             self.journal.mark_rolled_back(index)
             raise
+        finally:
+            self._active_step = previous_step
+
+    def checkpoint_undo(self, undo: UndoRecord) -> None:
+        if self._active_step is None:
+            raise RuntimeError("no active transaction step to checkpoint")
+        self.journal.checkpoint_undo(self._active_step, undo)
 
     def rollback(self) -> None:
         for index in range(len(self.journal.data["records"]) - 1, -1, -1):
@@ -316,15 +335,68 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+_RENAME_EXCL = 0x00000004
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_RENAME_EXCLUSIVE = getattr(_LIBC, "renamex_np", None)
+if _RENAME_EXCLUSIVE is not None:
+    _RENAME_EXCLUSIVE.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    _RENAME_EXCLUSIVE.restype = ctypes.c_int
+
+
+def _rename_exclusive(source: Path, destination: Path) -> None:
+    """Atomically move *source* without replacing an existing destination."""
+    if _RENAME_EXCLUSIVE is None:
+        raise OSError(errno.ENOTSUP, "exclusive rename is unavailable")
+    result = _RENAME_EXCLUSIVE(
+        os.fsencode(source), os.fsencode(destination), _RENAME_EXCL
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+
+
 @dataclass(frozen=True)
 class _CopyStaging:
+    directory: Path
+    cleanup_directory: Path
     path: Path
+    directory_device: int
+    directory_inode: int
     device: int
     inode: int
 
 
-def _staging_status(staging: _CopyStaging) -> os.stat_result:
-    status = os.lstat(staging.path)
+def _directory_open_flags() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not no_follow or not directory:
+        raise OSError(errno.ENOTSUP, "safe directory opens are unavailable")
+    return os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
+
+
+def _owned_directory_status(
+    descriptor: int, staging: _CopyStaging
+) -> os.stat_result:
+    status = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_dev != staging.directory_device
+        or status.st_ino != staging.directory_inode
+    ):
+        raise OSError(
+            errno.EPERM,
+            "copy staging directory identity changed",
+            str(staging.directory),
+        )
+    return status
+
+
+def _owned_file_status(descriptor: int, staging: _CopyStaging) -> os.stat_result:
+    status = os.fstat(descriptor)
     if (
         not stat.S_ISREG(status.st_mode)
         or status.st_nlink != 1
@@ -333,44 +405,96 @@ def _staging_status(staging: _CopyStaging) -> os.stat_result:
     ):
         raise OSError(
             errno.EPERM,
-            "copy staging identity changed",
+            "copy staging file identity changed",
             str(staging.path),
         )
     return status
 
 
-def _unlink_owned_staging(staging: _CopyStaging) -> None:
-    try:
-        _staging_status(staging)
-    except (FileNotFoundError, OSError):
+def _cleanup_owned_staging(staging: _CopyStaging) -> None:
+    """Move a stage out of the destination namespace before deleting it."""
+    source_exists = os.path.lexists(staging.directory)
+    cleanup_exists = os.path.lexists(staging.cleanup_directory)
+    if source_exists and cleanup_exists:
         return
-    staging.path.unlink()
+    if source_exists:
+        try:
+            _rename_exclusive(staging.directory, staging.cleanup_directory)
+        except FileExistsError:
+            return
+        _fsync_directory(staging.directory.parent)
+        if staging.cleanup_directory.parent != staging.directory.parent:
+            _fsync_directory(staging.cleanup_directory.parent)
+        cleanup_exists = True
+    if not cleanup_exists:
+        return
+
+    directory_descriptor = None
+    staging_descriptor = None
+    remove_directory = False
+    try:
+        try:
+            directory_descriptor = os.open(
+                str(staging.cleanup_directory), _directory_open_flags()
+            )
+            _owned_directory_status(directory_descriptor, staging)
+        except OSError:
+            return
+        entries = os.listdir(directory_descriptor)
+        if entries == []:
+            remove_directory = True
+        elif entries == [staging.path.name]:
+            no_follow = getattr(os, "O_NOFOLLOW", 0)
+            try:
+                staging_descriptor = os.open(
+                    staging.path.name,
+                    os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_descriptor,
+                )
+                _owned_file_status(staging_descriptor, staging)
+            except OSError:
+                return
+            os.unlink(staging.path.name, dir_fd=directory_descriptor)
+            os.fsync(directory_descriptor)
+            remove_directory = os.listdir(directory_descriptor) == []
+        else:
+            return
+    finally:
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+    if remove_directory:
+        try:
+            os.rmdir(staging.cleanup_directory)
+        except FileNotFoundError:
+            return
+        _fsync_directory(staging.cleanup_directory.parent)
 
 
 def _atomic_copy_file(
     source: Path, destination: Path, staging: _CopyStaging
 ) -> None:
-    if staging.path.parent != destination.parent:
-        raise ValueError("copy staging path must be a sibling of its destination")
+    if staging.directory.parent != destination.parent:
+        raise ValueError("copy staging directory must be a sibling of its destination")
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not no_follow:
         raise OSError(errno.ENOTSUP, "no-follow file opens are unavailable")
-    flags = os.O_WRONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
     descriptor = None
+    directory_descriptor = None
+    destination_directory_descriptor = None
     try:
-        descriptor = os.open(str(staging.path), flags)
-        descriptor_status = os.fstat(descriptor)
-        path_status = _staging_status(staging)
-        if (
-            descriptor_status.st_dev != path_status.st_dev
-            or descriptor_status.st_ino != path_status.st_ino
-            or descriptor_status.st_nlink != 1
-        ):
-            raise OSError(
-                errno.EPERM,
-                "copy staging identity changed",
-                str(staging.path),
-            )
+        directory_descriptor = os.open(
+            str(staging.directory), _directory_open_flags()
+        )
+        _owned_directory_status(directory_descriptor, staging)
+        descriptor = os.open(
+            staging.path.name,
+            os.O_WRONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        _owned_file_status(descriptor, staging)
         os.ftruncate(descriptor, 0)
         with source.open("rb") as source_stream, os.fdopen(
             descriptor, "wb", closefd=False
@@ -379,9 +503,22 @@ def _atomic_copy_file(
             destination_stream.flush()
         os.fchmod(descriptor, stat_mode(source))
         os.fsync(descriptor)
-        _staging_status(staging)
-        os.replace(str(staging.path), str(destination))
-        installed_status = os.lstat(destination)
+        _owned_directory_status(directory_descriptor, staging)
+        _owned_file_status(descriptor, staging)
+        destination_directory_descriptor = os.open(
+            str(destination.parent), _directory_open_flags()
+        )
+        os.replace(
+            staging.path.name,
+            destination.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=destination_directory_descriptor,
+        )
+        installed_status = os.stat(
+            destination.name,
+            dir_fd=destination_directory_descriptor,
+            follow_symlinks=False,
+        )
         if (
             installed_status.st_dev != staging.device
             or installed_status.st_ino != staging.inode
@@ -391,13 +528,15 @@ def _atomic_copy_file(
                 "installed file identity changed",
                 str(destination),
             )
-        _fsync_directory(destination.parent)
-    except BaseException:
-        _unlink_owned_staging(staging)
-        raise
+        os.fsync(destination_directory_descriptor)
     finally:
         if descriptor is not None:
             os.close(descriptor)
+        if destination_directory_descriptor is not None:
+            os.close(destination_directory_descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+    _cleanup_owned_staging(staging)
 
 
 class LauncherPort(Protocol):
@@ -975,6 +1114,10 @@ class Installer:
     def _staging_name(destination: Path, token: str) -> str:
         return ".{}.ostriv-macos-stage-{}".format(destination.name, token)
 
+    @staticmethod
+    def _staging_cleanup_name(token: str) -> str:
+        return ".ostriv-macos-stage-cleanup-{}".format(token)
+
     def _prepare_copy_staging(
         self,
         transaction: Transaction,
@@ -998,26 +1141,56 @@ class Installer:
             )
         while True:
             token = secrets.token_hex(16)
-            staging = destination.with_name(self._staging_name(destination, token))
-            if not os.path.lexists(staging):
+            directory = destination.with_name(
+                self._staging_name(destination, token)
+            )
+            cleanup_directory = (
+                installation.bottle.root.resolve()
+                / self._staging_cleanup_name(token)
+            )
+            if not os.path.lexists(directory) and not os.path.lexists(
+                cleanup_directory
+            ):
                 break
+        staging = directory / "payload"
 
         record_data: Dict[str, object] = {
             "path": str(staging),
+            "directory": str(directory),
+            "cleanup_directory": str(cleanup_directory),
             "destination": str(destination),
         }
 
         def create_owned_staging() -> None:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             no_follow = getattr(os, "O_NOFOLLOW", 0)
             if not no_follow:
                 raise OSError(errno.ENOTSUP, "no-follow file opens are unavailable")
-            descriptor = os.open(
-                str(staging),
-                flags | no_follow | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-            )
+            os.mkdir(directory, mode=0o700)
+            directory_descriptor = None
+            descriptor = None
             try:
+                directory_descriptor = os.open(
+                    str(directory), _directory_open_flags()
+                )
+                os.fchmod(directory_descriptor, 0o700)
+                directory_status = os.fstat(directory_descriptor)
+                if not stat.S_ISDIR(directory_status.st_mode):
+                    raise OSError(
+                        errno.EPERM,
+                        "copy staging is not an exclusive directory",
+                        str(directory),
+                    )
+                descriptor = os.open(
+                    staging.name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | no_follow
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                os.fchmod(descriptor, 0o600)
                 status = os.fstat(descriptor)
                 if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
                     raise OSError(
@@ -1025,12 +1198,21 @@ class Installer:
                         "copy staging is not an exclusive regular file",
                         str(staging),
                     )
+                record_data["directory_device"] = directory_status.st_dev
+                record_data["directory_inode"] = directory_status.st_ino
                 record_data["device"] = status.st_dev
                 record_data["inode"] = status.st_ino
+                transaction.checkpoint_undo(
+                    UndoRecord("remove_staging", copy.deepcopy(record_data))
+                )
                 os.fsync(descriptor)
+                os.fsync(directory_descriptor)
             finally:
-                os.close(descriptor)
-            _fsync_directory(staging.parent)
+                if descriptor is not None:
+                    os.close(descriptor)
+                if directory_descriptor is not None:
+                    os.close(directory_descriptor)
+            _fsync_directory(directory.parent)
 
         transaction.step(
             "own copy staging for {}".format(destination.name),
@@ -1038,7 +1220,11 @@ class Installer:
             create_owned_staging,
         )
         return _CopyStaging(
+            directory,
+            cleanup_directory,
             staging,
+            int(record_data["directory_device"]),
+            int(record_data["directory_inode"]),
             int(record_data["device"]),
             int(record_data["inode"]),
         )
@@ -1479,7 +1665,7 @@ class Installer:
 
     @staticmethod
     def _backup_and_write(
-        path: Path, backup: Path, backup_staging: Path, data: bytes
+        path: Path, backup: Path, backup_staging: _CopyStaging, data: bytes
     ) -> None:
         mode = stat_mode(path)
         if not backup.exists():
@@ -1729,41 +1915,77 @@ class Installer:
         self, installation: GameInstallation, record: UndoRecord
     ) -> None:
         path_text = record.data.get("path")
+        directory_text = record.data.get("directory")
+        cleanup_directory_text = record.data.get("cleanup_directory")
         destination_text = record.data.get("destination")
+        directory_device = record.data.get("directory_device")
+        directory_inode = record.data.get("directory_inode")
         device = record.data.get("device")
         inode = record.data.get("inode")
         if (
             not isinstance(path_text, str)
+            or not isinstance(directory_text, str)
+            or not isinstance(cleanup_directory_text, str)
             or not isinstance(destination_text, str)
+            or not isinstance(directory_device, int)
+            or not isinstance(directory_inode, int)
             or not isinstance(device, int)
             or not isinstance(inode, int)
         ):
             return
         path = Path(path_text)
+        directory = Path(directory_text)
+        cleanup_directory = Path(cleanup_directory_text)
         destination = Path(destination_text)
-        lexical_path = path.parent.resolve(strict=False) / path.name
+        lexical_directory = (
+            directory.parent.resolve(strict=False) / directory.name
+        )
         lexical_destination = (
             destination.parent.resolve(strict=False) / destination.name
         )
+        lexical_cleanup = (
+            cleanup_directory.parent.resolve(strict=False)
+            / cleanup_directory.name
+        )
         if (
             not path.is_absolute()
+            or not directory.is_absolute()
+            or not cleanup_directory.is_absolute()
             or not destination.is_absolute()
-            or path != lexical_path
+            or directory != lexical_directory
+            or path != directory / "payload"
             or destination != lexical_destination
-            or lexical_path.parent != lexical_destination.parent
+            or directory.parent != lexical_destination.parent
+            or cleanup_directory != lexical_cleanup
+            or cleanup_directory.parent != installation.bottle.root.resolve()
             or not self._allowed_atomic_copy_destination(
                 installation, lexical_destination
             )
         ):
             return
         name_pattern = re.compile(
-            r"^{}[0-9a-f]{{32}}$".format(
+            r"^{}(?P<token>[0-9a-f]{{32}})$".format(
                 re.escape(".{}.ostriv-macos-stage-".format(destination.name))
             )
         )
-        if name_pattern.fullmatch(path.name) is None:
+        name_match = name_pattern.fullmatch(directory.name)
+        if (
+            name_match is None
+            or cleanup_directory.name
+            != self._staging_cleanup_name(name_match.group("token"))
+        ):
             return
-        _unlink_owned_staging(_CopyStaging(path, device, inode))
+        _cleanup_owned_staging(
+            _CopyStaging(
+                directory,
+                cleanup_directory,
+                path,
+                directory_device,
+                directory_inode,
+                device,
+                inode,
+            )
+        )
 
     def _remove_empty_owned_directories(
         self, installation: GameInstallation, directories: object
