@@ -443,6 +443,10 @@ class LauncherInstallerTests(unittest.TestCase):
             "file-parent",
             "symlink-metadata",
             "unknown-type",
+            "nul-path",
+            "surrogate-path",
+            "nul-symlink-target",
+            "surrogate-symlink-target",
         ):
             with self.subTest(case=label):
                 fixture = LauncherFixture()
@@ -481,6 +485,26 @@ class LauncherInstallerTests(unittest.TestCase):
                     "unknown-type": [
                         {"relative_path": "device", "type": "device"}
                     ],
+                    "nul-path": [
+                        {"relative_path": "bad\0path", "type": "file"}
+                    ],
+                    "surrogate-path": [
+                        {"relative_path": "bad\udcffpath", "type": "file"}
+                    ],
+                    "nul-symlink-target": [
+                        {
+                            "relative_path": "unsafe-target",
+                            "type": "symlink",
+                            "target": "bad\0target",
+                        }
+                    ],
+                    "surrogate-symlink-target": [
+                        {
+                            "relative_path": "unsafe-target",
+                            "type": "symlink",
+                            "target": "bad\udcfftarget",
+                        }
+                    ],
                 }.get(label, [])
                 if label == "duplicate":
                     captured["entries"].append(dict(captured["entries"][0]))
@@ -510,15 +534,23 @@ class LauncherInstallerTests(unittest.TestCase):
                 )
                 transaction = production.transaction_for(fixture.installation)
                 transaction.start("restore")
-                transaction.journal.begin(
-                    "corrupt restore tree",
-                    UndoRecord(
-                        "restore_launcher",
-                        {
-                            "snapshots": [],
-                            "restore_trees": [captured],
+                corrupt_journal = dict(transaction.journal.data)
+                corrupt_journal["records"] = [
+                    {
+                        "name": "corrupt restore tree",
+                        "status": "pending",
+                        "undo": {
+                            "kind": "restore_launcher",
+                            "data": {
+                                "snapshots": [],
+                                "restore_trees": [captured],
+                            },
                         },
-                    ),
+                    }
+                ]
+                transaction.journal.path.write_text(
+                    json.dumps(corrupt_journal, ensure_ascii=True),
+                    encoding="utf-8",
                 )
 
                 with self.assertRaises(PatchError) as caught:

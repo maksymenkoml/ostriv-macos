@@ -53,6 +53,20 @@ def _lexists(path: Path) -> bool:
     return os.path.lexists(str(path))
 
 
+def _filesystem_safe_text(value: str) -> bool:
+    """Accept only text that the local filesystem can represent losslessly."""
+    contains_surrogate = any(
+        0xD800 <= ord(character) <= 0xDFFF for character in value
+    )
+    if "\0" in value or contains_surrogate:
+        return False
+    try:
+        encoded = os.fsencode(value)
+        return os.fsdecode(encoded) == value
+    except (UnicodeEncodeError, UnicodeDecodeError, ValueError):
+        return False
+
+
 def _regular_file_no_follow(root: Path, relative: Path) -> Optional[Path]:
     """Return a regular leaf only when every lexical parent is a real directory."""
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
@@ -257,6 +271,8 @@ def _validated_captured_entries(snapshot: Mapping[str, object]) -> List[Dict[str
         relative = PurePosixPath(relative_text)
         if (
             not relative_text
+            or not _filesystem_safe_text(relative_text)
+            or any(not _filesystem_safe_text(part) for part in relative.parts)
             or relative.is_absolute()
             or ".." in relative.parts
             or relative_text != relative.as_posix()
@@ -283,7 +299,11 @@ def _validated_captured_entries(snapshot: Mapping[str, object]) -> List[Dict[str
                 raise ValueError("captured launcher file digest is invalid")
         if item_type == "symlink":
             target = item.get("target")
-            if not isinstance(target, str) or not target or "\0" in target:
+            if (
+                not isinstance(target, str)
+                or not target
+                or not _filesystem_safe_text(target)
+            ):
                 raise ValueError("captured launcher symlink metadata is invalid")
         saved = dict(item)
         by_path[relative] = saved
