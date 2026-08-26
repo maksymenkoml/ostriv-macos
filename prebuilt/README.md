@@ -9,4 +9,5 @@ Drop-in DLLs, placed next to `ostriv.exe` by `../patch.py`:
 
 Built for x86_64-windows (runs under CrossOver's x86_64 Wine). Rebuild with `../scripts/build-driver.sh`.
 
-All `*.dll` here are tracked via **Git LFS** (see `../.gitattributes`).
+Players receive hydrated DLLs inside the downloadable release asset; no Git or Git LFS
+setup is needed. Git LFS applies to repository contributors only (see `../.gitattributes`).
