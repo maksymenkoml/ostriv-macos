@@ -114,7 +114,24 @@ class ProcessLock:
 MAX_LOG_EVIDENCE_BYTES = 256 * 1024
 LOG_TOKEN_TAIL_BYTES = 64 * 1024
 MAX_RENDERER_HELPER_PIDS = 64
+MAX_PID_TEXT_DIGITS = 10
 _AMBIGUOUS_LOG_EVIDENCE = "<changed log generation outside bounded evidence>"
+
+
+def _parse_pid(value) -> Optional[int]:
+    text = value.strip() if isinstance(value, str) else ""
+    if (
+        not text
+        or len(text) > MAX_PID_TEXT_DIGITS
+        or not text.isascii()
+        or not text.isdigit()
+    ):
+        return None
+    try:
+        pid = int(text, 10)
+    except ValueError:
+        return None
+    return pid if 0 < pid < 2**31 else None
 
 
 @dataclass(frozen=True)
@@ -525,11 +542,8 @@ class SteamController:
                 if len(row) < 2:
                     continue
                 image = row[0].lstrip("\ufeff").strip().lower()
-                pid_text = row[1].strip()
-                if not image or not pid_text.isdecimal():
-                    continue
-                pid = int(pid_text)
-                if not 0 < pid < 2**31:
+                pid = _parse_pid(row[1])
+                if not image or pid is None:
                     continue
                 processes.setdefault(image, set()).add(pid)
         except csv.Error:
@@ -560,9 +574,10 @@ class SteamController:
         selected_set = set(selected)
         for line in str(output)[:MAX_LOG_EVIDENCE_BYTES].splitlines():
             fields = line.strip().split(None, 1)
-            if len(fields) != 2 or not fields[0].isdecimal():
+            if len(fields) != 2:
                 continue
-            if int(fields[0]) not in selected_set:
+            pid = _parse_pid(fields[0])
+            if pid is None or pid not in selected_set:
                 continue
             if "--type=renderer" in fields[1].split():
                 return True

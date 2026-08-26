@@ -218,6 +218,64 @@ def real_launcher_for_restore(fixture, profiles):
     return launcher, installer
 
 
+class FinalLockUnlinkInterruption(BaseException):
+    pass
+
+
+def interrupt_restore_after_final_lock_unlink(installer, installation):
+    """Leave the exact journal produced after Restore unlinks its owned lock."""
+    armed = [True]
+
+    class InterruptingTransaction(Transaction):
+        def __init__(self, journal, handlers):
+            super().__init__(journal, handlers)
+            self.interrupted = False
+
+        def step(self, name, undo, action):
+            if name != "remove launcher recovery lock" or not armed:
+                return super().step(name, undo, action)
+            self.journal.begin(name, undo)
+            action()
+            armed.pop()
+            self.interrupted = True
+            raise FinalLockUnlinkInterruption()
+
+        def rollback(self):
+            if self.interrupted:
+                raise FinalLockUnlinkInterruption()
+            return super().rollback()
+
+    def transaction_for(selected):
+        return InterruptingTransaction(
+            InstallJournal(installer.journal_path(selected)),
+            installer.undo_handlers(selected),
+        )
+
+    with patch.object(installer, "transaction_for", side_effect=transaction_for):
+        try:
+            installer.restore(installation)
+        except FinalLockUnlinkInterruption:
+            return
+    raise AssertionError("Restore reached completion instead of final-unlink interruption")
+
+
+def active_lock_snapshot_references(journal, lock):
+    """Return exact lock snapshots in rollback-active supported list fields."""
+    references = []
+    for index, item in enumerate(journal["records"]):
+        if item["status"] not in ("pending", "applied"):
+            continue
+        undo = item["undo"]
+        for field in ("snapshots", "restore_files"):
+            snapshots = undo["data"].get(field, [])
+            if not isinstance(snapshots, list):
+                continue
+            for snapshot in snapshots:
+                if isinstance(snapshot, dict) and snapshot.get("path") == str(lock):
+                    references.append((index, item, field, snapshot))
+    return references
+
+
 class FailureTransaction(Transaction):
     def __init__(self, journal, handlers, fail_after=None):
         super().__init__(journal, handlers)
@@ -342,12 +400,14 @@ class FakeBottleFixture:
         paths = {}
         for path in sorted(self.root.rglob("*")):
             relative = path.relative_to(self.root).as_posix()
-            mode = stat.S_IMODE(path.lstat().st_mode)
-            paths[relative] = (
-                "dir" if path.is_dir() else "file",
-                b"" if path.is_dir() else path.read_bytes(),
-                mode,
-            )
+            status = path.lstat()
+            mode = stat.S_IMODE(status.st_mode)
+            if stat.S_ISLNK(status.st_mode):
+                paths[relative] = ("symlink", os.readlink(path), mode)
+            elif stat.S_ISDIR(status.st_mode):
+                paths[relative] = ("dir", b"", mode)
+            else:
+                paths[relative] = ("file", path.read_bytes(), mode)
         registry = tuple(sorted((key, value, data) for (key, value), data in self.registry.items()))
         return paths, registry
 
@@ -1037,46 +1097,32 @@ class InstallerTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            armed = [True]
+            interrupt_restore_after_final_lock_unlink(
+                installer, fixture.installation
+            )
 
-            class HardKill(BaseException):
-                pass
-
-            class HardKillTransaction(Transaction):
-                def __init__(self, journal, handlers):
-                    super().__init__(journal, handlers)
-                    self.killed = False
-
-                def step(self, name, undo, action):
-                    if name != "remove launcher recovery lock" or not armed:
-                        return super().step(name, undo, action)
-                    self.journal.begin(name, undo)
-                    action()
-                    armed.pop()
-                    self.killed = True
-                    raise HardKill()
-
-                def rollback(self):
-                    if self.killed:
-                        raise HardKill()
-                    return super().rollback()
-
-            def transaction_for(installation):
-                return HardKillTransaction(
-                    InstallJournal(installer.journal_path(installation)),
-                    installer.undo_handlers(installation),
-                )
-
-            with patch.object(installer, "transaction_for", side_effect=transaction_for):
-                with self.assertRaises(HardKill):
-                    installer.restore(fixture.installation)
-
-                self.assertFalse(lock.exists())
-                self.assertTrue(installer.state_path(fixture.installation).is_file())
-                journal = json.loads(
-                    installer.journal_path(fixture.installation).read_text(encoding="utf-8")
-                )
-                self.assertFalse(journal["complete"])
+            self.assertFalse(lock.exists())
+            self.assertTrue(installer.state_path(fixture.installation).is_file())
+            journal = json.loads(
+                installer.journal_path(fixture.installation).read_text(encoding="utf-8")
+            )
+            self.assertFalse(journal["complete"])
+            references = active_lock_snapshot_references(journal, lock)
+            self.assertEqual(
+                [
+                    ("restore launcher", "restore_launcher", "restore_files"),
+                    (
+                        "remove launcher recovery lock",
+                        "restore_launcher",
+                        "snapshots",
+                    ),
+                ],
+                [
+                    (item["name"], item["undo"]["kind"], field)
+                    for _index, item, field, _snapshot in references
+                ],
+            )
+            self.assertEqual([0o600, 0o600], [item[3]["mode"] for item in references])
 
             restart_transactions = []
             contender_acquired = []
@@ -1120,6 +1166,288 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_restore_restart_accepts_interruption_before_first_restore_record(self):
+        """An empty incomplete Restore journal has no lock snapshot to sanitize."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            _launcher, installer = real_launcher_for_restore(fixture, profiles)
+            before = fixture.snapshot()
+            installer.install(fixture.installation, fixture.payload)
+            transaction = installer.transaction_for(fixture.installation)
+            transaction.start("restore")
+
+            installer.restore(fixture.installation)
+
+            self.assertEqual(before, fixture.snapshot())
+            self.assertEqual([], profiles.calls)
+        finally:
+            fixture.cleanup()
+
+    def test_restore_restart_preflights_every_lock_snapshot_before_mutation(self):
+        """An earlier bad lock snapshot must fail before replaying a later exact one."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            state_path = installer.state_path(fixture.installation)
+            journal_path = installer.journal_path(fixture.installation)
+            lock = Path(str(state.launcher_artifacts["lock_path"]))
+            unowned = fixture.bottle_root / "player-owned-note.txt"
+            unowned.write_bytes(b"leave this unrelated file byte-for-byte")
+            unowned.chmod(0o640)
+
+            interrupt_restore_after_final_lock_unlink(
+                installer, fixture.installation
+            )
+
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            references = active_lock_snapshot_references(journal, lock)
+            self.assertEqual(2, len(references))
+            earlier = references[0]
+            latest = references[1]
+            self.assertEqual("restore_files", earlier[2])
+            self.assertEqual("snapshots", latest[2])
+            self.assertEqual(0o600, latest[3]["mode"])
+            earlier[3]["mode"] = 0o644
+            journal_path.write_text(
+                json.dumps(journal, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+
+            journal_before = journal_path.read_bytes()
+            statuses_before = [item["status"] for item in journal["records"]]
+            state_before = state_path.read_bytes()
+            filesystem_before = fixture.snapshot()
+            profile_before = (profiles.current, list(profiles.calls))
+            launcher_present_before = os.path.lexists(launcher._app_path())
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual(journal_before, journal_path.read_bytes())
+            self.assertEqual(
+                statuses_before,
+                [
+                    item["status"]
+                    for item in json.loads(journal_path.read_text(encoding="utf-8"))[
+                        "records"
+                    ]
+                ],
+            )
+            self.assertEqual(state_before, state_path.read_bytes())
+            self.assertEqual(filesystem_before, fixture.snapshot())
+            self.assertEqual(profile_before, (profiles.current, profiles.calls))
+            self.assertEqual(b"leave this unrelated file byte-for-byte", unowned.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(unowned.stat().st_mode))
+            self.assertFalse(os.path.lexists(lock))
+            self.assertEqual(
+                launcher_present_before, os.path.lexists(launcher._app_path())
+            )
+            self.assertEqual("restore.launcher_recovery", caught.exception.code)
+
+            earlier[3]["mode"] = 0o600
+            journal_path.write_text(
+                json.dumps(journal, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            installer.restore(fixture.installation)
+
+            self.assertFalse(journal_path.exists())
+            self.assertFalse(state_path.exists())
+            self.assertFalse(os.path.lexists(lock))
+            self.assertEqual(b"leave this unrelated file byte-for-byte", unowned.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(unowned.stat().st_mode))
+            self.assertEqual([], profiles.calls)
+        finally:
+            fixture.cleanup()
+
+    def test_restore_restart_rejects_nonlexical_lock_snapshot_before_mutation(self):
+        """A normalized spelling of the lock path is an alias, never an exact path."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            _launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            state_path = installer.state_path(fixture.installation)
+            journal_path = installer.journal_path(fixture.installation)
+            lock = Path(str(state.launcher_artifacts["lock_path"]))
+
+            interrupt_restore_after_final_lock_unlink(
+                installer, fixture.installation
+            )
+
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            references = active_lock_snapshot_references(journal, lock)
+            self.assertEqual(2, len(references))
+            references[0][3]["path"] = "{}/./{}".format(lock.parent, lock.name)
+            self.assertNotEqual(str(lock), references[0][3]["path"])
+            self.assertEqual(lock, Path(str(references[0][3]["path"])).resolve())
+            journal_path.write_text(
+                json.dumps(journal, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+
+            journal_before = journal_path.read_bytes()
+            state_before = state_path.read_bytes()
+            filesystem_before = fixture.snapshot()
+            profile_before = (profiles.current, list(profiles.calls))
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual("restore.launcher_recovery", caught.exception.code)
+            self.assertEqual(journal_before, journal_path.read_bytes())
+            self.assertEqual(state_before, state_path.read_bytes())
+            self.assertEqual(filesystem_before, fixture.snapshot())
+            self.assertEqual(profile_before, (profiles.current, profiles.calls))
+            self.assertFalse(os.path.lexists(lock))
+        finally:
+            fixture.cleanup()
+
+    def test_restore_restart_rejects_lock_alias_in_unexpected_handler_before_mutation(self):
+        """A lock alias outside its two supported undo locations is never replayed."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            state_path = installer.state_path(fixture.installation)
+            journal_path = installer.journal_path(fixture.installation)
+            lock = Path(str(state.launcher_artifacts["lock_path"]))
+
+            interrupt_restore_after_final_lock_unlink(
+                installer, fixture.installation
+            )
+
+            alias = fixture.bottle_root / "unowned-launcher-lock-alias"
+            alias.symlink_to(lock.name)
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            references = active_lock_snapshot_references(journal, lock)
+            self.assertEqual(2, len(references))
+            alias_snapshot = dict(references[-1][3])
+            alias_snapshot["path"] = str(alias)
+            journal["records"].append(
+                {
+                    "name": "unexpected launcher lock alias",
+                    "status": "pending",
+                    "undo": {
+                        "kind": "restore_file",
+                        "data": {"snapshots": [alias_snapshot]},
+                    },
+                }
+            )
+            journal_path.write_text(
+                json.dumps(journal, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+
+            journal_before = journal_path.read_bytes()
+            statuses_before = [item["status"] for item in journal["records"]]
+            state_before = state_path.read_bytes()
+            filesystem_before = fixture.snapshot()
+            profile_before = (profiles.current, list(profiles.calls))
+            alias_target_before = os.readlink(alias)
+            launcher_present_before = os.path.lexists(launcher._app_path())
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual(journal_before, journal_path.read_bytes())
+            self.assertEqual(
+                statuses_before,
+                [
+                    item["status"]
+                    for item in json.loads(journal_path.read_text(encoding="utf-8"))[
+                        "records"
+                    ]
+                ],
+            )
+            self.assertEqual(state_before, state_path.read_bytes())
+            self.assertEqual(filesystem_before, fixture.snapshot())
+            self.assertEqual(profile_before, (profiles.current, profiles.calls))
+            self.assertTrue(alias.is_symlink())
+            self.assertEqual(alias_target_before, os.readlink(alias))
+            self.assertFalse(os.path.lexists(lock))
+            self.assertEqual(
+                launcher_present_before, os.path.lexists(launcher._app_path())
+            )
+            self.assertEqual("restore.launcher_recovery", caught.exception.code)
+        finally:
+            fixture.cleanup()
+
+    def test_restore_restart_rejects_nested_lock_alias_before_mutation(self):
+        """Nested launcher inventories cannot smuggle a lock alias into replay."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            state_path = installer.state_path(fixture.installation)
+            journal_path = installer.journal_path(fixture.installation)
+            lock = Path(str(state.launcher_artifacts["lock_path"]))
+
+            interrupt_restore_after_final_lock_unlink(
+                installer, fixture.installation
+            )
+
+            alias = fixture.bottle_root / "nested-launcher-lock-alias"
+            alias.symlink_to(lock.name)
+            app = launcher._app_path()
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            journal["records"].append(
+                {
+                    "name": "unexpected nested launcher lock alias",
+                    "status": "pending",
+                    "undo": {
+                        "kind": "restore_launcher",
+                        "data": {
+                            "snapshots": [],
+                            "moved_tree": {
+                                "source": str(
+                                    app.with_name(
+                                        "." + app.name + ".ostriv-macos.previous"
+                                    )
+                                ),
+                                "destination": str(app),
+                                "source_inventory": [],
+                                "replacement_inventory": [
+                                    {
+                                        "relative_path": str(alias),
+                                        "type": "symlink",
+                                        "target": lock.name,
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                }
+            )
+            journal_path.write_text(
+                json.dumps(journal, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+
+            journal_before = journal_path.read_bytes()
+            state_before = state_path.read_bytes()
+            filesystem_before = fixture.snapshot()
+            profile_before = (profiles.current, list(profiles.calls))
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual("restore.launcher_recovery", caught.exception.code)
+            self.assertEqual(journal_before, journal_path.read_bytes())
+            self.assertEqual(state_before, state_path.read_bytes())
+            self.assertEqual(filesystem_before, fixture.snapshot())
+            self.assertEqual(profile_before, (profiles.current, profiles.calls))
+            self.assertTrue(alias.is_symlink())
+            self.assertEqual(lock.name, os.readlink(alias))
+            self.assertFalse(os.path.lexists(lock))
+        finally:
+            fixture.cleanup()
+
     def test_restore_restart_preserves_lock_substituted_after_lease_acquisition(self):
         """Recovery must not replace a lookalike inode that displaced the held lock."""
         fixture = FakeBottleFixture()
@@ -1129,44 +1457,13 @@ class InstallerTests(unittest.TestCase):
             state = installer.install(fixture.installation, fixture.payload)
             lock = Path(str(state.launcher_artifacts["lock_path"]))
             expected = lock.read_bytes()
-            armed = [True]
-
-            class HardKill(BaseException):
-                pass
-
-            class HardKillTransaction(Transaction):
-                def __init__(self, journal, handlers):
-                    super().__init__(journal, handlers)
-                    self.killed = False
-
-                def step(self, name, undo, action):
-                    if name != "remove launcher recovery lock" or not armed:
-                        return super().step(name, undo, action)
-                    self.journal.begin(name, undo)
-                    action()
-                    armed.pop()
-                    self.killed = True
-                    raise HardKill()
-
-                def rollback(self):
-                    if self.killed:
-                        raise HardKill()
-                    return super().rollback()
-
-            def interrupting_transaction_for(installation):
-                return HardKillTransaction(
-                    InstallJournal(installer.journal_path(installation)),
-                    installer.undo_handlers(installation),
-                )
-
-            with patch.object(
-                installer, "transaction_for", side_effect=interrupting_transaction_for
-            ):
-                with self.assertRaises(HardKill):
-                    installer.restore(fixture.installation)
+            interrupt_restore_after_final_lock_unlink(
+                installer, fixture.installation
+            )
 
             self.assertFalse(lock.exists())
             replacement_identity = []
+            recovery_boundary = []
 
             def restart_transaction_for(installation):
                 transaction = Transaction(
@@ -1181,6 +1478,23 @@ class InstallerTests(unittest.TestCase):
                     lock.chmod(0o600)
                     status = lock.stat()
                     replacement_identity.append((status.st_dev, status.st_ino))
+                    journal_path = installer.journal_path(fixture.installation)
+                    recovery_boundary.append(
+                        {
+                            "journal": journal_path.read_bytes(),
+                            "statuses": [
+                                record["status"]
+                                for record in json.loads(
+                                    journal_path.read_text(encoding="utf-8")
+                                )["records"]
+                            ],
+                            "state": installer.state_path(
+                                fixture.installation
+                            ).read_bytes(),
+                            "filesystem": fixture.snapshot(),
+                            "profile": (profiles.current, list(profiles.calls)),
+                        }
+                    )
                     original_recover()
 
                 transaction.recover_incomplete = substitute_then_recover
@@ -1193,6 +1507,25 @@ class InstallerTests(unittest.TestCase):
                     installer.restore(fixture.installation)
 
             self.assertEqual("install.rollback_failed", caught.exception.code)
+            self.assertEqual(1, len(recovery_boundary))
+            boundary = recovery_boundary[0]
+            journal_path = installer.journal_path(fixture.installation)
+            self.assertEqual(boundary["journal"], journal_path.read_bytes())
+            self.assertEqual(
+                boundary["statuses"],
+                [
+                    record["status"]
+                    for record in json.loads(
+                        journal_path.read_text(encoding="utf-8")
+                    )["records"]
+                ],
+            )
+            self.assertEqual(
+                boundary["state"],
+                installer.state_path(fixture.installation).read_bytes(),
+            )
+            self.assertEqual(boundary["filesystem"], fixture.snapshot())
+            self.assertEqual(boundary["profile"], (profiles.current, profiles.calls))
             status = lock.stat()
             self.assertEqual(replacement_identity, [(status.st_dev, status.st_ino)])
             self.assertEqual(expected, lock.read_bytes())

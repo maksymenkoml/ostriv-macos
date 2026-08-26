@@ -521,6 +521,39 @@ class SteamControllerTests(unittest.TestCase):
         self.assertEqual(SteamSignals(True, True, True), signals)
         self.assertEqual([expected_task, expected_renderer, expected_registry], calls)
 
+    def test_tasklist_pid_parser_rejects_non_ascii_and_pathological_decimals(self):
+        """Untrusted decimal text must not reach Python's bounded integer parser."""
+        pathological = "9" * 5000
+        output = (
+            '"steam.exe","\uff11\uff12\uff13","Console","1","12,000 K"\n'
+            '"steamwebhelper.exe","{}","Console","1","24,000 K"\n'.format(
+                pathological
+            )
+        )
+
+        self.assertEqual({}, SteamController._task_processes(output))
+
+    def test_ps_pid_parser_treats_pathological_decimal_as_safe_false(self):
+        """A huge ps PID field cannot crash selected-helper role correlation."""
+        config = make_config("/private/tmp/selected")
+        pathological = "9" * 5000
+
+        class PathologicalPsRunner(ProbeRunner):
+            def run(self, argv, timeout=None):
+                if list(argv)[:1] == ["/bin/ps"]:
+                    return FakeResult(
+                        0,
+                        pathological
+                        + " /selected/steamwebhelper.exe --type=renderer\n",
+                    )
+                return super().run(argv, timeout)
+
+        signals = SteamController(
+            config=config, runner=PathologicalPsRunner()
+        ).probe()
+
+        self.assertEqual(SteamSignals(True, True, False), signals)
+
     def test_non_renderer_helper_never_passes_selected_bottle_readiness_gate(self):
         """A helper without the renderer role must not satisfy the 15-second gate."""
         config = make_config("/private/tmp/selected")
