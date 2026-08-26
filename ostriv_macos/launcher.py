@@ -1,5 +1,6 @@
 """Verified CrossOver launcher application installation and migration."""
 
+import ast
 import base64
 import bz2
 import hashlib
@@ -34,6 +35,10 @@ PLIST_FIELDS = (
     "CXHelperAppBottleName",
     "CXHelperAppBottleTag",
 )
+LEGACY_RUNTIME_NORMALIZED_SHA256 = {
+    "0f1cc970c2f14861eff39d99c2494081f4615e395777021ccc7c2c8182a7b474",
+    "459c38c2e8c64ea216747161fdc17f22f547e08671bda1e0af195cd28ba74193",
+}
 
 
 def _digest(data: bytes) -> str:
@@ -46,6 +51,29 @@ def _file_digest(path: Path) -> str:
 
 def _lexists(path: Path) -> bool:
     return os.path.lexists(str(path))
+
+
+def _regular_file_no_follow(root: Path, relative: Path) -> Optional[Path]:
+    """Return a regular leaf only when every lexical parent is a real directory."""
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    current = root
+    try:
+        root_mode = current.lstat().st_mode
+        if not stat.S_ISDIR(root_mode) or stat.S_ISLNK(root_mode):
+            return None
+        for part in relative.parts[:-1]:
+            current = current / part
+            mode = current.lstat().st_mode
+            if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+                return None
+        leaf = current / relative.parts[-1]
+        mode = leaf.lstat().st_mode
+        if stat.S_ISREG(mode) and not stat.S_ISLNK(mode):
+            return leaf
+    except OSError:
+        return None
+    return None
 
 
 def _mode(path: Path) -> int:
@@ -209,15 +237,79 @@ def _captured_tree(root: Path) -> Dict[str, object]:
     return {"root": str(root), "present": bool(entries), "entries": captured}
 
 
+def _validated_captured_entries(snapshot: Mapping[str, object]) -> List[Dict[str, object]]:
+    present = snapshot.get("present")
+    entries = snapshot.get("entries")
+    if not isinstance(present, bool) or not isinstance(entries, list):
+        raise ValueError("captured launcher tree schema is invalid")
+    if not present:
+        if entries:
+            raise ValueError("absent captured launcher tree contains entries")
+        return []
+    validated = []
+    by_path = {}
+    for item in entries:
+        if not isinstance(item, dict) or not isinstance(
+            item.get("relative_path"), str
+        ):
+            raise ValueError("captured launcher tree entry is invalid")
+        relative_text = str(item["relative_path"])
+        relative = PurePosixPath(relative_text)
+        if (
+            not relative_text
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative_text != relative.as_posix()
+            or relative in by_path
+        ):
+            raise ValueError("captured launcher path is unsafe or duplicated")
+        item_type = item.get("type")
+        if item_type not in ("directory", "file", "symlink"):
+            raise ValueError("captured launcher entry type is invalid")
+        if item_type in ("directory", "file"):
+            mode = item.get("mode")
+            if not isinstance(mode, int) or isinstance(mode, bool) or not 0 <= mode <= 0o7777:
+                raise ValueError("captured launcher entry mode is invalid")
+        if item_type == "file":
+            content = item.get("content")
+            digest = item.get("sha256")
+            if not isinstance(content, str) or not isinstance(digest, str):
+                raise ValueError("captured launcher file metadata is invalid")
+            try:
+                data = base64.b64decode(content, validate=True)
+            except (ValueError, TypeError) as error:
+                raise ValueError("captured launcher file content is invalid") from error
+            if _digest(data) != digest:
+                raise ValueError("captured launcher file digest is invalid")
+        if item_type == "symlink":
+            target = item.get("target")
+            if not isinstance(target, str) or not target or "\0" in target:
+                raise ValueError("captured launcher symlink metadata is invalid")
+        saved = dict(item)
+        by_path[relative] = saved
+        validated.append(saved)
+    root = by_path.get(PurePosixPath("."))
+    if root is None or root.get("type") != "directory":
+        raise ValueError("captured launcher root directory is missing")
+    for relative, item in by_path.items():
+        if relative == PurePosixPath("."):
+            continue
+        parent = relative.parent
+        while parent != PurePosixPath("."):
+            parent_item = by_path.get(parent)
+            if parent_item is None or parent_item.get("type") != "directory":
+                raise ValueError("captured launcher entry has a non-directory parent")
+            parent = parent.parent
+    return validated
+
+
 def _restore_captured_tree(snapshot: Mapping[str, object]) -> None:
     root = Path(str(snapshot["root"]))
-    entries = snapshot.get("entries")
+    entries = _validated_captured_entries(snapshot)
     if _lexists(root):
         _remove_inventory_tree(root, _inventory(root))
     if snapshot.get("present") is not True:
         return
-    if not isinstance(entries, list):
-        raise ValueError("captured launcher tree inventory is invalid")
     directories = [item for item in entries if item.get("type") == "directory"]
     for item in sorted(
         directories,
@@ -555,6 +647,39 @@ class LauncherInstaller:
 
         def restore_and_prune(record: UndoRecord) -> None:
             root, directories = owned_paths(record)
+            tree_snapshots = record.data.get("restore_trees", [])
+            if not isinstance(tree_snapshots, list):
+                raise PatchError(
+                    "restore.launcher_ownership",
+                    "Restore failed.",
+                    "Launcher tree snapshots are invalid",
+                )
+            seen_tree_roots = set()
+            for snapshot in tree_snapshots:
+                snapshot_root = (
+                    Path(str(snapshot.get("root", "")))
+                    if isinstance(snapshot, dict)
+                    else None
+                )
+                if (
+                    not isinstance(snapshot, dict)
+                    or snapshot_root not in allowed_roots
+                    or snapshot_root in seen_tree_roots
+                ):
+                    raise PatchError(
+                        "restore.launcher_ownership",
+                        "Restore failed.",
+                        "Launcher tree snapshot is outside the allowlist",
+                    )
+                seen_tree_roots.add(snapshot_root)
+                try:
+                    _validated_captured_entries(snapshot)
+                except (KeyError, TypeError, ValueError) as error:
+                    raise PatchError(
+                        "restore.launcher_ownership",
+                        "Restore failed.",
+                        "Launcher tree snapshot is invalid: {}".format(error),
+                    ) from error
             moved = record.data.get("moved_tree")
             if moved is not None:
                 if not isinstance(moved, dict):
@@ -585,23 +710,7 @@ class LauncherInstaller:
                     os.replace(source, destination)
                     _sync_directory(destination.parent)
             fallback(record)
-            tree_snapshots = record.data.get("restore_trees", [])
-            if not isinstance(tree_snapshots, list):
-                raise PatchError(
-                    "restore.launcher_ownership",
-                    "Restore failed.",
-                    "Launcher tree snapshots are invalid",
-                )
             for snapshot in tree_snapshots:
-                if (
-                    not isinstance(snapshot, dict)
-                    or Path(str(snapshot.get("root", ""))) not in allowed_roots
-                ):
-                    raise PatchError(
-                        "restore.launcher_ownership",
-                        "Restore failed.",
-                        "Launcher tree snapshot is outside the allowlist",
-                    )
                 _restore_captured_tree(snapshot)
             file_snapshots = record.data.get("restore_files", [])
             if not isinstance(file_snapshots, list):
@@ -716,7 +825,7 @@ class LauncherInstaller:
         )
         return argv
 
-    def restore_undo_data(
+    def _restore_undo_data(
         self,
         installation: GameInstallation,
         state: Mapping[str, object],
@@ -746,6 +855,24 @@ class LauncherInstaller:
             "recreate_menu": isinstance(menu, dict)
             and menu.get("name") == LAUNCHER_MENU,
         }
+
+    def restore_undo_data(
+        self,
+        installation: GameInstallation,
+        state: Mapping[str, object],
+    ) -> Dict[str, object]:
+        try:
+            return self._restore_undo_data(installation, state)
+        except PatchError:
+            raise
+        except (OSError, UnicodeError, ValueError, plistlib.InvalidFileException) as error:
+            raise PatchError(
+                "restore.launcher_prepare",
+                "Restore failed.",
+                "Unable to capture launcher rollback state: {}: {}".format(
+                    type(error).__name__, error
+                ),
+            ) from error
 
     def _app_path(self) -> Path:
         if self.launcher_destination.suffix == ".app":
@@ -1137,6 +1264,23 @@ class LauncherInstaller:
                 "\n".join(failures),
             )
 
+    def _canonical_plist(
+        self,
+        installation: GameInstallation,
+        identity: Mapping[str, str],
+    ) -> Dict[str, object]:
+        with tempfile.TemporaryDirectory(prefix="ostriv-launcher-plist-") as temporary:
+            destination = Path(temporary) / "template"
+            destination.mkdir()
+            self.extractor(self._template(installation), destination)
+            properties = plistlib.loads(
+                (destination / "Contents/Info.plist").read_bytes()
+            )
+        if not isinstance(properties, dict):
+            raise ValueError("Menu Helper template plist is not a dictionary")
+        properties.update(identity)
+        return properties
+
     @staticmethod
     def _swap_snapshots(app: Path, pending: Path, previous: Optional[Path]) -> List[Dict[str, object]]:
         pending_by_relative = {
@@ -1174,7 +1318,7 @@ class LauncherInstaller:
                 "Existing installed launcher changed: {}".format(root),
             )
         inventory = list(expected_inventory)
-        files = _tree_files(root)
+        captured = _captured_tree(root)
 
         def remove() -> None:
             for item in reversed(inventory):
@@ -1193,7 +1337,7 @@ class LauncherInstaller:
             "remove replaced launcher app",
             UndoRecord(
                 "restore_launcher",
-                {"snapshots": [_snapshot(path) for path in files]},
+                {"snapshots": [], "restore_trees": [captured]},
             ),
             remove,
         )
@@ -1286,6 +1430,8 @@ class LauncherInstaller:
                 "CrossOverHelperCommand": command,
                 "CXHelperAppBottleName": installation.bottle.name,
                 "CXHelperAppBottleTag": bottle_tag,
+                "CFBundleExecutable": "Menu Helper",
+                "CFBundleIconFile": "CrossOverHelper.icns",
             }
             icon_source = self._find_game_icon(installation, app)
             if icon_source is None:
@@ -1405,7 +1551,11 @@ class LauncherInstaller:
                 "register launcher menu",
                 UndoRecord(
                     "restore_launcher",
-                    {"snapshots": [], "purge_menu": True},
+                    {
+                        "snapshots": [],
+                        "purge_menu": True,
+                        "recreate_menu": prior is not None,
+                    },
                 ),
                 register_menu,
             )
@@ -1553,6 +1703,8 @@ class LauncherInstaller:
                 "CrossOverHelperCommand": expected_command,
                 "CXHelperAppBottleName": installation.bottle.name,
                 "CXHelperAppBottleTag": expected_tag,
+                "CFBundleExecutable": "Menu Helper",
+                "CFBundleIconFile": "CrossOverHelper.icns",
             }
             identity_failures = []
             if state.get("schema") != 1:
@@ -1576,6 +1728,25 @@ class LauncherInstaller:
                     "install.launcher_verify",
                     "Installation failed.",
                     "\n".join(identity_failures),
+                )
+            actual_plist = plistlib.loads(
+                (app / "Contents/Info.plist").read_bytes()
+            )
+            canonical_plist = self._canonical_plist(
+                installation, expected_identity
+            )
+            if actual_plist != canonical_plist:
+                differing = sorted(
+                    key
+                    for key in set(actual_plist) | set(canonical_plist)
+                    if actual_plist.get(key) != canonical_plist.get(key)
+                )
+                raise PatchError(
+                    "install.launcher_verify",
+                    "Installation failed.",
+                    "Launcher plist is not canonical: {}".format(
+                        ", ".join(differing)
+                    ),
                 )
             self._verify_materialized(
                 installation,
@@ -1679,8 +1850,8 @@ class LauncherInstaller:
         self, installation: GameInstallation, app: Path
     ) -> None:
         """Remove only the entries whose legacy bundle identity proves ownership."""
-        plist_path = app / "Contents/Info.plist"
-        if plist_path.is_symlink() or not plist_path.is_file():
+        plist_path = _regular_file_no_follow(app, Path("Contents/Info.plist"))
+        if plist_path is None:
             return
         try:
             properties = plistlib.loads(plist_path.read_bytes())
@@ -1708,12 +1879,13 @@ class LauncherInstaller:
         ):
             return
         owned_files = (
-            app / "Contents/MacOS/Menu Helper",
-            app / "Contents/Resources/CrossOverHelper.icns",
-            plist_path,
+            Path("Contents/MacOS/Menu Helper"),
+            Path("Contents/Resources/CrossOverHelper.icns"),
+            Path("Contents/Info.plist"),
         )
-        for path in owned_files:
-            if path.is_file() and not path.is_symlink():
+        for relative in owned_files:
+            path = _regular_file_no_follow(app, relative)
+            if path is not None:
                 path.unlink()
         for directory in (
             app / "Contents/MacOS",
@@ -1722,9 +1894,60 @@ class LauncherInstaller:
             app,
         ):
             try:
-                directory.rmdir()
+                mode = directory.lstat().st_mode
+                if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+                    directory.rmdir()
             except OSError:
                 pass
+
+    def _legacy_runtime_owned(
+        self, installation: GameInstallation, path: Path
+    ) -> bool:
+        safe = _regular_file_no_follow(path.parent, Path(path.name))
+        if safe is None:
+            return False
+        try:
+            text = safe.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, UnicodeError, SyntaxError):
+            return False
+        assignments = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id in ("GAME_CMD", "WINE", "BOTTLE"):
+                try:
+                    assignments[target.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    return False
+        wine = str(self._wine(installation))
+        expected_game = [
+            wine,
+            "--bottle",
+            installation.bottle.name,
+            "--check",
+            "--wait-children",
+            "--start",
+            self._windows_game(installation),
+        ]
+        if assignments != {
+            "GAME_CMD": expected_game,
+            "WINE": wine,
+            "BOTTLE": installation.bottle.name,
+        }:
+            return False
+        normalized, count = re.subn(
+            r"^(GAME_CMD|WINE|BOTTLE) = .*?$",
+            lambda match: match.group(1) + " = <dynamic>",
+            text,
+            flags=re.MULTILINE,
+        )
+        return (
+            count == 3
+            and _digest(normalized.encode("utf-8"))
+            in LEGACY_RUNTIME_NORMALIZED_SHA256
+        )
 
     @staticmethod
     def _restore_previous_app(app: Path, previous: Path, inventory: object) -> None:
@@ -1827,15 +2050,9 @@ class LauncherInstaller:
                 elif (
                     path.resolve(strict=False)
                     == installation.bottle.root.resolve() / RUNTIME_NAME
-                    and path.is_file()
-                    and not path.is_symlink()
+                    and self._legacy_runtime_owned(installation, path)
                 ):
-                    try:
-                        owned_runtime = b"Generated by ostriv-macos patch.py" in path.read_bytes()
-                    except OSError:
-                        owned_runtime = False
-                    if owned_runtime:
-                        path.unlink()
+                    path.unlink()
             return
 
         app = Path(str(state.get("app", self._app_path())))

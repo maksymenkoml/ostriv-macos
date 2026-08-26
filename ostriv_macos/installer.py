@@ -2195,6 +2195,50 @@ class Installer:
             paths.append(Path(previous))
         return paths
 
+    def _launcher_restore_undo(
+        self,
+        installation: GameInstallation,
+        launcher_state: Mapping[str, object],
+    ) -> Dict[str, object]:
+        try:
+            restore_undo_data = getattr(self.launcher, "restore_undo_data", None)
+            if callable(restore_undo_data):
+                return {
+                    "snapshots": [],
+                    **restore_undo_data(installation, launcher_state),
+                }
+            return {
+                "snapshots": self._snapshots(self._launcher_paths(launcher_state))
+            }
+        except PatchError:
+            raise
+        except (OSError, UnicodeError, ValueError) as error:
+            raise PatchError(
+                "restore.launcher_prepare",
+                "Restore failed.",
+                "Unable to prepare launcher rollback: {}: {}".format(
+                    type(error).__name__, error
+                ),
+            ) from error
+
+    def _legacy_launcher_restore_undo(
+        self, installation: GameInstallation
+    ) -> Optional[tuple[Dict[str, object], Dict[str, object]]]:
+        legacy_app = self._launcher_app_path()
+        legacy_runtime = installation.bottle.root.resolve() / "play-ostriv-patched.py"
+        if not os.path.lexists(str(legacy_app)) and not os.path.lexists(
+            str(legacy_runtime)
+        ):
+            return None
+        state: Dict[str, object] = {
+            "legacy": True,
+            "artifacts": [
+                {"path": str(legacy_app)},
+                {"path": str(legacy_runtime)},
+            ],
+        }
+        return state, self._launcher_restore_undo(installation, state)
+
     def _verify_restored(
         self, installation: GameInstallation, state: InstallState
     ) -> None:
@@ -2259,25 +2303,28 @@ class Installer:
         transaction.recover_incomplete()
         self._cleanup_completed_journal(transaction)
         state = self._load_state(installation, "restore")
+        launcher_undo = None
+        legacy_launcher_undo = None
+        if state is not None:
+            launcher_undo = self._launcher_restore_undo(
+                installation, state.launcher_artifacts
+            )
+        else:
+            legacy_launcher_undo = self._legacy_launcher_restore_undo(installation)
         transaction = self.transaction_for(installation)
         transaction.start("restore")
         try:
             if state is None:
-                self._restore_legacy(transaction, installation)
+                self._restore_legacy(
+                    transaction, installation, legacy_launcher_undo
+                )
                 transaction.journal.commit()
                 self._cleanup_completed_journal(transaction)
                 return
 
-            launcher_paths = self._launcher_paths(state.launcher_artifacts)
-            launcher_undo = {"snapshots": self._snapshots(launcher_paths)}
-            restore_undo_data = getattr(self.launcher, "restore_undo_data", None)
-            if callable(restore_undo_data):
-                launcher_undo.update(
-                    restore_undo_data(installation, state.launcher_artifacts)
-                )
             transaction.step(
                 "restore launcher",
-                UndoRecord("restore_launcher", launcher_undo),
+                UndoRecord("restore_launcher", launcher_undo or {}),
                 lambda: self.launcher.restore(installation, state.launcher_artifacts),
             )
             handled = set()
@@ -2366,7 +2413,10 @@ class Installer:
         transaction.step(name, UndoRecord(kind, {"snapshots": self._snapshots(paths)}), action)
 
     def _restore_legacy(
-        self, transaction: Transaction, installation: GameInstallation
+        self,
+        transaction: Transaction,
+        installation: GameInstallation,
+        launcher_undo: Optional[tuple[Dict[str, object], Dict[str, object]]] = None,
     ) -> None:
         game_dir = installation.game_dir.resolve()
         for name in DRIVER_NAMES:
@@ -2470,27 +2520,11 @@ class Installer:
                     settings.unlink,
                     "restore_settings",
                 )
-        legacy_app = self.launcher_destination
-        if legacy_app.suffix != ".app":
-            legacy_app = legacy_app / "Ostriv (patched).app"
-        legacy_runtime = installation.bottle.root.resolve() / "play-ostriv-patched.py"
-        if legacy_app.exists() or legacy_runtime.exists():
-            legacy_state = {
-                "legacy": True,
-                "artifacts": [
-                    {"path": str(legacy_app)},
-                    {"path": str(legacy_runtime)},
-                ],
-            }
-            launcher_undo = {
-                "snapshots": self._snapshots([legacy_app, legacy_runtime])
-            }
-            restore_undo_data = getattr(self.launcher, "restore_undo_data", None)
-            if callable(restore_undo_data):
-                launcher_undo.update(restore_undo_data(installation, legacy_state))
+        if launcher_undo is not None:
+            legacy_state, undo_data = launcher_undo
             transaction.step(
                 "restore legacy launcher",
-                UndoRecord("restore_launcher", launcher_undo),
+                UndoRecord("restore_launcher", undo_data),
                 lambda: self.launcher.restore(installation, legacy_state),
             )
 

@@ -93,11 +93,15 @@ class FakeRunner:
         self.calls = []
         self.cxmenu_returncode = 0
         self.cxmenu_purge_returncode = 0
+        self.cxmenu_failures = 0
 
     def run(self, argv, timeout=None):
         argv = list(argv)
         self.calls.append((argv, timeout))
         if Path(argv[0]).name == "cxmenu":
+            if "--create" in argv and self.cxmenu_failures:
+                self.cxmenu_failures -= 1
+                return CommandResult(7, "", "cxmenu failed once")
             returncode = (
                 self.cxmenu_purge_returncode
                 if "--purge" in argv
@@ -428,6 +432,115 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertFalse(
             production.transaction_for(fixture.installation).journal.data["complete"]
         )
+
+    def test_recovery_validates_entire_captured_tree_before_touching_current_app(self):
+        """Corrupt rich-tree entries must not escape root or delete the installed tree first."""
+        for label in (
+            "traversal",
+            "absolute",
+            "duplicate",
+            "symlink-parent",
+            "file-parent",
+            "symlink-metadata",
+            "unknown-type",
+        ):
+            with self.subTest(case=label):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                state = fixture.installer.install(
+                    fixture.transaction, fixture.installation
+                )
+                fixture.transaction.journal.commit()
+                captured = launcher_module._captured_tree(
+                    fixture.installer._app_path()
+                )
+                victim = fixture.installer._app_path().parent / "outside-victim"
+                victim.write_text("keep", encoding="utf-8")
+                additions = {
+                    "traversal": [
+                        {"relative_path": "../outside-victim", "type": "file"}
+                    ],
+                    "absolute": [
+                        {"relative_path": str(victim), "type": "file"}
+                    ],
+                    "symlink-parent": [
+                        {
+                            "relative_path": "redirect",
+                            "type": "symlink",
+                            "target": "../outside-victim",
+                        },
+                        {"relative_path": "redirect/child", "type": "file"},
+                    ],
+                    "file-parent": [
+                        {"relative_path": "collision", "type": "file"},
+                        {"relative_path": "collision/child", "type": "file"},
+                    ],
+                    "symlink-metadata": [
+                        {"relative_path": "missing-target", "type": "symlink"}
+                    ],
+                    "unknown-type": [
+                        {"relative_path": "device", "type": "device"}
+                    ],
+                }.get(label, [])
+                if label == "duplicate":
+                    captured["entries"].append(dict(captured["entries"][0]))
+                else:
+                    for addition in additions:
+                        item = dict(addition)
+                        if item["type"] == "file":
+                            item.update(
+                                {
+                                    "content": base64.b64encode(b"corrupt").decode(
+                                        "ascii"
+                                    ),
+                                    "sha256": digest(b"corrupt"),
+                                    "mode": 0o644,
+                                }
+                            )
+                        captured["entries"].append(item)
+                before = {
+                    path.relative_to(fixture.app).as_posix(): path.read_bytes()
+                    for path in fixture.app.rglob("*")
+                    if path.is_file()
+                }
+                production = Installer(
+                    fixture.release,
+                    fixture.installer,
+                    launcher_destination=fixture.destination,
+                )
+                transaction = production.transaction_for(fixture.installation)
+                transaction.start("restore")
+                transaction.journal.begin(
+                    "corrupt restore tree",
+                    UndoRecord(
+                        "restore_launcher",
+                        {
+                            "snapshots": [],
+                            "restore_trees": [captured],
+                        },
+                    ),
+                )
+
+                with self.assertRaises(PatchError) as caught:
+                    production.transaction_for(
+                        fixture.installation
+                    ).recover_incomplete()
+
+                self.assertEqual("install.rollback_failed", caught.exception.code)
+                self.assertEqual("keep", victim.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    before,
+                    {
+                        path.relative_to(fixture.app).as_posix(): path.read_bytes()
+                        for path in fixture.app.rglob("*")
+                        if path.is_file()
+                    },
+                )
+                self.assertFalse(
+                    production.transaction_for(fixture.installation).journal.data[
+                        "complete"
+                    ]
+                )
 
     def test_recovery_purge_failure_is_typed_and_keeps_journal(self):
         """Silently accepting cxmenu failure makes interrupted registration unrecoverable."""
@@ -823,6 +936,49 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertEqual("install.launcher_verify", caught.exception.code)
         self.assertIn("CrossOverHelperCommand", caught.exception.detail)
 
+    def test_reinstall_rejects_paired_unlisted_plist_tampering_before_mutation(self):
+        """A rewritten state digest cannot authorize launch-critical template fields."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        state = dict(fixture.installer.install(fixture.transaction, fixture.installation))
+        fixture.transaction.journal.commit()
+        plist_path = fixture.app / "Contents/Info.plist"
+        properties = plistlib.loads(plist_path.read_bytes())
+        properties["CFBundleExecutable"] = "Foreign Helper"
+        properties["CFBundleIconFile"] = "Foreign.icns"
+        plist_path.write_bytes(plistlib.dumps(properties))
+        state["plist_sha256"] = digest(plist_path.read_bytes())
+        (fixture.bottle_root / "ostriv-macos-state.json").write_text(
+            json.dumps({"launcher_artifacts": state}), encoding="utf-8"
+        )
+        before = {
+            path.relative_to(fixture.app).as_posix(): path.read_bytes()
+            for path in fixture.app.rglob("*")
+            if path.is_file()
+        }
+        journal = InstallJournal(fixture.bottle_root / "paired-plist-reinstall.json")
+        transaction = Transaction(
+            journal, {"restore_launcher": fixture._restore_snapshots}
+        )
+        transaction.start("reinstall")
+        calls_before = list(fixture.runner.calls)
+
+        with self.assertRaises(PatchError) as caught:
+            fixture.installer.install(transaction, fixture.installation)
+
+        self.assertEqual("install.launcher_verify", caught.exception.code)
+        self.assertIn("CFBundleExecutable", caught.exception.detail)
+        self.assertEqual([], transaction.journal.data["records"])
+        self.assertEqual(calls_before, fixture.runner.calls)
+        self.assertEqual(
+            before,
+            {
+                path.relative_to(fixture.app).as_posix(): path.read_bytes()
+                for path in fixture.app.rglob("*")
+                if path.is_file()
+            },
+        )
+
     def test_new_launcher_verifies_before_legacy_is_removed(self):
         """A failed pending app must not destroy the working legacy launcher."""
         fixture = LauncherFixture()
@@ -969,6 +1125,69 @@ class LauncherInstallerTests(unittest.TestCase):
             (fixture.app / "Contents/MacOS/Menu Helper").read_bytes(),
         )
 
+    def test_restore_preparation_capture_errors_are_typed_without_mutation(self):
+        """Undo capture happens before the action wrapper and must never leak raw OSError."""
+        for helper_name in ("_captured_tree", "_snapshot"):
+            with self.subTest(helper=helper_name):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                state = fixture.installer.install(
+                    fixture.transaction, fixture.installation
+                )
+                before_app = {
+                    path.relative_to(fixture.app).as_posix(): path.read_bytes()
+                    for path in fixture.app.rglob("*")
+                    if path.is_file()
+                }
+                before_runtime = fixture.runtime.read_bytes()
+                calls_before = list(fixture.runner.calls)
+
+                with patch.object(
+                    launcher_module,
+                    helper_name,
+                    side_effect=OSError("injected undo capture failure"),
+                ):
+                    with self.assertRaises(PatchError) as caught:
+                        fixture.installer.restore_undo_data(
+                            fixture.installation, state
+                        )
+
+                self.assertEqual("restore.launcher_prepare", caught.exception.code)
+                self.assertEqual(calls_before, fixture.runner.calls)
+                self.assertEqual(before_runtime, fixture.runtime.read_bytes())
+                self.assertEqual(
+                    before_app,
+                    {
+                        path.relative_to(fixture.app).as_posix(): path.read_bytes()
+                        for path in fixture.app.rglob("*")
+                        if path.is_file()
+                    },
+                )
+
+    def test_production_restore_preparation_failure_starts_no_journal(self):
+        """The production boundary must finish launcher capture before transaction.start."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        production = Installer(
+            fixture.release,
+            fixture.installer,
+            launcher_destination=fixture.destination,
+        )
+        journal_path = production.journal_path(fixture.installation)
+        self.assertFalse(journal_path.exists())
+
+        with patch.object(
+            launcher_module,
+            "_captured_tree",
+            side_effect=OSError("injected production capture failure"),
+        ):
+            with self.assertRaises(PatchError) as caught:
+                production._launcher_restore_undo(fixture.installation, state)
+
+        self.assertEqual("restore.launcher_prepare", caught.exception.code)
+        self.assertFalse(journal_path.exists())
+
     def test_reinstall_preserves_the_original_legacy_restore_target(self):
         """Backing up the first hardened app on reinstall loses the genuine legacy launcher."""
         fixture = LauncherFixture()
@@ -990,6 +1209,52 @@ class LauncherInstallerTests(unittest.TestCase):
 
         self.assertEqual(b"legacy executable", (fixture.app / "Contents/MacOS/Menu Helper").read_bytes())
         self.assertIn(b"Generated by ostriv-macos patch.py", fixture.runtime.read_bytes())
+
+    def test_reinstall_failure_after_rich_replaced_tree_removal_restores_exactly(self):
+        """File-only removal undo loses owned empty directories and symlink types."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        base_extractor = fixture.extractor
+
+        def rich_extractor(template, destination):
+            base_extractor(template, destination)
+            empty = destination / "Contents/Resources/owned-empty"
+            empty.mkdir()
+            empty.chmod(0o711)
+            (destination / "Contents/Resources/owned-link").symlink_to(
+                "missing-owned-target"
+            )
+
+        fixture.installer.extractor = rich_extractor
+        first = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.transaction.journal.commit()
+        state_path = fixture.bottle_root / "ostriv-macos-state.json"
+        state_bytes = json.dumps({"launcher_artifacts": dict(first)}).encode("utf-8")
+        state_path.write_bytes(state_bytes)
+        before = launcher_module._captured_tree(fixture.installer._app_path())
+        second_journal = InstallJournal(fixture.bottle_root / "rich-reinstall.json")
+        second_transaction = Transaction(
+            second_journal, {"restore_launcher": fixture._restore_snapshots}
+        )
+        second_transaction.start("reinstall")
+        fixture.runner.cxmenu_failures = 1
+
+        with self.assertRaises(PatchError) as caught:
+            fixture.installer.install(
+                second_transaction, fixture.installation
+            )
+
+        self.assertEqual("install.launcher_menu", caught.exception.code)
+        self.assertEqual(
+            before, launcher_module._captured_tree(fixture.installer._app_path())
+        )
+        self.assertEqual(state_bytes, state_path.read_bytes())
+        self.assertIn("--create", fixture.runner.calls[-1][0])
+        self.assertFalse(
+            fixture.app.with_name(
+                "." + fixture.app.name + ".ostriv-macos.replaced"
+            ).exists()
+        )
 
     def test_restore_removes_only_owned_inventory_and_leaves_unknown_files(self):
         """Recursive launcher cleanup can erase user files that were never installed by us."""
@@ -1041,7 +1306,7 @@ class LauncherInstallerTests(unittest.TestCase):
             ["--purge", "--filter", "StartMenu/Ostriv (patched)"], purge[-3:]
         )
         self.assertFalse(fixture.app.exists())
-        self.assertFalse(fixture.runtime.exists())
+        self.assertTrue(fixture.runtime.exists())
 
     def test_legacy_restore_removes_known_entries_but_preserves_unknown_files_and_symlinks(self):
         """Recursive legacy cleanup erases user data and follows ownership beyond known entries."""
@@ -1072,6 +1337,63 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertFalse((fixture.app / "Contents/Info.plist").exists())
         self.assertFalse((fixture.app / "Contents/MacOS/Menu Helper").exists())
         self.assertTrue(fixture.app.exists())
+
+    def test_legacy_restore_never_follows_symlinked_bundle_parents(self):
+        """Leaf checks are unsafe when Contents or a nested parent redirects externally."""
+        for parent_name in ("Contents", "Contents/Resources"):
+            with self.subTest(parent=parent_name):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                fixture.create_legacy_launcher()
+                external = fixture.root / "external bundle victim"
+                if parent_name == "Contents":
+                    shutil.copytree(fixture.app / "Contents", external)
+                    shutil.rmtree(fixture.app / "Contents")
+                    (fixture.app / "Contents").symlink_to(
+                        external, target_is_directory=True
+                    )
+                    victim = external / "Info.plist"
+                else:
+                    external.mkdir()
+                    victim = external / "CrossOverHelper.icns"
+                    victim.write_bytes(b"external-icon")
+                    (fixture.app / "Contents/Resources").symlink_to(
+                        external, target_is_directory=True
+                    )
+                before = victim.read_bytes()
+                state = {
+                    "legacy": True,
+                    "artifacts": [
+                        {"path": str(fixture.app)},
+                        {"path": str(fixture.runtime)},
+                    ],
+                }
+
+                fixture.installer.restore(fixture.installation, state)
+
+                self.assertEqual(before, victim.read_bytes())
+                self.assertTrue(
+                    (fixture.app / parent_name).is_symlink(), parent_name
+                )
+
+    def test_legacy_restore_preserves_modified_runtime_containing_old_marker(self):
+        """A marker substring cannot authenticate arbitrary or user-modified Python code."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        fixture.create_legacy_launcher()
+        modified = fixture.runtime.read_bytes() + b"print('unrelated modification')\n"
+        fixture.runtime.write_bytes(modified)
+        state = {
+            "legacy": True,
+            "artifacts": [
+                {"path": str(fixture.app)},
+                {"path": str(fixture.runtime)},
+            ],
+        }
+
+        fixture.installer.restore(fixture.installation, state)
+
+        self.assertEqual(modified, fixture.runtime.read_bytes())
 
     def test_installed_runtime_has_no_project_import_and_survives_source_move(self):
         """Importing package code from the release directory makes the installed app non-standalone."""
