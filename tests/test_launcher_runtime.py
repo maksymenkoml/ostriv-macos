@@ -174,6 +174,38 @@ class SteamControllerTests(unittest.TestCase):
         self.assertEqual([], opened)
         self.assertEqual(2.0, clock.now)
 
+    def test_retry_mode_requires_30_continuous_ready_seconds_without_warm_shortcut(self):
+        """Reusing warm readiness would retry after two seconds instead of a stable window."""
+        clock = FakeClock()
+        controller = SteamController(
+            probe=lambda: SteamSignals(True, True, True),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        controller.ensure_ready(retry=True)
+
+        self.assertEqual(30.0, clock.now)
+
+    def test_retry_mode_resets_30_second_timer_after_signal_drop(self):
+        """Counting ready time across a drop would retry against a transitioning client."""
+        clock = FakeClock()
+
+        def probe():
+            if clock.now == 10.0:
+                return SteamSignals(True, True, False)
+            return SteamSignals(True, True, True)
+
+        controller = SteamController(
+            probe=probe,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        controller.ensure_ready(retry=True)
+
+        self.assertEqual(42.0, clock.now)
+
     def test_starting_or_logged_out_client_is_not_opened_again(self):
         """Opening Steam while its process exists would create duplicate startup attempts."""
         for first in (
@@ -197,6 +229,51 @@ class SteamControllerTests(unittest.TestCase):
 
                 self.assertEqual([], opened)
                 self.assertEqual([True], notified)
+
+    def test_warm_client_disappearance_on_second_probe_opens_once(self):
+        """Checking absence only on the first probe would strand a disappearing warm client."""
+        clock = FakeClock()
+        opened = []
+        notified = []
+        signals = [
+            SteamSignals(True, True, True),
+            SteamSignals(False, False, False),
+        ] + [SteamSignals(True, True, True)] * 9
+        controller = SteamController(
+            probe=lambda: signals.pop(0),
+            open_steam=lambda: opened.append(clock.now),
+            notify=lambda: notified.append(clock.now),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        controller.ensure_ready()
+
+        self.assertEqual([2.0], opened)
+        self.assertEqual([2.0], notified)
+
+    def test_starting_client_that_disappears_later_opens_only_once(self):
+        """A later process loss must consume the one allowed open without repeated starts."""
+        clock = FakeClock()
+        opened = []
+        notified = []
+        signals = [
+            SteamSignals(True, False, False),
+            SteamSignals(False, False, False),
+            SteamSignals(False, False, False),
+        ] + [SteamSignals(True, True, True)] * 9
+        controller = SteamController(
+            probe=lambda: signals.pop(0),
+            open_steam=lambda: opened.append(clock.now),
+            notify=lambda: notified.append(clock.now),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        controller.ensure_ready()
+
+        self.assertEqual([2.0], opened)
+        self.assertEqual([0.0], notified)
 
     def test_timeout_notifies_once_and_does_not_open_logged_out_client(self):
         """A stalled login must neither spam notifications nor launch another Steam."""
@@ -241,6 +318,41 @@ class SteamControllerTests(unittest.TestCase):
         self.assertEqual([True], opened)
         self.assertEqual([True], notified)
         self.assertEqual(8.0, clock.now)
+
+    def test_non_divisible_timeout_caps_last_sleep_at_absolute_deadline(self):
+        """Sleeping a full poll interval would overrun a five-second readiness deadline."""
+        clock = FakeClock()
+        controller = SteamController(
+            probe=lambda: SteamSignals(True, False, True),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_seconds=2.0,
+        )
+
+        with self.assertRaises(LauncherRuntimeError):
+            controller.ensure_ready(timeout_seconds=5.0)
+
+        self.assertEqual(5.0, clock.now)
+
+    def test_slow_probe_cannot_return_ready_after_deadline(self):
+        """Readiness observed only after a slow probe crosses the deadline must be rejected."""
+        clock = FakeClock()
+
+        def slow_ready_probe():
+            clock.now += 3.0
+            return SteamSignals(True, True, True)
+
+        controller = SteamController(
+            probe=slow_ready_probe,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_seconds=1.0,
+        )
+
+        with self.assertRaises(LauncherRuntimeError):
+            controller.ensure_ready(timeout_seconds=5.0)
+
+        self.assertEqual(7.0, clock.now)
 
     def test_absent_client_opens_matching_crossover_steam_app_once(self):
         """Using a bare Wine child or opening twice would recreate Steam's broken half-state."""
@@ -306,6 +418,50 @@ class ProcessLockTests(unittest.TestCase):
             lock.close()
 
             self.assertTrue(path.exists())
+
+    def test_unexpected_flock_error_closes_local_descriptor(self):
+        """An unexpected flock failure must not leak the just-opened descriptor."""
+        with TemporaryDirectory() as directory:
+            lock = ProcessLock(Path(directory) / "launcher.lock")
+            closed = []
+            with patch.object(runtime.os, "open", return_value=71), patch.object(
+                runtime.fcntl, "flock", side_effect=OSError("flock failed")
+            ), patch.object(runtime.os, "close", side_effect=closed.append):
+                with self.assertRaisesRegex(OSError, "flock failed"):
+                    lock.acquire()
+
+            self.assertEqual([71], closed)
+            self.assertIsNone(lock.fd)
+
+    def test_repeat_acquire_is_idempotent_without_opening_another_descriptor(self):
+        """A repeat acquire must not overwrite and leak the held lock descriptor."""
+        with TemporaryDirectory() as directory:
+            lock = ProcessLock(Path(directory) / "launcher.lock")
+            opened = []
+            flocked = []
+            closed = []
+
+            def open_once(*_args):
+                if opened:
+                    raise AssertionError("repeat acquire opened another descriptor")
+                opened.append(72)
+                return 72
+
+            def flock_once(descriptor, _flags):
+                if flocked:
+                    raise AssertionError("repeat acquire called flock again")
+                flocked.append(descriptor)
+
+            with patch.object(runtime.os, "open", side_effect=open_once), patch.object(
+                runtime.fcntl, "flock", side_effect=flock_once
+            ), patch.object(runtime.os, "close", side_effect=closed.append):
+                self.assertTrue(lock.acquire())
+                self.assertTrue(lock.acquire())
+                lock.close()
+
+            self.assertEqual([72], opened)
+            self.assertEqual([72], flocked)
+            self.assertEqual([72], closed)
 
 
 class LaunchLogTests(unittest.TestCase):
@@ -374,8 +530,8 @@ class FakeSteam:
         self.events = events
         self.failure = failure
 
-    def ensure_ready(self, timeout_seconds=None):
-        self.events.append(("steam", timeout_seconds))
+    def ensure_ready(self, timeout_seconds=None, retry=False):
+        self.events.append(("steam", timeout_seconds, retry))
         if self.failure is not None:
             raise self.failure
 
@@ -456,7 +612,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     "lock",
                     "log",
                     "recover",
-                    ("steam", None),
+                    ("steam", None, False),
                     "handlers",
                     "switch",
                     ("launch", 1, config.game_command),
@@ -491,7 +647,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     "lock",
                     "log",
                     "recover",
-                    ("steam", None),
+                    ("steam", None, False),
                     "diagnostic",
                     "restore",
                     ("final", "failed"),
@@ -526,7 +682,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
             self.assertEqual(0, code)
             self.assertEqual(2, runner.calls)
             self.assertEqual(
-                [("steam", None), ("steam", 30.0)],
+                [("steam", None, False), ("steam", None, True)],
                 [event for event in events if isinstance(event, tuple) and event[0] == "steam"],
             )
             self.assertIn(("final", "other"), events)
@@ -580,8 +736,136 @@ class LauncherOrchestrationTests(unittest.TestCase):
             self.assertEqual(1, events.count("restore"))
             self.assertEqual("unlock", events[-1])
 
+    def test_final_state_logging_base_exception_cannot_skip_unlock(self):
+        """A logger BaseException after restoration must still release the process lock."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            events = []
+            runner = FakeGameRunner(events, config.game_log, [b"normal exit\n"])
+
+            class ExplodingLogger(FakeLogger):
+                def info(self, message, *args):
+                    if message == "launcher final state: %s":
+                        events.append("final-log")
+                        raise KeyboardInterrupt()
+
+            with self.assertRaises(KeyboardInterrupt):
+                run_launcher(
+                    config,
+                    lock=FakeLock(events),
+                    log_factory=lambda _path: ExplodingLogger(events),
+                    runner=runner,
+                    steam=FakeSteam(events),
+                    profile=FakeProfile(events),
+                    dialog=lambda _message: self.fail("unexpected dialog"),
+                    install_handlers=lambda _profile: None,
+                )
+
+            self.assertEqual(1, events.count("restore"))
+            self.assertEqual("unlock", events[-1])
+
 
 class LauncherMainTests(unittest.TestCase):
+    def assert_bootstrap_failure_is_generic(self, argv):
+        dialogs = []
+        with patch.object(runtime, "_display_dialog", side_effect=dialogs.append), patch.object(
+            runtime,
+            "_create_launcher_log",
+            side_effect=lambda _path: self.fail("bootstrap failure created launcher log"),
+        ), patch.object(
+            runtime,
+            "ExternalProcessRunner",
+            side_effect=lambda: self.fail("bootstrap failure constructed process adapter"),
+        ), patch.object(
+            runtime,
+            "ColorSyncProfileBackend",
+            side_effect=lambda: self.fail("bootstrap failure constructed profile adapter"),
+        ):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = main(argv)
+
+        self.assertNotEqual(0, code)
+        self.assertEqual(["Unable to start Ostriv."], dialogs)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
+    def test_wrong_argument_count_shows_one_generic_fallback_dialog(self):
+        """A wrapper invocation mistake must not fail silently or reveal diagnostics."""
+        self.assert_bootstrap_failure_is_generic([])
+
+    def test_missing_config_shows_one_generic_fallback_dialog(self):
+        """A missing configuration cannot supply copy, so main must use the safe fallback."""
+        with TemporaryDirectory() as directory:
+            self.assert_bootstrap_failure_is_generic(
+                [str(Path(directory) / "missing.json")]
+            )
+
+    def test_malformed_config_shows_one_generic_fallback_dialog(self):
+        """Malformed JSON must not fail silently or expose its parser diagnostic."""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "launcher.json"
+            path.write_text("not json", encoding="utf-8")
+            self.assert_bootstrap_failure_is_generic([str(path)])
+
+    def test_invalid_schema_and_types_show_one_generic_fallback_dialog(self):
+        """Invalid configuration data must use one generic message before adapters exist."""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "launcher.json"
+            valid = make_config(directory).__dict__
+            for payload in (
+                {**valid, "schema": 2},
+                {**valid, "launcher_log": 7},
+            ):
+                with self.subTest(payload=payload):
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    self.assert_bootstrap_failure_is_generic([str(path)])
+
+    def test_default_contention_dialog_does_not_construct_runtime_adapters(self):
+        """The one contention dialog must not instantiate the normal process/runtime stack."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            config.messages["already_running"] = "Ostriv is already starting or running."
+            config_path = Path(directory) / "launcher.json"
+            write_config(config, config_path)
+            events = []
+            dialogs = []
+
+            def show_dialog(argv, **_kwargs):
+                dialogs.append(list(argv)[-1])
+                return FakeResult(0)
+
+            with patch.object(
+                runtime, "ProcessLock", side_effect=lambda _path: FakeLock(events, False)
+            ), patch.object(
+                runtime,
+                "_create_launcher_log",
+                side_effect=lambda _path: self.fail("contention created the launcher log"),
+            ), patch.object(
+                runtime,
+                "ExternalProcessRunner",
+                side_effect=lambda: self.fail("contention constructed process adapter"),
+            ), patch.object(
+                runtime,
+                "ColorSyncProfileBackend",
+                side_effect=lambda: self.fail("contention constructed profile adapter"),
+            ), patch.object(
+                runtime,
+                "SteamController",
+                side_effect=lambda **_kwargs: self.fail("contention constructed Steam"),
+            ), patch("subprocess.run", side_effect=show_dialog):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = main([str(config_path)])
+
+            self.assertEqual(0, code)
+            self.assertEqual(["lock"], events)
+            self.assertEqual(["Ostriv is already starting or running."], dialogs)
+            self.assertEqual("", stdout.getvalue())
+            self.assertEqual("", stderr.getvalue())
+
     def test_main_creates_log_before_lazy_platform_adapters(self):
         """Constructing a failing macOS/process adapter first would lose its diagnostics."""
         with TemporaryDirectory() as directory:

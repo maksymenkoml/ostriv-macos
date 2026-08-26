@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 
 SRGB_PROFILE = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+FALLBACK_ERROR_MESSAGE = "Unable to start Ostriv."
 
 
 class LauncherRuntimeError(RuntimeError):
@@ -41,19 +42,24 @@ class ProcessLock:
         self.fd = None
 
     def acquire(self) -> bool:
+        if self.fd is not None:
+            return True
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = os.open(
+        descriptor = os.open(
             str(self.path),
             os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
             0o600,
         )
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(self.fd)
-            self.fd = None
+            os.close(descriptor)
             return False
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self.fd = descriptor
+        return True
 
     def close(self) -> None:
         if self.fd is not None:
@@ -130,6 +136,8 @@ class ExternalProcessRunner:
 
 
 def _display_dialog(message: str) -> None:
+    import subprocess
+
     script = (
         "on run argv\n"
         'display dialog (item 1 of argv) with title "Ostriv for macOS" '
@@ -137,8 +145,11 @@ def _display_dialog(message: str) -> None:
         "end run"
     )
     try:
-        ExternalProcessRunner().run(
-            ["osascript", "-e", script, message], timeout=30.0
+        subprocess.run(
+            ["osascript", "-e", script, message],
+            capture_output=True,
+            check=False,
+            timeout=30.0,
         )
     except Exception:
         pass
@@ -266,40 +277,67 @@ class SteamController:
         ).returncode == 0
         return SteamSignals(process, active_user, renderer)
 
-    def ensure_ready(self, timeout_seconds: Optional[float] = None) -> None:
-        started_at = self.monotonic()
+    def ensure_ready(
+        self, timeout_seconds: Optional[float] = None, retry: bool = False
+    ) -> None:
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        deadline = self.monotonic() + timeout
+        stable_seconds = 30.0 if retry else self.transition_stable_seconds
+
+        def timeout_failure(signals: SteamSignals) -> LauncherRuntimeError:
+            message_key = (
+                "steam_login"
+                if signals.process and not signals.active_user
+                else "steam_timeout"
+            )
+            return LauncherRuntimeError(message_key, "Steam did not become ready")
+
+        def check_deadline(signals: SteamSignals) -> float:
+            now = self.monotonic()
+            if now >= deadline:
+                raise timeout_failure(signals)
+            return now
+
+        def open_if_absent(signals: SteamSignals) -> None:
+            if not signals.process and not self._opened:
+                self.open_steam()
+                self._opened = True
+
         signals = self.probe()
-        if signals.ready:
-            self.sleep(self.poll_seconds)
+        now = check_deadline(signals)
+        open_if_absent(signals)
+        now = check_deadline(signals)
+        if signals.ready and not retry:
+            self.sleep(min(self.poll_seconds, deadline - now))
+            check_deadline(signals)
             signals = self.probe()
+            now = check_deadline(signals)
+            open_if_absent(signals)
+            now = check_deadline(signals)
             if signals.ready:
                 return
-        elif not signals.process and not self._opened:
-            self.open_steam()
-            self._opened = True
 
         if not self._notified:
             self.notify()
             self._notified = True
-        ready_since = self.monotonic() if signals.ready else None
-        while self.monotonic() - started_at < timeout:
-            self.sleep(self.poll_seconds)
+        ready_since = now if signals.ready else None
+        while True:
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise timeout_failure(signals)
+            self.sleep(min(self.poll_seconds, remaining))
+            check_deadline(signals)
             signals = self.probe()
-            now = self.monotonic()
+            now = check_deadline(signals)
+            open_if_absent(signals)
+            now = check_deadline(signals)
             if signals.ready:
                 if ready_since is None:
                     ready_since = now
-                if now - ready_since >= self.transition_stable_seconds:
+                if now - ready_since >= stable_seconds:
                     return
             else:
                 ready_since = None
-        message_key = (
-            "steam_login"
-            if signals.process and not signals.active_user
-            else "steam_timeout"
-        )
-        raise LauncherRuntimeError(message_key, "Steam did not become ready")
 
 
 def atomic_json(path: Path, data: Dict[str, Any]) -> None:
@@ -629,7 +667,7 @@ def run_launcher(
         run_game(config, actual_runner)
         final_state = classify_launch(read_new_log(game_log, offset))
         if final_state == "steam_api":
-            actual_steam.ensure_ready(timeout_seconds=30.0)
+            actual_steam.ensure_ready(retry=True)
             offset = _log_offset(game_log)
             run_game(config, actual_runner)
             final_state = classify_launch(read_new_log(game_log, offset))
@@ -640,16 +678,18 @@ def run_launcher(
         raise
     finally:
         try:
-            if actual_profile is not None:
-                actual_profile.restore_once()
-        except Exception:
-            final_state = "failed"
-            if logger is not None:
-                logger.exception("display profile restoration failed")
-            raise
+            try:
+                if actual_profile is not None:
+                    actual_profile.restore_once()
+            except Exception:
+                final_state = "failed"
+                if logger is not None:
+                    logger.exception("display profile restoration failed")
+                raise
+            finally:
+                if logger is not None:
+                    logger.info("launcher final state: %s", final_state)
         finally:
-            if logger is not None:
-                logger.info("launcher final state: %s", final_state)
             actual_lock.close()
 
 
@@ -671,10 +711,12 @@ def _record_entrypoint_failure(path: Path, error: Exception) -> None:
 def main(argv=None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if len(arguments) != 1:
+        _display_dialog(FALLBACK_ERROR_MESSAGE)
         return 2
     try:
         config = LauncherConfig.load(Path(arguments[0]))
     except Exception:
+        _display_dialog(FALLBACK_ERROR_MESSAGE)
         return 2
 
     try:
@@ -684,7 +726,7 @@ def main(argv=None) -> int:
         message_key = getattr(error, "message_key", "error")
         message = config.messages.get(
             message_key,
-            config.messages.get("error", "Unable to start Ostriv."),
+            config.messages.get("error", FALLBACK_ERROR_MESSAGE),
         )
         _display_dialog(message)
         return 1
