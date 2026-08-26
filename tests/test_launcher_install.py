@@ -6,6 +6,7 @@ import json
 import os
 import plistlib
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -299,6 +300,65 @@ class LauncherInstallerTests(unittest.TestCase):
                 self.assertEqual("install.launcher_ownership", caught.exception.code)
                 self.assertTrue(reserved.is_symlink())
                 self.assertEqual("keep", marker.read_text(encoding="utf-8"))
+
+    def test_runtime_and_config_symlinks_survive_late_menu_failure_lexically(self):
+        """Rollback must not follow or replace runtime/config symlink leaves."""
+        for leaf_name in ("runtime", "config"):
+            with self.subTest(leaf=leaf_name):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                leaf = getattr(fixture, leaf_name)
+                victim = fixture.root / (leaf_name + "-outside")
+                victim.write_bytes((leaf_name + "-victim").encode("ascii"))
+                before = victim.read_bytes()
+                leaf.symlink_to(victim)
+                fixture.runner.cxmenu_returncode = 7
+
+                with self.assertRaises(PatchError) as caught:
+                    fixture.installer.install(
+                        fixture.transaction, fixture.installation
+                    )
+
+                self.assertEqual("install.launcher_ownership", caught.exception.code)
+                self.assertTrue(leaf.is_symlink())
+                self.assertEqual(victim.resolve(), leaf.resolve())
+                self.assertEqual(before, victim.read_bytes())
+                self.assertFalse(
+                    leaf.with_name("." + leaf.name + ".pending").exists()
+                )
+                self.assertEqual([], fixture.runner.calls)
+
+    def test_runtime_and_config_pending_symlink_leaves_are_reserved(self):
+        """Dangling pending aliases must be rejected with lstat before staging."""
+        for destination_name in ("runtime", "config"):
+            with self.subTest(leaf=destination_name):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                destination = getattr(fixture, destination_name)
+                pending = destination.with_name("." + destination.name + ".pending")
+                pending.symlink_to(fixture.root / "missing-external-target")
+
+                with self.assertRaises(PatchError) as caught:
+                    fixture.installer.preflight(fixture.installation)
+
+                self.assertEqual("install.launcher_ownership", caught.exception.code)
+                self.assertTrue(pending.is_symlink())
+
+    def test_preexisting_unowned_recovery_leaves_are_rejected_unchanged(self):
+        """Install must not adopt or delete an unrecorded marker or lock."""
+        for name in (".ostriv-launcher.lock", ".ostriv-profile-recovery.json"):
+            with self.subTest(name=name):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                path = fixture.bottle_root / name
+                path.write_bytes(b"unowned recovery data")
+
+                with self.assertRaises(PatchError) as caught:
+                    fixture.installer.preflight(fixture.installation)
+
+                self.assertEqual("install.launcher_ownership", caught.exception.code)
+                self.assertEqual(b"unowned recovery data", path.read_bytes())
+                self.assertEqual([], fixture.runner.calls)
 
     def test_production_transaction_recovers_owned_pending_tree_after_restart(self):
         """A killed extraction must be recoverable before launcher.install can bind handlers."""
@@ -919,6 +979,9 @@ class LauncherInstallerTests(unittest.TestCase):
                 "bottle_name",
                 "bottle_argument",
                 "scope",
+                "bottle_realpath",
+                "bottle_tag",
+                "profile_owner_token",
                 "wine",
                 "game_command",
                 "steam_apps_root",
@@ -1061,6 +1124,71 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual(Path("missing-target"), link.readlink())
         self.assertFalse(Path(state["previous_app"]).exists())
+
+    def test_restore_recreates_restrictive_previous_directory_modes_deepest_first(self):
+        """Recorded 0555 parents cannot be applied before their children are restored."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        fixture.create_legacy_launcher()
+        nested = fixture.app / "Contents/Resources/restrictive/nested"
+        nested.mkdir(parents=True)
+        marker = nested / "marker.txt"
+        marker.write_text("legacy", encoding="utf-8")
+        restrictive = (
+            (nested, 0o555),
+            (nested.parent, 0o500),
+            (fixture.app / "Contents", 0o555),
+            (fixture.app, 0o555),
+        )
+        for path, mode in restrictive:
+            path.chmod(mode)
+
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.installer.restore(fixture.installation, state)
+
+        self.assertEqual("legacy", marker.read_text(encoding="utf-8"))
+        for path, mode in restrictive:
+            self.assertEqual(mode, stat.S_IMODE(path.stat().st_mode), path)
+
+    def test_launcher_transaction_rollback_recreates_restrictive_tree_exactly(self):
+        """Rollback materializes children before restoring restrictive directory modes."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.transaction.journal.commit()
+        app = fixture.installer._app_path()
+        nested = app / "Contents/Resources"
+        restrictive = ((nested, 0o500), (app, 0o555))
+        for path, mode in restrictive:
+            path.chmod(mode)
+        before = launcher_module._captured_tree(app)
+        journal = InstallJournal(fixture.bottle_root / "restrictive-rollback.json")
+        handler = fixture.installer.undo_handler(
+            fixture.installation, fixture._restore_snapshots
+        )
+        transaction = Transaction(journal, {"restore_launcher": handler})
+        transaction.start("restrictive-rollback")
+
+        def remove_then_fail():
+            for path in sorted(
+                [candidate for candidate in app.rglob("*") if candidate.is_dir()],
+                key=lambda candidate: len(candidate.parts),
+                reverse=True,
+            ):
+                path.chmod(0o700)
+            app.chmod(0o700)
+            shutil.rmtree(app)
+            raise OSError("injected failure after launcher removal")
+
+        with self.assertRaisesRegex(OSError, "injected failure"):
+            transaction.step(
+                "remove restrictive launcher",
+                UndoRecord("restore_launcher", {"restore_trees": [before]}),
+                remove_then_fail,
+            )
+
+        self.assertEqual(before, launcher_module._captured_tree(app))
+        self.assertEqual(state["runtime_sha256"], digest(fixture.runtime.read_bytes()))
 
     def test_failed_restore_recreates_installed_snapshot_and_menu(self):
         """Restore rollback must include the previous bundle and inverse menu mutation."""
@@ -1475,7 +1603,7 @@ class LauncherInstallerTests(unittest.TestCase):
         class Runner:
             def run(self, argv):
                 events.append(("game", list(argv)))
-                return object()
+                return type("Result", (), {"returncode": 0})()
 
         result = module.run_launcher(
             config,

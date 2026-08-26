@@ -620,6 +620,28 @@ class ProductionCliIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(before, self.fixture.snapshot())
 
+    def test_explicit_managed_path_keeps_managed_cli_command_identity(self):
+        """CLI explicit selection must not downgrade an inventoried managed bottle."""
+        services = ProductionServices(
+            self.fixture.package_root,
+            self.fixture.installer(),
+            self.fixture.runner,
+            io.StringIO(),
+            PlayerOutput(io.StringIO(), color=False),
+            home=self.home,
+            env={
+                "OSTRIV_CROSSOVER_APP": str(self.fixture.app),
+                "CX_MANAGED_BOTTLE_PATH": str(self.fixture.bottle_root.parent),
+            },
+        )
+
+        games = services.find_games(str(self.fixture.game_dir))
+
+        self.assertEqual(1, len(games))
+        self.assertEqual("managed", games[0].bottle.scope)
+        self.assertEqual(self.fixture.bottle.name, games[0].bottle.command_bottle())
+        self.assertEqual(["--scope", "managed"], games[0].bottle.scope_args())
+
     def test_success_snapshot_stays_exact_while_file_log_receives_diagnostics(self):
         log_path = self.fixture.root / "install.log"
         configure_logger(log_path)

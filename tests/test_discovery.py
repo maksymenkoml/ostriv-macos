@@ -270,6 +270,49 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual("Sniper 5", result.bottle.name)
         self.assertEqual("private", result.bottle.scope)
 
+    def test_explicit_managed_game_preserves_discovered_bottle_identity(self):
+        """An explicit path inside inventory must keep managed scope, name, and owner."""
+        first_app = make_crossover(self.home / "First", "CrossOver.app")
+        second_app = make_crossover(self.home / "Second", "CrossOver.app")
+        first = CrossOverInstall(
+            first_app, first_app / "Contents/SharedSupport/CrossOver", "26.3"
+        )
+        second = CrossOverInstall(
+            second_app, second_app / "Contents/SharedSupport/CrossOver", "26.3"
+        )
+        root = make_bottle(self.home / "Managed", "Shared Name")
+        game = root / "drive_c/Steam/steamapps/common/Ostriv"
+        game.mkdir(parents=True)
+        (game / "ostriv.exe").write_bytes(b"MZ")
+        managed = Bottle("Managed Ostriv", root.resolve(), "managed", second)
+
+        result = resolve_explicit_game(game, [first, second], [managed])
+
+        self.assertEqual(managed, result.bottle)
+        self.assertEqual("Managed Ostriv", result.bottle.command_bottle())
+        self.assertEqual(["--scope", "managed"], result.bottle.scope_args())
+        self.assertEqual(second.app, result.bottle.crossover.app)
+
+    def test_explicit_inventory_selects_the_crossover_that_discovered_the_root(self):
+        """The first CrossOver in app order must not steal another app's bottle."""
+        first_app = make_crossover(self.home / "First Owner", "CrossOver.app")
+        second_app = make_crossover(self.home / "Actual Owner", "CrossOver.app")
+        first = CrossOverInstall(
+            first_app, first_app / "Contents/SharedSupport/CrossOver", "26.3"
+        )
+        second = CrossOverInstall(
+            second_app, second_app / "Contents/SharedSupport/CrossOver", "26.3"
+        )
+        root = make_bottle(self.home / "Private Roots", "Actual Bottle")
+        game = root / "drive_c/Games/Ostriv"
+        game.mkdir(parents=True)
+        (game / "ostriv.exe").write_bytes(b"MZ")
+        discovered = Bottle("Actual Bottle", root.resolve(), "private", second)
+
+        result = resolve_explicit_game(game, [first, second], [discovered])
+
+        self.assertEqual(discovered, result.bottle)
+
     def test_explicit_game_outside_bottle_raises_patch_error(self):
         game = self.home / "Downloads/Ostriv"
         game.mkdir(parents=True)

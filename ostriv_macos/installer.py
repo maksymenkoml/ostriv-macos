@@ -45,7 +45,7 @@ class UndoRecord:
 
 def atomic_write_json(path: Path, data: Dict[str, object]) -> None:
     """Replace *path* only after its complete JSON contents reach disk."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_durable_directory(path.parent)
     temp_name = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -59,16 +59,11 @@ def atomic_write_json(path: Path, data: Dict[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp_name, str(path))
-        if os.name != "nt":
-            directory_descriptor = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                try:
-                    os.fsync(directory_descriptor)
-                except OSError as error:
-                    setattr(error, _JOURNAL_REPLACED_ATTRIBUTE, True)
-                    raise
-            finally:
-                os.close(directory_descriptor)
+        try:
+            _fsync_directory(path.parent)
+        except OSError as error:
+            setattr(error, _JOURNAL_REPLACED_ATTRIBUTE, True)
+            raise
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -326,7 +321,7 @@ def _same_file(path: Path, expected_digest: str) -> bool:
 
 
 def _atomic_write_bytes(path: Path, data: bytes, mode: Optional[int] = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_durable_directory(path.parent)
     temp_name = None
     try:
         with tempfile.NamedTemporaryFile("wb", dir=str(path.parent), delete=False) as stream:
@@ -336,7 +331,7 @@ def _atomic_write_bytes(path: Path, data: bytes, mode: Optional[int] = None) -> 
             os.fsync(stream.fileno())
         if mode is not None:
             os.chmod(temp_name, mode)
-        os.replace(temp_name, str(path))
+        _durable_replace(Path(temp_name), path)
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -350,6 +345,52 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _ensure_durable_directory(path: Path) -> None:
+    """Create a missing directory chain and sync each new link and directory."""
+    path = Path(path)
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+    if not current.is_dir():
+        raise NotADirectoryError(str(current))
+    for directory in reversed(missing):
+        directory.mkdir()
+        _fsync_directory(directory)
+        _fsync_directory(directory.parent)
+
+
+def _durable_replace(source: Path, destination: Path) -> None:
+    source = Path(source)
+    destination = Path(destination)
+    source_parent = source.parent
+    destination_parent = destination.parent
+    os.replace(str(source), str(destination))
+    _fsync_directory(destination_parent)
+    if source_parent != destination_parent:
+        _fsync_directory(source_parent)
+
+
+def _durable_unlink(path: Path, *, missing_ok: bool = False) -> None:
+    path = Path(path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        if missing_ok:
+            return
+        raise
+    _fsync_directory(path.parent)
+
+
+def _durable_rmdir(path: Path) -> None:
+    path = Path(path)
+    path.rmdir()
+    _fsync_directory(path.parent)
 
 
 _RENAME_EXCL = 0x00000004
@@ -428,6 +469,161 @@ def _directory_open_flags() -> int:
     if not no_follow or not directory:
         raise OSError(errno.ENOTSUP, "safe directory opens are unavailable")
     return os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
+
+
+def _relative_directory_descriptor(
+    root: Path, directory: Path, *, create: bool
+) -> tuple[int, List[Path]]:
+    """Open *directory* below *root* without following any lexical component."""
+    root = Path(root).resolve()
+    directory = Path(directory)
+    try:
+        relative = directory.relative_to(root)
+    except ValueError as error:
+        raise OSError(errno.EPERM, "directory is outside trusted root", str(directory)) from error
+    if ".." in relative.parts:
+        raise OSError(errno.EPERM, "directory traversal is not allowed", str(directory))
+    descriptor = os.open(str(root), _directory_open_flags())
+    created: List[Path] = []
+    current = root
+    try:
+        for part in relative.parts:
+            try:
+                child = os.open(part, _directory_open_flags(), dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                os.fsync(descriptor)
+                current = current / part
+                child = os.open(part, _directory_open_flags(), dir_fd=descriptor)
+                os.fsync(child)
+                created.append(current)
+            else:
+                current = current / part
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, created
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _validate_real_directory_ancestry(root: Path, directory: Path) -> None:
+    """Reject symlink/non-directory ancestors while allowing a missing suffix."""
+    root = Path(root).resolve()
+    directory = Path(directory)
+    try:
+        relative = directory.relative_to(root)
+    except ValueError as error:
+        raise OSError(errno.EPERM, "directory is outside trusted root", str(directory)) from error
+    if ".." in relative.parts:
+        raise OSError(errno.EPERM, "directory traversal is not allowed", str(directory))
+    descriptor = os.open(str(root), _directory_open_flags())
+    try:
+        for part in relative.parts:
+            try:
+                child = os.open(part, _directory_open_flags(), dir_fd=descriptor)
+            except FileNotFoundError:
+                return
+            os.close(descriptor)
+            descriptor = child
+    finally:
+        os.close(descriptor)
+
+
+def _read_relative_file(root: Path, path: Path) -> tuple[bytes, int]:
+    parent, _created = _relative_directory_descriptor(root, path.parent, create=False)
+    descriptor = None
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise OSError(errno.EPERM, "settings leaf is not a regular file", str(path))
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read()
+        return data, stat.S_IMODE(status.st_mode)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _atomic_write_relative(
+    root: Path, path: Path, data: bytes, mode: Optional[int] = None
+) -> List[Path]:
+    parent, created = _relative_directory_descriptor(root, path.parent, create=True)
+    token = secrets.token_hex(16)
+    temporary = ".{}.ostriv-write-{}".format(path.name, token)
+    descriptor = None
+    replaced = False
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent,
+        )
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+        if mode is not None:
+            os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=parent,
+            dst_dir_fd=parent,
+        )
+        replaced = True
+        os.fsync(parent)
+        return created
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not replaced:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+                os.fsync(parent)
+            except FileNotFoundError:
+                pass
+        os.close(parent)
+
+
+def _replace_relative(root: Path, source: Path, destination: Path) -> None:
+    if source.parent != destination.parent:
+        raise OSError(errno.EPERM, "relative replace crosses directories")
+    parent, _created = _relative_directory_descriptor(
+        root, destination.parent, create=False
+    )
+    try:
+        os.replace(
+            source.name,
+            destination.name,
+            src_dir_fd=parent,
+            dst_dir_fd=parent,
+        )
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def _unlink_relative(root: Path, path: Path) -> None:
+    parent, _created = _relative_directory_descriptor(root, path.parent, create=False)
+    try:
+        os.unlink(path.name, dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def _owned_directory_status(
@@ -585,6 +781,7 @@ def _atomic_copy_file(
             src_dir_fd=directory_descriptor,
             dst_dir_fd=destination_directory_descriptor,
         )
+        os.fsync(directory_descriptor)
         installed_status = os.stat(
             destination.name,
             dir_fd=destination_directory_descriptor,
@@ -846,6 +1043,8 @@ class Installer:
             app / "Contents/Resources/CrossOverHelper.icns",
             bottle / "play-ostriv-patched.py",
             bottle / "launcher-config.json",
+            bottle / ".ostriv-launcher.lock",
+            bottle / ".ostriv-profile-recovery.json",
         }
 
     def _allowed_owned_targets(self, installation: GameInstallation) -> set:
@@ -1001,7 +1200,7 @@ class Installer:
     def _cleanup_completed_journal(self, transaction: Transaction) -> None:
         if transaction.journal.data.get("complete"):
             try:
-                transaction.journal.path.unlink()
+                _durable_unlink(transaction.journal.path)
             except FileNotFoundError:
                 pass
 
@@ -1051,6 +1250,20 @@ class Installer:
             candidate = candidate.parent
         return candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK)
 
+    def _validate_settings_ancestry(
+        self, installation: GameInstallation, code: str, player_message: str
+    ) -> None:
+        path = self._settings_path(installation)
+        root = installation.bottle.root.resolve()
+        try:
+            _validate_real_directory_ancestry(root, path.parent)
+        except OSError as error:
+            raise PatchError(
+                code,
+                player_message,
+                "Unsafe settings directory ancestry {}: {}".format(path.parent, error),
+            ) from error
+
     def preflight(
         self, installation: GameInstallation, payload: Sequence[PayloadEntry]
     ) -> None:
@@ -1078,6 +1291,12 @@ class Installer:
         config = bottle_root / "cxbottle.conf"
         registry_file = bottle_root / "system.reg"
         settings = self._settings_path(installation)
+        try:
+            self._validate_settings_ancestry(
+                installation, "install.preflight", "Installation cannot start."
+            )
+        except PatchError as error:
+            issues.append(error.detail)
         mutable_destinations = [
             *(game_dir / name for name in DRIVER_NAMES),
             game_dir / "steam_appid.txt",
@@ -1668,8 +1887,16 @@ class Installer:
         self, transaction: Transaction, installation: GameInstallation
     ) -> None:
         path = self._settings_path(installation)
+        bottle_root = installation.bottle.root.resolve()
+        self._validate_settings_ancestry(
+            installation, "install.settings", "Installation failed."
+        )
         if self._existing_state is not None:
-            if not path.is_file() or _file_digest(path) != self._existing_state.installed_settings_digest:
+            try:
+                existing_data, _existing_mode = _read_relative_file(bottle_root, path)
+            except OSError:
+                existing_data = b""
+            if _bytes_digest(existing_data) != self._existing_state.installed_settings_digest:
                 raise PatchError(
                     "install.ownership_conflict",
                     "Installation cannot replace modified game settings.",
@@ -1682,7 +1909,7 @@ class Installer:
             }
             return
         if path.is_file():
-            current = path.read_bytes()
+            current, current_mode = _read_relative_file(bottle_root, path)
             desired = self._safe_settings(current)
             original_digest = _bytes_digest(current)
             if desired == current:
@@ -1694,9 +1921,6 @@ class Installer:
                 return
             backup = self._choose_backup(path)
             installed_digest = _bytes_digest(desired)
-            backup_staging = self._prepare_copy_staging(
-                transaction, installation, backup
-            )
             transaction.step(
                 "set safe graphics",
                 UndoRecord(
@@ -1709,8 +1933,14 @@ class Installer:
                         "original_sha256": original_digest,
                     },
                 ),
-                lambda: self._backup_and_write(
-                    path, backup, backup_staging, desired
+                lambda: self._backup_and_write_settings(
+                    installation,
+                    path,
+                    backup,
+                    current,
+                    current_mode,
+                    original_digest,
+                    desired,
                 ),
             )
             self._settings = {
@@ -1739,7 +1969,7 @@ class Installer:
                     "owned_directories": owned_directories,
                 },
             ),
-            lambda: _atomic_write_bytes(path, desired),
+            lambda: _atomic_write_relative(bottle_root, path, desired),
         )
         self._upsert(
             self._owned_files,
@@ -1763,6 +1993,28 @@ class Installer:
         if not backup.exists():
             _atomic_copy_file(path, backup, backup_staging)
         _atomic_write_bytes(path, data, mode)
+
+    @staticmethod
+    def _backup_and_write_settings(
+        installation: GameInstallation,
+        path: Path,
+        backup: Path,
+        original_data: bytes,
+        original_mode: int,
+        original_digest: str,
+        data: bytes,
+    ) -> None:
+        root = installation.bottle.root.resolve()
+        current, current_mode = _read_relative_file(root, path)
+        if _bytes_digest(current) != original_digest or current_mode != original_mode:
+            raise PatchError(
+                "install.ownership_conflict",
+                "Installation cannot replace modified game settings.",
+                str(path),
+            )
+        if not os.path.lexists(backup):
+            _atomic_write_relative(root, backup, original_data, original_mode)
+        _atomic_write_relative(root, path, data, original_mode)
 
     def _completed_time(self) -> str:
         if self._existing_state is not None:
@@ -1980,6 +2232,10 @@ class Installer:
             path = Path(snapshot["path"])
             if not self._allowed(installation, path):
                 continue
+            settings = self._settings_path(installation)
+            settings_family = path == settings or self._valid_backup_relationship(
+                settings, path
+            )
             present = snapshot.get("present") is True
             if present:
                 try:
@@ -1988,6 +2244,32 @@ class Installer:
                     continue
                 expected = str(snapshot.get("sha256", ""))
                 if _bytes_digest(data) != expected:
+                    continue
+                if settings_family:
+                    try:
+                        self._validate_settings_ancestry(
+                            installation, "restore.settings_path", "Restore failed."
+                        )
+                        current, _current_mode = _read_relative_file(
+                            installation.bottle.root.resolve(), path
+                        )
+                        current_digest = _bytes_digest(current)
+                    except FileNotFoundError:
+                        current_digest = None
+                    except (OSError, PatchError):
+                        continue
+                    allowed = snapshot.get("allowed_current_sha256", [])
+                    if current_digest not in (None, expected) and (
+                        not isinstance(allowed, list)
+                        or current_digest not in allowed
+                    ):
+                        continue
+                    _atomic_write_relative(
+                        installation.bottle.root.resolve(),
+                        path,
+                        data,
+                        int(snapshot.get("mode", 0o644)),
+                    )
                     continue
                 if path.exists() and not _same_file(path, expected):
                     allowed = snapshot.get("allowed_current_sha256", [])
@@ -1999,7 +2281,13 @@ class Installer:
                 _atomic_write_bytes(path, data, int(snapshot.get("mode", 0o644)))
             elif path.is_file() and snapshot.get("remove_sha256"):
                 if _same_file(path, str(snapshot["remove_sha256"])):
-                    path.unlink()
+                    if settings_family:
+                        try:
+                            _unlink_relative(installation.bottle.root.resolve(), path)
+                        except OSError:
+                            pass
+                    else:
+                        _durable_unlink(path)
 
     def _undo_remove_path(
         self, installation: GameInstallation, record: UndoRecord
@@ -2012,7 +2300,7 @@ class Installer:
             return
         expected = record.data.get("expected_sha256")
         if isinstance(expected, str) and _same_file(path, expected):
-            path.unlink()
+            _durable_unlink(path)
         if path.exists():
             return
         self._remove_empty_owned_directories(
@@ -2110,7 +2398,7 @@ class Installer:
             if directory not in allowed:
                 continue
             try:
-                directory.rmdir()
+                _durable_rmdir(directory)
             except (FileNotFoundError, OSError):
                 pass
 
@@ -2134,12 +2422,32 @@ class Installer:
             return
         original = str(record.data.get("original_sha256", ""))
         installed = str(record.data.get("installed_sha256", ""))
+        if path == self._settings_path(installation):
+            try:
+                self._validate_settings_ancestry(
+                    installation, "restore.settings_path", "Restore failed."
+                )
+                root = installation.bottle.root.resolve()
+                backup_data, _backup_mode = _read_relative_file(root, backup)
+                try:
+                    current, _current_mode = _read_relative_file(root, path)
+                except FileNotFoundError:
+                    current = None
+            except OSError:
+                return
+            if _bytes_digest(backup_data) != original:
+                return
+            if current is None or _bytes_digest(current) == installed:
+                _replace_relative(root, backup, path)
+            elif _bytes_digest(current) == original:
+                _unlink_relative(root, backup)
+            return
         if not _same_file(backup, original):
             return
         if not path.exists() or _same_file(path, installed):
-            os.replace(str(backup), str(path))
+            _durable_replace(backup, path)
         elif _same_file(path, original):
-            backup.unlink()
+            _durable_unlink(backup)
 
     def _undo_restore_named(
         self, installation: GameInstallation, record: UndoRecord
@@ -2166,16 +2474,45 @@ class Installer:
         elif isinstance(before, str):
             registry.set(key, value, before)
 
-    def _restore_backup_action(self, item: Mapping[str, object]) -> None:
+    def _restore_backup_action(
+        self,
+        installation: GameInstallation,
+        item: Mapping[str, object],
+    ) -> None:
         path = Path(str(item["path"]))
         backup = Path(str(item["backup_path"]))
         installed = str(item["installed_sha256"])
         original = str(item["original_sha256"])
+        settings = self._settings_path(installation)
+        if path == settings:
+            self._validate_settings_ancestry(
+                installation, "restore.settings_path", "Restore failed."
+            )
+            root = installation.bottle.root.resolve()
+            try:
+                current, _mode = _read_relative_file(root, path)
+            except FileNotFoundError:
+                current = None
+            try:
+                backup_data, _backup_mode = _read_relative_file(root, backup)
+            except FileNotFoundError:
+                backup_data = None
+            if current is not None and _bytes_digest(current) == original and backup_data is None:
+                return
+            if (
+                current is None
+                or _bytes_digest(current) != installed
+                or backup_data is None
+                or _bytes_digest(backup_data) != original
+            ):
+                return
+            _replace_relative(root, backup, path)
+            return
         if _same_file(path, original) and not backup.exists():
             return
         if not _same_file(path, installed) or not _same_file(backup, original):
             return
-        os.replace(str(backup), str(path))
+        _durable_replace(backup, path)
 
     def _journal_restore_backup(
         self,
@@ -2195,7 +2532,7 @@ class Installer:
         transaction.step(
             "restore {}".format(path.name),
             UndoRecord(kind, {"snapshots": snapshots}),
-            lambda: self._restore_backup_action(item),
+            lambda: self._restore_backup_action(installation, item),
         )
 
     def _journal_remove_owned(
@@ -2209,7 +2546,7 @@ class Installer:
         snapshots = self._snapshots([path])
         def remove_owned() -> None:
             if _same_file(path, expected):
-                path.unlink()
+                _durable_unlink(path)
                 self._remove_empty_owned_directories(
                     installation, item.get("owned_directories", [])
                 )
@@ -2305,6 +2642,12 @@ class Installer:
         elif _same_file(settings, state.installed_settings_digest):
             failures.append("installed game settings remain")
         for artifact in self._launcher_paths(state.launcher_artifacts):
+            if artifact in {
+                installation.bottle.root.resolve() / ".ostriv-launcher.lock",
+                installation.bottle.root.resolve()
+                / ".ostriv-profile-recovery.json",
+            }:
+                continue
             matching = next(
                 (
                     item
@@ -2336,26 +2679,151 @@ class Installer:
                 "restore.registry", "Restore failed.", error.detail
             ) from error
 
+    def _recreate_journaled_restore_lock(
+        self,
+        installation: GameInstallation,
+        state: InstallState,
+        transaction: Transaction,
+    ) -> None:
+        """Recreate only a missing lock whose late Restore unlink is journaled."""
+        launcher_state = state.launcher_artifacts
+        root = installation.bottle.root.resolve()
+        lock = root / ".ostriv-launcher.lock"
+        if os.path.lexists(lock):
+            return
+        journal = transaction.journal.data
+        if journal.get("complete") or journal.get("operation") != "restore":
+            return
+        owner_token = launcher_state.get("profile_owner_token")
+        expected_digest = launcher_state.get("lock_sha256")
+        if (
+            launcher_state.get("lock_path") != str(lock)
+            or not isinstance(owner_token, str)
+            or re.fullmatch(r"[0-9a-f]{64}", owner_token) is None
+            or not isinstance(expected_digest, str)
+        ):
+            return
+        expected_data = (owner_token + "\n").encode("ascii")
+        if _bytes_digest(expected_data) != expected_digest:
+            return
+        proven = False
+        for item in journal.get("records", []):
+            if (
+                not isinstance(item, dict)
+                or item.get("name") != "remove launcher recovery lock"
+                or item.get("status") not in ("pending", "applied")
+            ):
+                continue
+            undo = item.get("undo")
+            if not isinstance(undo, dict) or undo.get("kind") != "restore_launcher":
+                continue
+            data = undo.get("data")
+            snapshots = data.get("snapshots") if isinstance(data, dict) else None
+            if not isinstance(snapshots, list):
+                continue
+            for snapshot in snapshots:
+                if (
+                    not isinstance(snapshot, dict)
+                    or snapshot.get("path") != str(lock)
+                    or snapshot.get("present") is not True
+                    or snapshot.get("sha256") != expected_digest
+                ):
+                    continue
+                try:
+                    captured = base64.b64decode(
+                        str(snapshot["content"]), validate=True
+                    )
+                except (KeyError, ValueError):
+                    continue
+                if captured == expected_data:
+                    proven = True
+                    break
+            if proven:
+                break
+        if not proven:
+            return
+
+        descriptor = None
+        created = False
+        try:
+            descriptor = os.open(
+                str(lock),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            created = True
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(expected_data)
+                stream.flush()
+            os.fsync(descriptor)
+            _fsync_directory(lock.parent)
+        except OSError as error:
+            if created:
+                try:
+                    _durable_unlink(lock)
+                except OSError:
+                    pass
+            raise PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                "Unable to recreate the journaled launcher lock: {}: {}".format(
+                    type(error).__name__, error
+                ),
+            ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
     def restore(self, installation: GameInstallation) -> None:
         logger.info(
             "restore start bottle=%s game=%s",
             installation.bottle.name,
             installation.game_dir.resolve(),
         )
+        self._validate_settings_ancestry(
+            installation, "restore.settings_path", "Restore failed."
+        )
         transaction = self.transaction_for(installation)
-        transaction.recover_incomplete()
-        self._cleanup_completed_journal(transaction)
         state = self._load_state(installation, "restore")
-        launcher_undo = None
-        legacy_launcher_undo = None
-        if state is not None:
-            launcher_undo = self._launcher_restore_undo(
+        restore_lease = None
+        prepare_restore = getattr(self.launcher, "prepare_restore", None)
+        if state is not None and callable(prepare_restore):
+            self._recreate_journaled_restore_lock(
+                installation, state, transaction
+            )
+            restore_lease = prepare_restore(
                 installation, state.launcher_artifacts
             )
-        else:
-            legacy_launcher_undo = self._legacy_launcher_restore_undo(installation)
-        transaction = self.transaction_for(installation)
-        transaction.start("restore")
+        try:
+            transaction.recover_incomplete()
+            self._cleanup_completed_journal(transaction)
+            state = self._load_state(installation, "restore")
+            if (
+                restore_lease is None
+                and state is not None
+                and callable(prepare_restore)
+            ):
+                restore_lease = prepare_restore(
+                    installation, state.launcher_artifacts
+                )
+            launcher_undo = None
+            legacy_launcher_undo = None
+            if state is not None:
+                launcher_undo = self._launcher_restore_undo(
+                    installation, state.launcher_artifacts
+                )
+            else:
+                legacy_launcher_undo = self._legacy_launcher_restore_undo(installation)
+            transaction = self.transaction_for(installation)
+            transaction.start("restore")
+        except BaseException:
+            if restore_lease is not None:
+                restore_lease.close()
+            raise
         try:
             if state is None:
                 self._restore_legacy(
@@ -2434,12 +2902,27 @@ class Installer:
                     self._journal_remove_owned(transaction, installation, item)
             self._verify_restored(installation, state)
             logger.info("restore verification status=OK mode=owned")
+            finalize_restore = getattr(self.launcher, "finalize_restore", None)
+            if callable(finalize_restore):
+                lock_path = installation.bottle.root.resolve() / ".ostriv-launcher.lock"
+                transaction.step(
+                    "remove launcher recovery lock",
+                    UndoRecord(
+                        "restore_launcher",
+                        {"snapshots": self._snapshots([lock_path])},
+                    ),
+                    lambda: finalize_restore(
+                        installation, state.launcher_artifacts
+                    ),
+                )
             state_path = self.state_path(installation)
             state_digest = _file_digest(state_path)
             transaction.step(
                 "remove ownership state",
                 UndoRecord("restore_file", {"snapshots": self._snapshots([state_path])}),
-                lambda: state_path.unlink() if _same_file(state_path, state_digest) else None,
+                lambda: _durable_unlink(state_path)
+                if _same_file(state_path, state_digest)
+                else None,
             )
             transaction.journal.commit()
             self._cleanup_completed_journal(transaction)
@@ -2449,6 +2932,9 @@ class Installer:
             transaction.rollback()
             self._cleanup_completed_journal(transaction)
             raise
+        finally:
+            if restore_lease is not None:
+                restore_lease.close()
 
     def _journal_legacy_change(
         self,
@@ -2481,26 +2967,32 @@ class Installer:
                         transaction,
                         "remove stale legacy {}".format(name),
                         [path, backup],
-                        lambda path=path, backup=backup: (path.unlink(), backup.unlink()),
+                        lambda path=path, backup=backup: (
+                            _durable_unlink(path),
+                            _durable_unlink(backup),
+                        ),
                     )
                 else:
                     self._journal_legacy_change(
                         transaction,
                         "restore legacy {}".format(name),
                         [path, backup],
-                        lambda path=path, backup=backup: os.replace(str(backup), str(path)),
+                        lambda path=path, backup=backup: _durable_replace(backup, path),
                     )
             elif _same_file(path, installed_digest) and not backup.exists():
                 self._journal_legacy_change(
                     transaction,
                     "remove legacy {}".format(name),
                     [path],
-                    lambda path=path: path.unlink(),
+                    lambda path=path: _durable_unlink(path),
                 )
         app_id = game_dir / "steam_appid.txt"
         if _same_file(app_id, _bytes_digest(b"773790")):
             self._journal_legacy_change(
-                transaction, "remove legacy app id", [app_id], app_id.unlink
+                transaction,
+                "remove legacy app id",
+                [app_id],
+                lambda: _durable_unlink(app_id),
             )
         for name in DIAGNOSTIC_LOGS:
             path = game_dir / name
@@ -2509,7 +3001,7 @@ class Installer:
                     transaction,
                     "remove legacy diagnostic {}".format(name),
                     [path],
-                    path.unlink,
+                    lambda path=path: _durable_unlink(path),
                 )
         registry = self._registry(installation)
         if (
@@ -2555,7 +3047,9 @@ class Installer:
                     transaction,
                     "restore legacy settings",
                     [settings, backup],
-                    lambda: os.replace(str(backup), str(settings)),
+                    lambda: _replace_relative(
+                        installation.bottle.root.resolve(), backup, settings
+                    ),
                     "restore_settings",
                 )
         elif settings.is_file():
@@ -2565,7 +3059,9 @@ class Installer:
                     transaction,
                     "remove legacy settings",
                     [settings],
-                    settings.unlink,
+                    lambda: _unlink_relative(
+                        installation.bottle.root.resolve(), settings
+                    ),
                     "restore_settings",
                 )
         if launcher_undo is not None:

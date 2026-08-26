@@ -309,7 +309,9 @@ def is_supported_game_directory(game_dir: Path, bottle_root: Path) -> bool:
 
 
 def resolve_explicit_game(
-    game_dir: Path, crossovers: Sequence[CrossOverInstall]
+    game_dir: Path,
+    crossovers: Sequence[CrossOverInstall],
+    bottles: Sequence[Bottle] = (),
 ) -> GameInstallation:
     """Resolve a game directory to its enclosing bottle, including external bottles."""
     candidate = game_dir.resolve()
@@ -330,7 +332,18 @@ def resolve_explicit_game(
                     "CrossOver could not be found.",
                     "No CrossOver installation was available to run the selected game.",
                 )
-            bottle = Bottle(current.name, current, "private", crossovers[0])
+            resolved_root = current.resolve()
+            bottle = next(
+                (
+                    item
+                    for item in bottles
+                    if item.root.resolve() == resolved_root
+                    and item.crossover in crossovers
+                ),
+                None,
+            )
+            if bottle is None:
+                bottle = Bottle(current.name, resolved_root, "private", crossovers[0])
             return GameInstallation(bottle, candidate, _ostriv_version(bottle))
         current = current.parent
     raise PatchError(

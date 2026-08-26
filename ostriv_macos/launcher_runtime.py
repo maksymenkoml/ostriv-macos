@@ -7,11 +7,14 @@ keep working after the release directory that supplied it has gone away.
 import atexit
 import ctypes
 import fcntl
+import hashlib
 import json
 import logging
 import os
 import plistlib
+import re
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -47,10 +50,16 @@ class ProcessLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
             str(self.path),
-            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
         try:
+            status = os.fstat(descriptor)
+            if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+                raise OSError("launcher lock is not an owned regular file")
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(descriptor)
@@ -67,13 +76,117 @@ class ProcessLock:
             self.fd = None
 
 
-def read_new_log(path: Path, offset: int) -> str:
+MAX_LOG_EVIDENCE_BYTES = 256 * 1024
+LOG_TOKEN_TAIL_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class LogGeneration:
+    present: bool
+    device: int = 0
+    inode: int = 0
+    size: int = 0
+    mtime_ns: int = 0
+    head_size: int = 0
+    head_sha256: str = ""
+    tail_start: int = 0
+    tail_sha256: str = ""
+
+
+def _segment_digest(path: Path, start: int, size: int) -> str:
+    checksum = hashlib.sha256()
+    remaining = max(0, size)
+    with Path(path).open("rb") as stream:
+        stream.seek(start)
+        while remaining:
+            chunk = stream.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            checksum.update(chunk)
+            remaining -= len(chunk)
+    return checksum.hexdigest()
+
+
+def capture_log_generation(path: Path) -> LogGeneration:
+    """Capture bounded identity/content evidence for a possibly overwritten log."""
     path = Path(path)
-    if not path.exists():
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return LogGeneration(False)
+    head_size = min(status.st_size, LOG_TOKEN_TAIL_BYTES)
+    tail_start = max(head_size, status.st_size - LOG_TOKEN_TAIL_BYTES)
+    return LogGeneration(
+        True,
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        getattr(status, "st_mtime_ns", int(status.st_mtime * 1_000_000_000)),
+        head_size,
+        _segment_digest(path, 0, head_size),
+        tail_start,
+        _segment_digest(path, tail_start, status.st_size - tail_start),
+    )
+
+
+def _matches_generation_samples(path: Path, generation: LogGeneration) -> bool:
+    return (
+        _segment_digest(path, 0, generation.head_size) == generation.head_sha256
+        and _segment_digest(
+            path,
+            generation.tail_start,
+            generation.size - generation.tail_start,
+        )
+        == generation.tail_sha256
+    )
+
+
+def _read_bounded_segment(path: Path, start: int, end: int) -> bytes:
+    length = max(0, end - start)
+    with Path(path).open("rb") as stream:
+        stream.seek(start)
+        if length <= MAX_LOG_EVIDENCE_BYTES:
+            return stream.read(length)
+        half = MAX_LOG_EVIDENCE_BYTES // 2
+        first = stream.read(half)
+        stream.seek(end - half)
+        last = stream.read(half)
+    return first + b"\n<fresh log evidence truncated>\n" + last
+
+
+def read_new_log(path: Path, generation) -> str:
+    """Return only bounded evidence written after *generation*."""
+    path = Path(path)
+    try:
+        status = path.stat()
+    except FileNotFoundError:
         return ""
-    with path.open("rb") as stream:
-        stream.seek(min(offset, path.stat().st_size))
-        return stream.read().decode("utf-8", errors="replace")
+    if isinstance(generation, int):
+        data = _read_bounded_segment(path, min(generation, status.st_size), status.st_size)
+        return data.decode("utf-8", errors="replace")
+    if not isinstance(generation, LogGeneration):
+        raise TypeError("invalid log generation token")
+    if not generation.present:
+        start = 0
+    else:
+        same_identity = (
+            status.st_dev == generation.device and status.st_ino == generation.inode
+        )
+        if (
+            same_identity
+            and status.st_size == generation.size
+            and _matches_generation_samples(path, generation)
+        ):
+            return ""
+        append_only = (
+            same_identity
+            and status.st_size >= generation.size
+            and _matches_generation_samples(path, generation)
+        )
+        start = generation.size if append_only else 0
+    return _read_bounded_segment(path, start, status.st_size).decode(
+        "utf-8", errors="replace"
+    )
 
 
 def classify_launch(text: str) -> str:
@@ -340,6 +453,8 @@ class SteamController:
                 command = properties.get("CrossOverHelperCommand", "")
                 if (
                     properties.get("CXHelperAppBottleName") == self.config.bottle_name
+                    and properties.get("CXHelperAppBottleTag")
+                    == self.config.bottle_tag
                     and isinstance(command, str)
                     and command.rstrip('"').lower().endswith("/steam.lnk")
                 ):
@@ -359,8 +474,16 @@ class SteamController:
             if self.config is None or self.runner is None:
                 raise TypeError("SteamController requires a probe or config and runner")
 
+            scope = self.config.bottle_realpath or self.config.bottle_tag
+            escaped_scope = re.escape(scope)
+
+            def scoped_pattern(marker: str) -> str:
+                if not escaped_scope:
+                    return r"(?!)"
+                return r"({0}.*{1}|{1}.*{0})".format(marker, escaped_scope)
+
             process = self.runner.run(
-                ["pgrep", "-f", r"steam\.exe"], timeout=5.0
+                ["pgrep", "-f", scoped_pattern(r"steam\.exe")], timeout=5.0
             ).returncode == 0
             registry_command = self._wine_command(
                 "--no-update",
@@ -386,7 +509,12 @@ class SteamController:
                     except ValueError:
                         active_user = False
             renderer = self.runner.run(
-                ["pgrep", "-f", "steamwebhelper.exe.*type=renderer"], timeout=5.0
+                [
+                    "pgrep",
+                    "-f",
+                    scoped_pattern(r"steamwebhelper\.exe.*type=renderer"),
+                ],
+                timeout=5.0,
             ).returncode == 0
             signals = SteamSignals(process, active_user, renderer)
         self.logger.info(
@@ -507,6 +635,9 @@ class LauncherConfig:
     lock_path: str
     recovery_marker: str
     messages: Dict[str, str]
+    bottle_realpath: str = ""
+    bottle_tag: str = ""
+    profile_owner_token: str = ""
 
     @classmethod
     def load(cls, path: Path) -> "LauncherConfig":
@@ -525,6 +656,9 @@ class LauncherConfig:
             "launcher_log",
             "lock_path",
             "recovery_marker",
+            "bottle_realpath",
+            "bottle_tag",
+            "profile_owner_token",
         )
         if any(type(data.get(field)) is not str for field in string_fields):
             raise RuntimeError("Invalid launcher configuration")
@@ -639,10 +773,11 @@ class ColorSyncProfileBackend:
 class ProfileGuard:
     """Persist and restore the exact display profile around a game launch."""
 
-    def __init__(self, backend, marker: Path, srgb_path: str):
+    def __init__(self, backend, marker: Path, srgb_path: str, owner_token: str = ""):
         self.backend = backend
         self.marker = Path(marker)
         self.srgb_path = srgb_path
+        self.owner_token = owner_token
         self.original = None
         self.switched = False
         self.restored = False
@@ -654,6 +789,8 @@ class ProfileGuard:
         except (OSError, TypeError, ValueError) as error:
             raise RuntimeError("Invalid profile recovery marker") from error
         if not isinstance(data, dict) or "original" not in data:
+            raise RuntimeError("Invalid profile recovery marker")
+        if self.owner_token and data.get("owner") != self.owner_token:
             raise RuntimeError("Invalid profile recovery marker")
         original = data["original"]
         if original is not None and not isinstance(original, str):
@@ -667,10 +804,14 @@ class ProfileGuard:
         if not self.backend.set(original):
             raise RuntimeError("Could not restore display profile")
         self.marker.unlink()
+        _fsync_directory(self.marker.parent)
 
     def switch(self) -> None:
         self.original = self.backend.get()
-        atomic_json(self.marker, {"original": self.original})
+        marker = {"original": self.original}
+        if self.owner_token:
+            marker["owner"] = self.owner_token
+        atomic_json(self.marker, marker)
         if not self.backend.set(self.srgb_path):
             raise RuntimeError("Could not switch display profile")
         self.switched = True
@@ -685,6 +826,7 @@ class ProfileGuard:
                 if not self.backend.set(original):
                     raise RuntimeError("Could not restore display profile")
                 self.marker.unlink()
+                _fsync_directory(self.marker.parent)
             self.restored = True
         finally:
             if not self.restored:
@@ -723,13 +865,6 @@ def run_game(config: LauncherConfig, runner):
     return runner.run(config.game_command)
 
 
-def _log_offset(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except FileNotFoundError:
-        return 0
-
-
 def run_launcher(
     config: LauncherConfig,
     *,
@@ -765,6 +900,7 @@ def run_launcher(
                 ColorSyncProfileBackend(),
                 Path(config.recovery_marker),
                 SRGB_PROFILE,
+                config.profile_owner_token,
             )
         actual_steam = steam or SteamController(
             config=config,
@@ -789,30 +925,42 @@ def run_launcher(
         logger.info("launcher boundary=profile_switch status=OK")
 
         game_log = Path(config.game_log)
-        offset = _log_offset(game_log)
-        logger.info("launcher boundary=game_launch status=start attempt=1 offset=%s", offset)
+        generation = capture_log_generation(game_log)
+        logger.info(
+            "launcher boundary=game_launch status=start attempt=1 generation_size=%s",
+            generation.size,
+        )
         result = run_game(config, actual_runner)
         logger.info(
             "launcher boundary=game_launch status=finished attempt=1 returncode=%s",
             getattr(result, "returncode", "unknown"),
         )
-        final_state = classify_launch(read_new_log(game_log, offset))
+        final_state = classify_launch(read_new_log(game_log, generation))
         logger.info("launcher classification=%s attempt=1", final_state)
         if final_state == "steam_api":
             logger.info("launcher boundary=steam_retry_readiness status=start")
             actual_steam.ensure_ready(retry=True)
             logger.info("launcher boundary=steam_retry_readiness status=OK")
-            offset = _log_offset(game_log)
+            generation = capture_log_generation(game_log)
             logger.info(
-                "launcher boundary=game_launch status=start attempt=2 offset=%s", offset
+                "launcher boundary=game_launch status=start attempt=2 generation_size=%s",
+                generation.size,
             )
             result = run_game(config, actual_runner)
             logger.info(
                 "launcher boundary=game_launch status=finished attempt=2 returncode=%s",
                 getattr(result, "returncode", "unknown"),
             )
-            final_state = classify_launch(read_new_log(game_log, offset))
+            final_state = classify_launch(read_new_log(game_log, generation))
             logger.info("launcher classification=%s attempt=2", final_state)
+        returncode = getattr(result, "returncode", None)
+        if final_state in ("steam_api", "graphics_context") or returncode != 0:
+            raise LauncherRuntimeError(
+                "game_failed",
+                "Game launch failed: classification={} returncode={}".format(
+                    final_state, returncode
+                )[:256],
+            )
         return 0
     except Exception:
         if logger is not None:

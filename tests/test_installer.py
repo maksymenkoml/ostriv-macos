@@ -22,6 +22,7 @@ from ostriv_macos.installer import (
     UndoRecord,
     WineRegistry,
 )
+from ostriv_macos.launcher import LauncherInstaller
 from ostriv_macos.payload import PayloadEntry
 
 
@@ -150,6 +151,70 @@ class FakeLauncherPort:
         expected = launcher_state["artifacts"][0]["sha256"]
         if self.artifact.is_file() and digest(self.artifact.read_bytes()) == expected:
             self.artifact.unlink()
+
+
+class FakeRestoreProfiles:
+    def __init__(self, current="/Profiles/sRGB.icc"):
+        self.current = current
+        self.calls = []
+
+    def get(self):
+        return self.current
+
+    def set(self, value):
+        self.calls.append(value)
+        self.current = value
+        return True
+
+
+def real_launcher_for_restore(fixture, profiles):
+    destination = fixture.root / "Real Applications/CrossOver"
+    destination.mkdir(parents=True)
+    game_app = destination / "Games/Ostriv.app"
+    icon = game_app / "Contents/Resources/CrossOverHelper.icns"
+    icon.parent.mkdir(parents=True)
+    icon.write_bytes(b"real-ostriv-icon")
+    with (game_app / "Contents/Info.plist").open("wb") as stream:
+        plistlib.dump(
+            {
+                "CXHelperAppBottleName": fixture.bottle.name,
+                "CrossOverHelperCommand": '"C:/Program Files/Ostriv/Ostriv.lnk"',
+            },
+            stream,
+        )
+
+    def extract(_template, pending):
+        executable = pending / "Contents/MacOS/Menu Helper"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"menu-helper")
+        executable.chmod(0o755)
+        resources = pending / "Contents/Resources"
+        resources.mkdir(parents=True)
+        with (pending / "Contents/Info.plist").open("wb") as stream:
+            plistlib.dump(
+                {
+                    "CFBundleExecutable": "Menu Helper",
+                    "CFBundleIconFile": "CrossOverHelper.icns",
+                },
+                stream,
+            )
+
+    launcher = LauncherInstaller(
+        fixture.package_root,
+        launcher_destination=destination,
+        runner=fixture.runner,
+        runtime_source=Path(__file__).parents[1]
+        / "ostriv_macos/launcher_runtime.py",
+        extractor=extract,
+        profile_backend_factory=lambda: profiles,
+    )
+    installer = TrackingInstaller(
+        fixture.package_root,
+        launcher,
+        runner=fixture.runner,
+        launcher_destination=destination,
+    )
+    return launcher, installer
 
 
 class FailureTransaction(Transaction):
@@ -856,6 +921,208 @@ class InstallerTests(unittest.TestCase):
                 finally:
                     fixture.cleanup()
 
+    @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-only")
+    def test_restore_directory_sync_failure_keeps_installed_state_recoverable(self):
+        """A backup move is not complete until its containing directory is synced."""
+        fixture = FakeBottleFixture()
+        try:
+            installer = fixture.installer()
+            installer.install(fixture.installation, fixture.payload)
+            before = fixture.snapshot()
+            real_sync = os.fsync
+            settings_directory = os.stat(fixture.settings.parent)
+            failures = [OSError("injected restore directory sync failure")]
+
+            def fail_settings_sync(descriptor):
+                observed = os.fstat(descriptor)
+                if (
+                    stat.S_ISDIR(observed.st_mode)
+                    and observed.st_dev == settings_directory.st_dev
+                    and observed.st_ino == settings_directory.st_ino
+                    and failures
+                ):
+                    raise failures.pop()
+                return real_sync(descriptor)
+
+            with patch.object(
+                installer_module.os, "fsync", side_effect=fail_settings_sync
+            ):
+                with self.assertRaisesRegex(OSError, "restore directory sync failure"):
+                    installer.restore(fixture.installation)
+
+            self.assertEqual(before, fixture.snapshot())
+            self.assertTrue(installer.state_path(fixture.installation).is_file())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
+        finally:
+            fixture.cleanup()
+
+    @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-only")
+    def test_legacy_unlink_directory_sync_failure_restores_removed_app_id(self):
+        """Legacy unlink completion includes the containing-directory sync boundary."""
+        fixture = FakeBottleFixture()
+        try:
+            app_id = fixture.game_dir / "steam_appid.txt"
+            app_id.write_bytes(b"773790")
+            installer = fixture.installer()
+            real_sync = installer_module._fsync_directory
+            failures = [OSError("injected legacy unlink sync failure")]
+
+            def fail_game_directory(path):
+                if Path(path).resolve() == fixture.game_dir.resolve() and failures:
+                    raise failures.pop()
+                return real_sync(path)
+
+            with patch.object(
+                installer_module, "_fsync_directory", side_effect=fail_game_directory
+            ):
+                with self.assertRaisesRegex(OSError, "legacy unlink sync failure"):
+                    installer.restore(fixture.installation)
+
+            self.assertEqual(b"773790", app_id.read_bytes())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_recovers_exact_profile_and_removes_owned_marker_and_lock(self):
+        """Restore consumes only install-reserved launcher recovery artifacts under lock."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            launcher_state = state.launcher_artifacts
+            marker = Path(str(launcher_state["recovery_marker"]))
+            lock = Path(str(launcher_state["lock_path"]))
+            original = "/Profiles/Player Custom.icc"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "owner": launcher_state["profile_owner_token"],
+                        "original": original,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(lock.is_file())
+
+            installer.restore(fixture.installation)
+
+            self.assertEqual([original], profiles.calls)
+            self.assertEqual(original, profiles.current)
+            self.assertFalse(marker.exists())
+            self.assertFalse(lock.exists())
+            self.assertFalse(installer.state_path(fixture.installation).exists())
+            self.assertFalse(launcher._app_path().exists())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_restart_recovers_journaled_lock_unlink_before_reacquiring(self):
+        """A hard kill after owned-lock unlink must leave a restartable Restore journal."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            _launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            lock = Path(str(state.launcher_artifacts["lock_path"]))
+            armed = [True]
+
+            class HardKill(BaseException):
+                pass
+
+            class HardKillTransaction(Transaction):
+                def __init__(self, journal, handlers):
+                    super().__init__(journal, handlers)
+                    self.killed = False
+
+                def step(self, name, undo, action):
+                    if name != "remove launcher recovery lock" or not armed:
+                        return super().step(name, undo, action)
+                    self.journal.begin(name, undo)
+                    action()
+                    armed.pop()
+                    self.killed = True
+                    raise HardKill()
+
+                def rollback(self):
+                    if self.killed:
+                        raise HardKill()
+                    return super().rollback()
+
+            def transaction_for(installation):
+                return HardKillTransaction(
+                    InstallJournal(installer.journal_path(installation)),
+                    installer.undo_handlers(installation),
+                )
+
+            with patch.object(installer, "transaction_for", side_effect=transaction_for):
+                with self.assertRaises(HardKill):
+                    installer.restore(fixture.installation)
+
+                self.assertFalse(lock.exists())
+                self.assertTrue(installer.state_path(fixture.installation).is_file())
+                journal = json.loads(
+                    installer.journal_path(fixture.installation).read_text(encoding="utf-8")
+                )
+                self.assertFalse(journal["complete"])
+
+                installer.restore(fixture.installation)
+
+            self.assertFalse(lock.exists())
+            self.assertFalse(installer.state_path(fixture.installation).exists())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_preserves_invalid_or_unowned_launcher_recovery_artifacts(self):
+        """Invalid marker/lock ownership fails before profile or launcher mutation."""
+        for conflict in ("marker", "lock"):
+            with self.subTest(conflict=conflict):
+                fixture = FakeBottleFixture()
+                try:
+                    profiles = FakeRestoreProfiles()
+                    launcher, installer = real_launcher_for_restore(fixture, profiles)
+                    state = installer.install(fixture.installation, fixture.payload)
+                    launcher_state = state.launcher_artifacts
+                    marker = Path(str(launcher_state["recovery_marker"]))
+                    lock = Path(str(launcher_state["lock_path"]))
+                    marker.write_text(
+                        json.dumps(
+                            {
+                                "owner": launcher_state["profile_owner_token"],
+                                "original": "/Profiles/Player Custom.icc",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    if conflict == "marker":
+                        marker.write_text(
+                            json.dumps(
+                                {
+                                    "owner": "another-install",
+                                    "original": "/Profiles/Player Custom.icc",
+                                }
+                            ),
+                            encoding="utf-8",
+                        )
+                    else:
+                        lock.write_text("another-install\n", encoding="utf-8")
+                    marker_before = marker.read_bytes()
+                    lock_before = lock.read_bytes()
+
+                    with self.assertRaises(PatchError) as caught:
+                        installer.restore(fixture.installation)
+
+                    self.assertEqual("restore.launcher_recovery", caught.exception.code)
+                    self.assertEqual([], profiles.calls)
+                    self.assertEqual(marker_before, marker.read_bytes())
+                    self.assertEqual(lock_before, lock.read_bytes())
+                    self.assertTrue(installer.state_path(fixture.installation).is_file())
+                    self.assertTrue(launcher._app_path().is_dir())
+                    self.assertTrue(Path(str(launcher_state["runtime"])).is_file())
+                    self.assertFalse(installer.journal_path(fixture.installation).exists())
+                finally:
+                    fixture.cleanup()
+
     def test_restart_recovers_install_interrupted_after_state_write(self):
         fixture = FakeBottleFixture()
         try:
@@ -1248,6 +1515,88 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual("test.launcher_failure", caught.exception.code)
             self.assertEqual(before, fixture.snapshot())
             self.assertFalse(fixture.settings.parent.exists())
+        finally:
+            fixture.cleanup()
+
+    def test_install_rejects_missing_settings_below_symlinked_ancestor_before_mutation(self):
+        """A Saved Games symlink must not redirect template creation outside the bottle."""
+        fixture = FakeBottleFixture()
+        try:
+            saved_games = fixture.settings.parents[1]
+            fixture.settings.unlink()
+            fixture.settings.parent.rmdir()
+            saved_games.rmdir()
+            outside = fixture.root / "outside-player-data"
+            outside.mkdir()
+            saved_games.symlink_to(outside, target_is_directory=True)
+            installer = fixture.installer()
+
+            with self.assertRaises(PatchError) as caught:
+                installer.install(fixture.installation, fixture.payload)
+
+            self.assertEqual("install.preflight", caught.exception.code)
+            self.assertEqual([], list(outside.iterdir()))
+            self.assertTrue(saved_games.is_symlink())
+            self.assertEqual([], installer.transactions)
+            self.assertFalse(installer.state_path(fixture.installation).exists())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_rejects_symlinked_settings_ancestor_before_legacy_mutation(self):
+        """Restore validates settings ancestry before changing any legacy artifact."""
+        fixture = FakeBottleFixture()
+        try:
+            saved_games = fixture.settings.parents[1]
+            fixture.settings.unlink()
+            fixture.settings.parent.rmdir()
+            saved_games.rmdir()
+            outside = fixture.root / "outside-restore-data"
+            outside.mkdir()
+            saved_games.symlink_to(outside, target_is_directory=True)
+            legacy_driver = fixture.game_dir / "libgallium_wgl.dll"
+            payload_driver = fixture.package_root / "prebuilt/libgallium_wgl.dll"
+            legacy_driver.write_bytes(payload_driver.read_bytes())
+            before = legacy_driver.read_bytes()
+            installer = fixture.installer()
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual("restore.settings_path", caught.exception.code)
+            self.assertEqual(before, legacy_driver.read_bytes())
+            self.assertEqual([], list(outside.iterdir()))
+            self.assertTrue(saved_games.is_symlink())
+            self.assertFalse(installer.state_path(fixture.installation).exists())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
+        finally:
+            fixture.cleanup()
+
+    def test_owned_restore_rejects_missing_settings_behind_symlinked_ancestor(self):
+        """Owned Restore leaves its state and patch intact when settings ancestry escapes."""
+        fixture = FakeBottleFixture()
+        try:
+            installer = fixture.installer()
+            installer.install(fixture.installation, fixture.payload)
+            state_path = installer.state_path(fixture.installation)
+            state_before = state_path.read_bytes()
+            driver = fixture.game_dir / "libgallium_wgl.dll"
+            driver_before = driver.read_bytes()
+            saved_games = fixture.settings.parents[1]
+            parked = saved_games.with_name("Saved Games parked")
+            saved_games.rename(parked)
+            outside = fixture.root / "outside-owned-restore"
+            outside.mkdir()
+            saved_games.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(PatchError) as caught:
+                installer.restore(fixture.installation)
+
+            self.assertEqual("restore.settings_path", caught.exception.code)
+            self.assertEqual([], list(outside.iterdir()))
+            self.assertEqual(state_before, state_path.read_bytes())
+            self.assertEqual(driver_before, driver.read_bytes())
+            self.assertFalse(installer.journal_path(fixture.installation).exists())
         finally:
             fixture.cleanup()
 

@@ -8,6 +8,7 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -124,12 +125,24 @@ def _sync_directory(path: Path) -> None:
 
 
 def _snapshot(path: Path, after_digest: Optional[str] = None) -> Dict[str, object]:
-    path = path.resolve(strict=False)
-    if path.is_file():
+    path = path.parent.resolve(strict=False) / path.name
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+        return {
+            "path": str(path),
+            "present": True,
+            "type": "symlink",
+            "target": os.readlink(path),
+        }
+    if metadata is not None and stat.S_ISREG(metadata.st_mode):
         data = path.read_bytes()
         item: Dict[str, object] = {
             "path": str(path),
             "present": True,
+            "type": "file",
             "content": base64.b64encode(data).decode("ascii"),
             "sha256": _digest(data),
             "mode": _mode(path),
@@ -137,7 +150,7 @@ def _snapshot(path: Path, after_digest: Optional[str] = None) -> Dict[str, objec
         if after_digest:
             item["allowed_current_sha256"] = [after_digest]
         return item
-    item = {"path": str(path), "present": False}
+    item = {"path": str(path), "present": False, "type": "absent"}
     if after_digest:
         item["remove_sha256"] = after_digest
     return item
@@ -226,6 +239,14 @@ def _remove_inventory_tree(root: Path, inventory: object) -> None:
             "Restore failed.",
             "Owned launcher tree changed: {}".format(root),
         )
+    for item in sorted(
+        inventory,
+        key=lambda entry: len(Path(str(entry.get("relative_path", ""))).parts),
+    ):
+        if item.get("type") == "directory":
+            relative = Path(str(item.get("relative_path", "")))
+            path = root if relative == Path(".") else root / relative
+            path.chmod(int(item.get("mode", 0o755)) | 0o700)
     for item in sorted(
         inventory,
         key=lambda entry: len(Path(str(entry.get("relative_path", ""))).parts),
@@ -337,8 +358,9 @@ def _restore_captured_tree(snapshot: Mapping[str, object]) -> None:
     ):
         relative = Path(str(item["relative_path"]))
         path = root if relative == Path(".") else root / relative
-        path.mkdir(parents=True, exist_ok=True)
-        path.chmod(int(item.get("mode", 0o755)))
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.chmod(int(item.get("mode", 0o755)) | 0o700)
+        _sync_directory(path.parent)
     for item in entries:
         relative = Path(str(item.get("relative_path", "")))
         if relative == Path(".") or item.get("type") == "directory":
@@ -346,12 +368,25 @@ def _restore_captured_tree(snapshot: Mapping[str, object]) -> None:
         path = root / relative
         if item.get("type") == "symlink":
             path.symlink_to(str(item["target"]))
+            _sync_directory(path.parent)
         elif item.get("type") == "file":
             data = base64.b64decode(str(item["content"]), validate=True)
             if _digest(data) != item.get("sha256"):
                 raise ValueError("captured launcher file digest is invalid")
-            path.write_bytes(data)
-            path.chmod(int(item.get("mode", 0o644)))
+            _atomic_write(path, data, int(item.get("mode", 0o644)))
+    for item in sorted(
+        directories,
+        key=lambda entry: len(Path(str(entry["relative_path"])).parts),
+        reverse=True,
+    ):
+        relative = Path(str(item["relative_path"]))
+        path = root if relative == Path(".") else root / relative
+        descriptor = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fchmod(descriptor, int(item.get("mode", 0o755)))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _saved_file(path: Path) -> Optional[Dict[str, object]]:
@@ -526,6 +561,10 @@ class LauncherState(Mapping[str, object]):
     bottle_argument: str
     scope: str
     bottle_tag: str
+    lock_path: str
+    lock_sha256: str
+    recovery_marker: str
+    profile_owner_token: str
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -548,6 +587,8 @@ class LauncherInstaller:
         runner: Optional[CommandRunner] = None,
         runtime_source: Optional[Path] = None,
         extractor: Optional[Callable[[Path, Path], None]] = None,
+        profile_backend_factory: Optional[Callable[[], object]] = None,
+        lock_factory: Optional[Callable[[Path], object]] = None,
     ) -> None:
         self.package_root = Path(package_root).resolve()
         self.launcher_destination = Path(
@@ -562,6 +603,8 @@ class LauncherInstaller:
             else self.package_root / "ostriv_macos/launcher_runtime.py"
         )
         self.extractor = extractor or _extract_menu_helper
+        self.profile_backend_factory = profile_backend_factory
+        self.lock_factory = lock_factory
 
     def _bind_owned_directory_cleanup(
         self, transaction: Transaction, installation: GameInstallation
@@ -596,6 +639,8 @@ class LauncherInstaller:
         allowed_files = {
             installation.bottle.root.resolve() / RUNTIME_NAME,
             installation.bottle.root.resolve() / CONFIG_NAME,
+            installation.bottle.root.resolve() / ".ostriv-launcher.lock",
+            installation.bottle.root.resolve() / ".ostriv-profile-recovery.json",
         }
 
         def owned_paths(record: UndoRecord) -> tuple[Optional[Path], List[Path]]:
@@ -750,7 +795,27 @@ class LauncherInstaller:
                         "Launcher file snapshot is outside the allowlist",
                     )
                 path = Path(str(snapshot["path"]))
-                if snapshot.get("present") is True:
+                if snapshot.get("present") is True and snapshot.get("type") == "symlink":
+                    target = snapshot.get("target")
+                    if not isinstance(target, str) or not _filesystem_safe_text(target):
+                        raise PatchError(
+                            "restore.launcher_ownership",
+                            "Restore failed.",
+                            "Launcher symlink snapshot is invalid",
+                        )
+                    if _lexists(path):
+                        if path.is_symlink() and os.readlink(path) == target:
+                            continue
+                        if path.is_dir() and not path.is_symlink():
+                            raise PatchError(
+                                "restore.launcher_ownership",
+                                "Restore failed.",
+                                "Launcher snapshot leaf changed type: {}".format(path),
+                            )
+                        path.unlink()
+                    path.symlink_to(target)
+                    _sync_directory(path.parent)
+                elif snapshot.get("present") is True:
                     data = base64.b64decode(str(snapshot["content"]), validate=True)
                     if _digest(data) != snapshot.get("sha256"):
                         raise PatchError(
@@ -852,6 +917,7 @@ class LauncherInstaller:
         previous = app.with_name("." + app.name + ".ostriv-macos.previous")
         runtime = installation.bottle.root.resolve() / RUNTIME_NAME
         config = installation.bottle.root.resolve() / CONFIG_NAME
+        lock, marker = self._recovery_paths(installation)
         if state.get("legacy") is True:
             self._validate_legacy_paths(installation, state)
             return {
@@ -869,7 +935,12 @@ class LauncherInstaller:
         menu = state.get("menu_entry")
         return {
             "restore_trees": [_captured_tree(app), _captured_tree(previous)],
-            "restore_files": [_snapshot(runtime), _snapshot(config)],
+            "restore_files": [
+                _snapshot(runtime),
+                _snapshot(config),
+                _snapshot(lock),
+                _snapshot(marker),
+            ],
             "recreate_menu": isinstance(menu, dict)
             and menu.get("name") == LAUNCHER_MENU,
         }
@@ -892,6 +963,117 @@ class LauncherInstaller:
                 ),
             ) from error
 
+    def prepare_restore(
+        self,
+        installation: GameInstallation,
+        state: Mapping[str, object],
+    ):
+        """Acquire the launcher lock and consume a validated owned profile marker."""
+        lock = None
+        try:
+            self._validate_state_paths(
+                installation,
+                state,
+                "restore.launcher_recovery",
+                "Restore failed.",
+            )
+            owner_token = state.get("profile_owner_token")
+            lock_path, marker = self._recovery_paths(installation)
+            if not self._valid_owner_token(owner_token):
+                raise ValueError("launcher profile ownership token is invalid")
+            expected_lock = self._lock_data(str(owner_token))
+
+            def validate_owned_leaves() -> None:
+                if (
+                    lock_path.is_symlink()
+                    or not lock_path.is_file()
+                    or lock_path.read_bytes() != expected_lock
+                    or _file_digest(lock_path) != state.get("lock_sha256")
+                ):
+                    raise ValueError("launcher lock is invalid or unowned")
+                if _lexists(marker) and not self._valid_marker(
+                    marker, str(owner_token)
+                ):
+                    raise ValueError("profile recovery marker is invalid or unowned")
+
+            validate_owned_leaves()
+            if self.lock_factory is None:
+                from .launcher_runtime import ProcessLock
+
+                lock = ProcessLock(lock_path)
+            else:
+                lock = self.lock_factory(lock_path)
+            if not lock.acquire():
+                raise ValueError("launcher is active for the selected bottle")
+            validate_owned_leaves()
+            if _lexists(marker):
+                from .launcher_runtime import (
+                    ColorSyncProfileBackend,
+                    ProfileGuard,
+                    SRGB_PROFILE,
+                )
+
+                backend = (
+                    self.profile_backend_factory()
+                    if self.profile_backend_factory is not None
+                    else ColorSyncProfileBackend()
+                )
+                ProfileGuard(
+                    backend,
+                    marker,
+                    SRGB_PROFILE,
+                    str(owner_token),
+                ).recover()
+            return lock
+        except PatchError:
+            if lock is not None:
+                lock.close()
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if lock is not None:
+                lock.close()
+            raise PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                "Launcher recovery coordination failed: {}: {}".format(
+                    type(error).__name__, error
+                ),
+            ) from error
+
+    def finalize_restore(
+        self,
+        installation: GameInstallation,
+        state: Mapping[str, object],
+    ) -> None:
+        """Remove only the still-owned recovery lock after Restore verification."""
+        lock, marker = self._recovery_paths(installation)
+        owner_token = state.get("profile_owner_token")
+        if not self._valid_owner_token(owner_token):
+            raise PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                "Launcher recovery ownership token is invalid",
+            )
+        if _lexists(marker):
+            raise PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                "A profile recovery marker appeared during Restore",
+            )
+        if (
+            lock.is_symlink()
+            or not lock.is_file()
+            or lock.read_bytes() != self._lock_data(str(owner_token))
+            or _file_digest(lock) != state.get("lock_sha256")
+        ):
+            raise PatchError(
+                "restore.launcher_recovery",
+                "Restore failed.",
+                "Launcher lock changed during Restore",
+            )
+        lock.unlink()
+        _sync_directory(lock.parent)
+
     def _app_path(self) -> Path:
         if self.launcher_destination.suffix == ".app":
             return (
@@ -900,14 +1082,55 @@ class LauncherInstaller:
             )
         return self.launcher_destination.resolve(strict=False) / (LAUNCHER_NAME + ".app")
 
+    @staticmethod
+    def _recovery_paths(installation: GameInstallation) -> tuple[Path, Path]:
+        root = installation.bottle.root.resolve()
+        return root / ".ostriv-launcher.lock", root / ".ostriv-profile-recovery.json"
+
+    @staticmethod
+    def _lock_data(owner_token: str) -> bytes:
+        return (owner_token + "\n").encode("ascii")
+
+    @staticmethod
+    def _valid_owner_token(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+    @classmethod
+    def _valid_marker(cls, path: Path, owner_token: str) -> bool:
+        safe = _regular_file_no_follow(path.parent, Path(path.name))
+        if safe is None:
+            return False
+        try:
+            data = json.loads(safe.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(data, dict)
+            and data.get("owner") == owner_token
+            and "original" in data
+            and (data["original"] is None or isinstance(data["original"], str))
+        )
+
     def preflight(self, installation: GameInstallation) -> None:
         """Reject reserved launcher leaves that could redirect later mutations."""
         app = self._app_path()
+        bottle_root = installation.bottle.root.resolve()
+        runtime = bottle_root / RUNTIME_NAME
+        config = bottle_root / CONFIG_NAME
+        runtime_pending = runtime.with_name("." + runtime.name + ".pending")
+        config_pending = config.with_name("." + config.name + ".pending")
+        lock, marker = self._recovery_paths(installation)
         reserved = (
             app,
             app.with_name(app.name + ".pending"),
             app.with_name("." + app.name + ".ostriv-macos.previous"),
             app.with_name("." + app.name + ".ostriv-macos.replaced"),
+            runtime,
+            config,
+            runtime_pending,
+            config_pending,
+            lock,
+            marker,
         )
         for path in reserved:
             try:
@@ -926,6 +1149,55 @@ class LauncherInstaller:
                     "Installation failed.",
                     "Reserved launcher path is a symbolic link: {}".format(path),
                 )
+        for path in (
+            app.with_name(app.name + ".pending"),
+            runtime_pending,
+            config_pending,
+        ):
+            if _lexists(path):
+                raise PatchError(
+                    "install.launcher_ownership",
+                    "Installation failed.",
+                    "Pending launcher path already exists: {}".format(path),
+                )
+        prior = self._prior_launcher_state(installation)
+        if prior is None:
+            conflicts = [path for path in (lock, marker) if _lexists(path)]
+            if conflicts:
+                raise PatchError(
+                    "install.launcher_ownership",
+                    "Installation failed.",
+                    "Unowned launcher recovery path exists: {}".format(conflicts[0]),
+                )
+            return
+        owner_token = prior.get("profile_owner_token")
+        if (
+            not self._valid_owner_token(owner_token)
+            or prior.get("lock_path") != str(lock)
+            or prior.get("recovery_marker") != str(marker)
+        ):
+            raise PatchError(
+                "install.launcher_ownership",
+                "Installation failed.",
+                "Existing launcher recovery ownership is invalid",
+            )
+        expected_lock = self._lock_data(str(owner_token))
+        if (
+            not lock.is_file()
+            or lock.is_symlink()
+            or lock.read_bytes() != expected_lock
+        ):
+            raise PatchError(
+                "install.launcher_ownership",
+                "Installation failed.",
+                "Owned launcher lock is missing or changed: {}".format(lock),
+            )
+        if _lexists(marker) and not self._valid_marker(marker, str(owner_token)):
+            raise PatchError(
+                "install.launcher_ownership",
+                "Installation failed.",
+                "Launcher recovery marker is invalid or unowned: {}".format(marker),
+            )
 
     @staticmethod
     def _prior_launcher_state(
@@ -1045,7 +1317,9 @@ class LauncherInstaller:
             ) from error
         return "C:/" + relative.as_posix()
 
-    def _config_data(self, installation: GameInstallation) -> Dict[str, object]:
+    def _config_data(
+        self, installation: GameInstallation, profile_owner_token: str
+    ) -> Dict[str, object]:
         bottle = installation.bottle
         bottle_root = bottle.root.resolve()
         wine = str(self._wine(installation))
@@ -1075,6 +1349,8 @@ class LauncherInstaller:
             "bottle_name": bottle.name,
             "bottle_argument": bottle_argument,
             "scope": bottle.scope,
+            "bottle_realpath": str(bottle_root),
+            "bottle_tag": "CrossOver-{}/".format(self._bottle_id(installation)),
             "wine": wine,
             "game_command": game_command,
             "steam_apps_root": str(self._app_path().parent),
@@ -1085,11 +1361,13 @@ class LauncherInstaller:
             "launcher_log": str(log_root / (safe_name + "-" + identity + ".log")),
             "lock_path": str(bottle_root / ".ostriv-launcher.lock"),
             "recovery_marker": str(bottle_root / ".ostriv-profile-recovery.json"),
+            "profile_owner_token": profile_owner_token,
             "messages": {
                 "already_running": "Ostriv is already starting or running.",
                 "steam_wait": "Waiting for Steam to finish starting.",
                 "steam_login": "Sign in to Steam, then open Ostriv (patched) again.",
                 "steam_timeout": "Steam did not finish starting. Quit CrossOver and try again.",
+                "game_failed": "Ostriv could not start. Quit and reopen CrossOver, then try again.",
                 "error": "Unable to start Ostriv. See the launcher log for details.",
             },
         }
@@ -1220,6 +1498,8 @@ class LauncherInstaller:
         app: Path,
         runtime: Path,
         config: Path,
+        lock: Path,
+        marker: Path,
     ) -> List[Dict[str, object]]:
         paths = (
             app,
@@ -1228,11 +1508,14 @@ class LauncherInstaller:
             app / "Contents/Resources/CrossOverHelper.icns",
             runtime,
             config,
+            lock,
         )
-        return [
+        artifacts = [
             {"path": str(path), **({"sha256": _file_digest(path)} if path.is_file() else {})}
             for path in paths
         ]
+        artifacts.append({"path": str(marker), "reserved": True})
+        return artifacts
 
     def _verify_materialized(
         self,
@@ -1411,6 +1694,12 @@ class LauncherInstaller:
                     installation.bottle.root.resolve() / CONFIG_NAME
                 )
                 app_backup = previous
+            profile_owner_token = (
+                str(prior["profile_owner_token"])
+                if prior is not None
+                else secrets.token_hex(32)
+            )
+            lock, recovery_marker = self._recovery_paths(installation)
             if app_backup is not None and app_backup.exists():
                 raise PatchError(
                     "install.launcher_ownership",
@@ -1422,7 +1711,7 @@ class LauncherInstaller:
             runtime_pending = runtime.with_name("." + runtime.name + ".pending")
             config_pending = config.with_name("." + config.name + ".pending")
             for path in (runtime_pending, config_pending):
-                if path.exists():
+                if _lexists(path):
                     raise PatchError(
                         "install.launcher_ownership",
                         "Installation failed.",
@@ -1430,7 +1719,7 @@ class LauncherInstaller:
                     )
 
             runtime_data = self.runtime_source.read_bytes()
-            config_data = self._config_data(installation)
+            config_data = self._config_data(installation, profile_owner_token)
             config_bytes = (
                 json.dumps(config_data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 + "\n"
@@ -1460,6 +1749,14 @@ class LauncherInstaller:
                         installation.bottle.name
                     ),
                 )
+
+            self._journal_file(
+                transaction,
+                "reserve launcher lock",
+                lock,
+                self._lock_data(profile_owner_token),
+                0o600,
+            )
 
             self._journal_file(
                 transaction, "stage launcher runtime", runtime_pending, runtime_data, 0o755
@@ -1579,7 +1876,9 @@ class LauncherInstaller:
             )
             state = LauncherState(
                 schema=1,
-                artifacts=self._expected_artifacts(app, runtime, config),
+                artifacts=self._expected_artifacts(
+                    app, runtime, config, lock, recovery_marker
+                ),
                 app=str(app),
                 runtime=str(runtime),
                 config=str(config),
@@ -1601,6 +1900,10 @@ class LauncherInstaller:
                 bottle_argument=self._command_bottle(installation),
                 scope=installation.bottle.scope,
                 bottle_tag=bottle_tag,
+                lock_path=str(lock),
+                lock_sha256=_file_digest(lock),
+                recovery_marker=str(recovery_marker),
+                profile_owner_token=profile_owner_token,
             )
             self.verify(installation, state)
             return state
@@ -1630,6 +1933,8 @@ class LauncherInstaller:
             "app": app,
             "runtime": bottle_root / RUNTIME_NAME,
             "config": bottle_root / CONFIG_NAME,
+            "lock_path": bottle_root / ".ostriv-launcher.lock",
+            "recovery_marker": bottle_root / ".ostriv-profile-recovery.json",
         }
         failures = []
         for key, path in expected.items():
@@ -1650,6 +1955,8 @@ class LauncherInstaller:
             app / "Contents/Resources/CrossOverHelper.icns",
             bottle_root / RUNTIME_NAME,
             bottle_root / CONFIG_NAME,
+            bottle_root / ".ostriv-launcher.lock",
+            bottle_root / ".ostriv-profile-recovery.json",
         }
         artifacts = state.get("artifacts")
         if not isinstance(artifacts, list):
@@ -1739,6 +2046,9 @@ class LauncherInstaller:
                 identity_failures.append("CrossOverHelperCommand does not match")
             if state.get("bottle_tag") != expected_tag:
                 identity_failures.append("CXHelperAppBottleTag does not match")
+            owner_token = state.get("profile_owner_token")
+            if not self._valid_owner_token(owner_token):
+                identity_failures.append("launcher profile ownership token is invalid")
             if state.get("plist_fields") != list(PLIST_FIELDS):
                 identity_failures.append("launcher plist field inventory does not match")
             if identity_failures:
@@ -1776,6 +2086,38 @@ class LauncherInstaller:
                 expected_identity,
                 str(state["icon_sha256"]),
             )
+            loaded_config = LauncherConfig.load(config)
+            if (
+                loaded_config.bottle_realpath
+                != str(installation.bottle.root.resolve())
+                or loaded_config.bottle_tag != expected_tag
+                or loaded_config.profile_owner_token != owner_token
+            ):
+                raise PatchError(
+                    "install.launcher_verify",
+                    "Installation failed.",
+                    "Launcher runtime ownership identity does not match",
+                )
+            lock = Path(str(state["lock_path"]))
+            expected_lock = self._lock_data(str(owner_token))
+            if (
+                lock.is_symlink()
+                or not lock.is_file()
+                or lock.read_bytes() != expected_lock
+                or _file_digest(lock) != state.get("lock_sha256")
+            ):
+                raise PatchError(
+                    "install.launcher_verify",
+                    "Installation failed.",
+                    "Launcher lock ownership does not match",
+                )
+            marker = Path(str(state["recovery_marker"]))
+            if _lexists(marker) and not self._valid_marker(marker, str(owner_token)):
+                raise PatchError(
+                    "install.launcher_verify",
+                    "Installation failed.",
+                    "Launcher recovery marker is invalid or unowned",
+                )
             if _file_digest(app / "Contents/MacOS/Menu Helper") != state.get(
                 "executable_sha256"
             ):
@@ -1801,6 +2143,8 @@ class LauncherInstaller:
 
     @staticmethod
     def _restore_saved(path: Path, installed_digest: str, saved: object) -> None:
+        if path.is_symlink():
+            return
         if path.is_file() and _file_digest(path) != installed_digest:
             return
         if isinstance(saved, dict):
@@ -1987,9 +2331,17 @@ class LauncherInstaller:
             key=lambda entry: len(Path(str(entry["relative_path"])).parts),
         ):
             relative = Path(str(item["relative_path"]))
+            source_directory = previous if relative == Path(".") else previous / relative
+            source_directory.chmod(int(item.get("mode", 0o755)) | 0o700)
+        for item in sorted(
+            directories,
+            key=lambda entry: len(Path(str(entry["relative_path"])).parts),
+        ):
+            relative = Path(str(item["relative_path"]))
             destination = app if relative == Path(".") else app / relative
-            destination.mkdir(parents=True, exist_ok=True)
-            destination.chmod(int(item.get("mode", 0o755)))
+            destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination.chmod(int(item.get("mode", 0o755)) | 0o700)
+            _sync_directory(destination.parent)
         for item in inventory:
             if not isinstance(item, dict) or not isinstance(item.get("relative_path"), str):
                 continue
@@ -2008,6 +2360,9 @@ class LauncherInstaller:
                 )
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(source, destination)
+            _sync_directory(source.parent)
+            if destination.parent != source.parent:
+                _sync_directory(destination.parent)
         for directory in sorted(
             _tree_directories(previous),
             key=lambda path: len(path.parts),
@@ -2021,6 +2376,19 @@ class LauncherInstaller:
             previous.rmdir()
         except OSError:
             pass
+        for item in sorted(
+            directories,
+            key=lambda entry: len(Path(str(entry["relative_path"])).parts),
+            reverse=True,
+        ):
+            relative = Path(str(item["relative_path"]))
+            destination = app if relative == Path(".") else app / relative
+            descriptor = os.open(str(destination), os.O_RDONLY)
+            try:
+                os.fchmod(descriptor, int(item.get("mode", 0o755)))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
     def _restore(
         self,

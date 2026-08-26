@@ -3,9 +3,11 @@ from dataclasses import dataclass
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import plistlib
+import re
 import subprocess
 from unittest.mock import patch
 
@@ -65,6 +67,8 @@ def make_config(root="/tmp"):
         bottle_name="Ostriv",
         bottle_argument="Ostriv",
         scope="managed",
+        bottle_realpath=root + "/Bottles/Ostriv",
+        bottle_tag="CrossOver-selected-id/",
         wine="/Applications/CrossOver.app/wine",
         game_command=["wine", "C:/Ostriv/ostriv.exe"],
         steam_apps_root=root + "/CrossOver Apps",
@@ -384,6 +388,7 @@ class SteamControllerTests(unittest.TestCase):
                 plistlib.dump(
                     {
                         "CXHelperAppBottleName": config.bottle_name,
+                        "CXHelperAppBottleTag": config.bottle_tag,
                         "CrossOverHelperCommand": '"C:/Steam/Steam.lnk"',
                     },
                     stream,
@@ -410,6 +415,61 @@ class SteamControllerTests(unittest.TestCase):
             controller.ensure_ready()
 
             self.assertEqual([(["open", str(app)], 10.0)], calls)
+
+    def test_steam_app_requires_matching_bottle_name_and_tag(self):
+        """A same-named app owned by another bottle must never be opened."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            object.__setattr__(config, "bottle_tag", "CrossOver-selected-id/")
+            config.steam_links.clear()
+            root = Path(config.steam_apps_root)
+            wrong = root / "Wrong Steam.app"
+            contents = wrong / "Contents"
+            contents.mkdir(parents=True)
+            with (contents / "Info.plist").open("wb") as stream:
+                plistlib.dump(
+                    {
+                        "CXHelperAppBottleName": config.bottle_name,
+                        "CXHelperAppBottleTag": "CrossOver-other-id/",
+                        "CrossOverHelperCommand": '"C:/Steam/Steam.lnk"',
+                    },
+                    stream,
+                )
+            calls = []
+
+            class OpenRunner:
+                def run(self, argv, timeout=None):
+                    calls.append((list(argv), timeout))
+                    return FakeResult(0)
+
+            controller = SteamController(config=config, runner=OpenRunner())
+
+            self.assertFalse(controller._open_configured_steam())
+            self.assertEqual([], calls)
+
+    def test_process_and_renderer_probes_include_selected_canonical_bottle_scope(self):
+        """Global Steam processes cannot satisfy a different selected bottle."""
+        config = make_config("/private/tmp/selected")
+        object.__setattr__(config, "bottle_realpath", "/Bottles/selected-id")
+        calls = []
+
+        class ScopedRunner:
+            def run(self, argv, timeout=None):
+                argv = list(argv)
+                calls.append(argv)
+                if argv[:2] == ["pgrep", "-f"]:
+                    matched_selected = re.escape(config.bottle_realpath) in argv[-1]
+                    return FakeResult(1 if matched_selected else 0)
+                return FakeResult(0, b"ActiveUser    REG_DWORD    0x1\n")
+
+        signals = SteamController(config=config, runner=ScopedRunner()).probe()
+
+        self.assertEqual(SteamSignals(False, True, False), signals)
+        pgrep_patterns = [argv[-1] for argv in calls if argv[:2] == ["pgrep", "-f"]]
+        self.assertEqual(2, len(pgrep_patterns))
+        self.assertTrue(
+            all(re.escape(config.bottle_realpath) in pattern for pattern in pgrep_patterns)
+        )
 
 
 class ExternalProcessRunnerTests(unittest.TestCase):
@@ -444,6 +504,21 @@ class ExternalProcessRunnerTests(unittest.TestCase):
 
 
 class ProcessLockTests(unittest.TestCase):
+    @unittest.skipIf(not hasattr(os, "O_NOFOLLOW"), "requires no-follow file opens")
+    def test_lock_open_never_follows_a_substituted_symlink(self):
+        """A lock alias must not create or lock an external target."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "outside.lock"
+            alias = root / "launcher.lock"
+            alias.symlink_to(target)
+
+            with self.assertRaises(OSError):
+                ProcessLock(alias).acquire()
+
+            self.assertTrue(alias.is_symlink())
+            self.assertFalse(target.exists())
+
     def test_second_launcher_is_rejected_until_first_lock_closes(self):
         """Allowing two holders would let double-click launches race profile and game state."""
         with TemporaryDirectory() as directory:
@@ -475,6 +550,10 @@ class ProcessLockTests(unittest.TestCase):
             lock = ProcessLock(Path(directory) / "launcher.lock")
             closed = []
             with patch.object(runtime.os, "open", return_value=71), patch.object(
+                runtime.os,
+                "fstat",
+                return_value=type("Status", (), {"st_mode": 0o100600, "st_nlink": 1})(),
+            ), patch.object(
                 runtime.fcntl, "flock", side_effect=OSError("flock failed")
             ), patch.object(runtime.os, "close", side_effect=closed.append):
                 with self.assertRaisesRegex(OSError, "flock failed"):
@@ -503,6 +582,10 @@ class ProcessLockTests(unittest.TestCase):
                 flocked.append(descriptor)
 
             with patch.object(runtime.os, "open", side_effect=open_once), patch.object(
+                runtime.os,
+                "fstat",
+                return_value=type("Status", (), {"st_mode": 0o100600, "st_nlink": 1})(),
+            ), patch.object(
                 runtime.fcntl, "flock", side_effect=flock_once
             ), patch.object(runtime.os, "close", side_effect=closed.append):
                 self.assertTrue(lock.acquire())
@@ -515,6 +598,42 @@ class ProcessLockTests(unittest.TestCase):
 
 
 class LaunchLogTests(unittest.TestCase):
+    def test_generation_token_reads_only_bounded_content_evidence(self):
+        """Capturing an old large log must not hash its unbounded full contents."""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ostriv.log"
+            path.write_bytes(b"x" * (runtime.LOG_TOKEN_TAIL_BYTES * 4))
+            real_open = Path.open
+            bytes_read = [0]
+
+            class CountingReader:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def read(self, size=-1):
+                    data = self.stream.read(size)
+                    bytes_read[0] += len(data)
+                    return data
+
+                def __getattr__(self, name):
+                    return getattr(self.stream, name)
+
+            def counted_open(candidate, *args, **kwargs):
+                stream = real_open(candidate, *args, **kwargs)
+                return CountingReader(stream) if Path(candidate) == path else stream
+
+            with patch.object(Path, "open", new=counted_open):
+                runtime.capture_log_generation(path)
+
+            self.assertLessEqual(bytes_read[0], runtime.LOG_TOKEN_TAIL_BYTES * 2)
+
     def test_only_fresh_appended_log_content_is_classified(self):
         """Reading the full log would retry forever because of an old Steam failure."""
         with TemporaryDirectory() as directory:
@@ -546,6 +665,50 @@ class LaunchLogTests(unittest.TestCase):
             self.assertEqual(
                 "graphics_context", classify_launch("windows_createWindow FAILED")
             )
+
+    def test_generation_reader_handles_append_truncate_recreate_and_in_place_overwrite(self):
+        """Ostriv may append, truncate, recreate, or overwrite its per-run log."""
+        cases = ("append", "truncate", "recreate", "overwrite")
+        for case in cases:
+            with self.subTest(case=case), TemporaryDirectory() as directory:
+                path = Path(directory) / "ostriv.log"
+                stale = b"stale SteamAPI_Init() failed\n"
+                path.write_bytes(stale)
+                before = path.stat()
+                token = runtime.capture_log_generation(path)
+                fresh = b"windows_createWindow FAILED\n"
+                if case == "append":
+                    with path.open("ab") as stream:
+                        stream.write(fresh)
+                elif case == "truncate":
+                    path.write_bytes(fresh)
+                elif case == "recreate":
+                    path.unlink()
+                    path.write_bytes(fresh)
+                else:
+                    replacement = fresh.ljust(len(stale), b"!")[: len(stale)]
+                    with path.open("r+b") as stream:
+                        stream.seek(0)
+                        stream.write(replacement)
+                        stream.flush()
+                    os.utime(
+                        path,
+                        ns=(before.st_atime_ns, before.st_mtime_ns),
+                    )
+
+                text = read_new_log(path, token)
+
+                self.assertNotIn("stale SteamAPI", text)
+                self.assertEqual("graphics_context", classify_launch(text))
+
+    def test_generation_reader_returns_empty_for_untouched_stale_marker(self):
+        """Metadata and content evidence must not reclassify an untouched old failure."""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ostriv.log"
+            path.write_bytes(b"SteamAPI_Init() failed\n")
+            token = runtime.capture_log_generation(path)
+
+            self.assertEqual("", read_new_log(path, token))
 
 
 class FakeLock:
@@ -587,10 +750,11 @@ class FakeSteam:
 
 
 class FakeGameRunner:
-    def __init__(self, events, log_path, additions):
+    def __init__(self, events, log_path, additions, returncodes=None):
         self.events = events
         self.log_path = Path(log_path)
         self.additions = list(additions)
+        self.returncodes = list(returncodes or [0] * len(self.additions))
         self.calls = 0
 
     def run(self, argv, timeout=None):
@@ -599,7 +763,7 @@ class FakeGameRunner:
         addition = self.additions.pop(0)
         with self.log_path.open("ab") as stream:
             stream.write(addition)
-        return FakeResult(0)
+        return FakeResult(self.returncodes.pop(0))
 
 
 class FakeLogger:
@@ -772,7 +936,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
             )
             self.assertIn(("final", "other"), events)
 
-    def test_graphics_and_unrelated_failures_never_retry(self):
+    def test_graphics_is_terminal_and_unrelated_zero_result_does_not_retry(self):
         """Broad automatic retries would duplicate launches for failures Steam cannot fix."""
         for addition in (b"windows_createWindow FAILED\n", b"unrelated failure\n"):
             with self.subTest(addition=addition), TemporaryDirectory() as directory:
@@ -780,8 +944,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                 events = []
                 runner = FakeGameRunner(events, config.game_log, [addition])
 
-                code = run_launcher(
-                    config,
+                arguments = dict(
                     lock=FakeLock(events),
                     log_factory=lambda _path: FakeLogger(events),
                     runner=runner,
@@ -790,10 +953,83 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     dialog=lambda _message: self.fail("unexpected dialog"),
                     install_handlers=lambda _profile: None,
                 )
-
-                self.assertEqual(0, code)
+                if b"windows_createWindow" in addition:
+                    with self.assertRaises(LauncherRuntimeError):
+                        run_launcher(config, **arguments)
+                else:
+                    self.assertEqual(0, run_launcher(config, **arguments))
                 self.assertEqual(1, runner.calls)
                 self.assertEqual(1, events.count("restore"))
+
+    def test_terminal_steam_graphics_and_nonzero_results_are_typed_and_clean_up(self):
+        """A completed Wine command is not success when fresh evidence says launch failed."""
+        cases = (
+            (
+                "second SteamAPI",
+                [b"SteamAPI_Init() failed\n", b"SteamAPI_Init() failed\n"],
+                [0, 0],
+                2,
+            ),
+            ("graphics", [b"windows_createWindow FAILED\n"], [0], 1),
+            ("nonzero", [b"normal log\n"], [9], 1),
+            (
+                "nonzero graphics",
+                [b"windows_createWindow FAILED\n"],
+                [9],
+                1,
+            ),
+        )
+        for label, additions, returncodes, attempts in cases:
+            with self.subTest(label=label), TemporaryDirectory() as directory:
+                config = make_config(directory)
+                events = []
+                runner = FakeGameRunner(
+                    events, config.game_log, additions, returncodes=returncodes
+                )
+
+                with self.assertRaises(LauncherRuntimeError) as caught:
+                    run_launcher(
+                        config,
+                        lock=FakeLock(events),
+                        log_factory=lambda _path: FakeLogger(events),
+                        runner=runner,
+                        steam=FakeSteam(events),
+                        profile=FakeProfile(events),
+                        dialog=lambda _message: self.fail("main owns failure dialogs"),
+                        install_handlers=lambda _profile: None,
+                    )
+
+                self.assertEqual("game_failed", caught.exception.message_key)
+                self.assertLessEqual(len(caught.exception.detail), 256)
+                self.assertEqual(attempts, runner.calls)
+                self.assertEqual(1, events.count("restore"))
+                self.assertEqual("unlock", events[-1])
+
+    def test_first_steam_marker_is_classified_before_nonzero_result_and_retries_once(self):
+        """Only attempt one's fresh Steam marker may override nonzero into one retry."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            events = []
+            runner = FakeGameRunner(
+                events,
+                config.game_log,
+                [b"SteamAPI_Init() failed\n", b"normal retry exit\n"],
+                returncodes=[7, 0],
+            )
+
+            code = run_launcher(
+                config,
+                lock=FakeLock(events),
+                log_factory=lambda _path: FakeLogger(events),
+                runner=runner,
+                steam=FakeSteam(events),
+                profile=FakeProfile(events),
+                dialog=lambda _message: self.fail("unexpected dialog"),
+                install_handlers=lambda _profile: None,
+            )
+
+            self.assertEqual(0, code)
+            self.assertEqual(2, runner.calls)
 
     def test_game_runner_failure_restores_profile_and_releases_lock(self):
         """An external launch exception after switching must not strand the display profile."""

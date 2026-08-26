@@ -110,6 +110,66 @@ class TransactionTests(unittest.TestCase):
 
         self.assertEqual([], list(self.path.parent.iterdir()))
 
+    @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-only")
+    def test_atomic_bytes_syncs_each_new_parent_and_the_published_leaf_directory(self):
+        """Nested creation must durably publish every parent link before success."""
+        target = Path(self.temp.name) / "new" / "nested" / "settings.data"
+        synced = []
+        real_sync = installer_module._fsync_directory
+
+        def record(path):
+            synced.append(Path(path))
+            return real_sync(path)
+
+        with patch.object(installer_module, "_fsync_directory", side_effect=record):
+            installer_module._atomic_write_bytes(target, b"player settings")
+
+        self.assertEqual(b"player settings", target.read_bytes())
+        self.assertTrue(
+            {Path(self.temp.name), target.parent.parent, target.parent}.issubset(
+                set(synced)
+            )
+        )
+
+    @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-only")
+    def test_directory_sync_failure_rolls_back_atomic_player_write_recoverably(self):
+        """A replace whose directory sync fails stays journaled and restores old data."""
+        target = Path(self.temp.name) / "player.data"
+        target.write_bytes(b"original-player-data")
+        journal = InstallJournal(Path(self.temp.name) / "player-journal.json")
+
+        def restore(_record):
+            installer_module._atomic_write_bytes(target, b"original-player-data")
+
+        transaction = Transaction(journal, {"restore": restore})
+        transaction.start("player-write")
+        real_sync = installer_module._fsync_directory
+        failures = [OSError("injected player directory sync failure")]
+
+        def fail_once(path):
+            if (
+                Path(path).resolve() == target.parent.resolve()
+                and target.read_bytes() == b"new-data"
+                and failures
+            ):
+                raise failures.pop()
+            return real_sync(path)
+
+        with patch.object(installer_module, "_fsync_directory", side_effect=fail_once):
+            with self.assertRaisesRegex(OSError, "player directory sync failure"):
+                transaction.step(
+                    "replace player data",
+                    UndoRecord("restore", {}),
+                    lambda: installer_module._atomic_write_bytes(target, b"new-data"),
+                )
+
+        self.assertEqual(b"original-player-data", target.read_bytes())
+        self.assertEqual("rolled_back", transaction.journal.data["records"][0]["status"])
+        self.assertFalse(transaction.journal.data["complete"])
+        transaction.recover_incomplete()
+        self.assertTrue(transaction.journal.data["complete"])
+        self.assertEqual(b"original-player-data", target.read_bytes())
+
     def test_corrupt_journal_is_not_replaced_by_a_new_operation(self):
         self.path.write_text("{", encoding="utf-8")
 

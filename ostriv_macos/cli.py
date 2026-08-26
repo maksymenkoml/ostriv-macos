@@ -200,7 +200,9 @@ def diagnose(context: DiagnosticContext) -> DiagnosticSummary:
     games = discover_games(bottles)
     if context.game_path and crossovers:
         try:
-            explicit = resolve_explicit_game(Path(context.game_path), crossovers)
+            explicit = resolve_explicit_game(
+                Path(context.game_path), crossovers, bottles
+            )
         except PatchError:
             pass
         else:
@@ -298,16 +300,27 @@ class ProductionServices:
             env=self.env,
             runner=self.runner,
         )
+        inventory = []
+        inventory_seen = set()
+        for crossover in crossovers:
+            for bottle in discover_bottles(crossover, self.home, self.env):
+                identity = bottle.root.resolve()
+                if identity not in inventory_seen:
+                    inventory_seen.add(identity)
+                    inventory.append(bottle)
         if game_path:
-            return [resolve_explicit_game(Path(game_path).expanduser(), crossovers)]
+            return [
+                resolve_explicit_game(
+                    Path(game_path).expanduser(), crossovers, inventory
+                )
+            ]
         games = []
         seen = set()
-        for crossover in crossovers:
-            for game in discover_games(discover_bottles(crossover, self.home, self.env)):
-                resolved = game.game_dir.resolve()
-                if resolved not in seen:
-                    seen.add(resolved)
-                    games.append(game)
+        for game in discover_games(inventory):
+            resolved = game.game_dir.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                games.append(game)
         return games
 
     def is_installed(self, installation) -> bool:
