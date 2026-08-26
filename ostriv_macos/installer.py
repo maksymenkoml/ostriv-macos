@@ -313,28 +313,23 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_copy_file(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_name = None
+def _atomic_copy_file(source: Path, destination: Path, staging: Path) -> None:
+    if staging.parent != destination.parent:
+        raise ValueError("copy staging path must be a sibling of its destination")
     try:
-        with source.open("rb") as source_stream, tempfile.NamedTemporaryFile(
-            "wb",
-            prefix=".{}.".format(destination.name),
-            suffix=".tmp",
-            dir=str(destination.parent),
-            delete=False,
-        ) as destination_stream:
-            temp_name = destination_stream.name
+        with source.open("rb") as source_stream, staging.open("wb") as destination_stream:
             shutil.copyfileobj(source_stream, destination_stream)
             destination_stream.flush()
-            shutil.copystat(source, temp_name)
+            shutil.copystat(source, staging)
             os.fsync(destination_stream.fileno())
-        os.replace(temp_name, str(destination))
-        temp_name = None
+        os.replace(str(staging), str(destination))
         _fsync_directory(destination.parent)
-    finally:
-        if temp_name and os.path.exists(temp_name):
-            os.unlink(temp_name)
+    except BaseException:
+        try:
+            staging.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class LauncherPort(Protocol):
@@ -429,8 +424,16 @@ class WineRegistry:
 
     @staticmethod
     def _missing(result) -> bool:
-        detail = "{}\n{}".format(result.stdout, result.stderr).lower()
-        return "not found" in detail or "unable to find" in detail
+        missing = re.compile(
+            r"^\s*reg(?:\.exe)?\s*:\s*"
+            r"(?:the system was )?unable to find the specified registry "
+            r"(?:key or value|key|value)\.?\s*$",
+            re.IGNORECASE,
+        )
+        return any(
+            missing.fullmatch(line) is not None
+            for line in "{}\n{}".format(result.stdout, result.stderr).splitlines()
+        )
 
     def query(
         self, key: str, value: str, error_code: str = "install.registry"
@@ -583,6 +586,19 @@ class Installer:
             current = current.parent
         return directories
 
+    def _allowed_atomic_copy_destination(
+        self, installation: GameInstallation, destination: Path
+    ) -> bool:
+        destination = destination.resolve(strict=False)
+        targets = self._allowed_owned_targets(installation) | {
+            installation.bottle.root.resolve() / "cxbottle.conf",
+            self._settings_path(installation),
+        }
+        return destination in targets or any(
+            self._valid_backup_relationship(target, destination)
+            for target in targets
+        )
+
     @staticmethod
     def _valid_backup_relationship(target: Path, backup: Path) -> bool:
         if backup.parent != target.parent:
@@ -669,6 +685,9 @@ class Installer:
     ) -> Mapping[str, Callable[[UndoRecord], None]]:
         return {
             "remove_path": lambda record: self._undo_remove_path(installation, record),
+            "remove_staging": lambda record: self._undo_remove_staging(
+                installation, record
+            ),
             "restore_file": lambda record: self._undo_restore_file(installation, record),
             "restore_registry": lambda record: self._undo_restore_registry(
                 installation, record
@@ -869,9 +888,44 @@ class Installer:
             counter += 1
         return candidate
 
+    @staticmethod
+    def _staging_name(destination: Path, counter: int) -> str:
+        suffix = "" if counter == 1 else "-{}".format(counter)
+        return ".{}.ostriv-macos-stage{}".format(destination.name, suffix)
+
+    def _prepare_copy_staging(
+        self,
+        transaction: Transaction,
+        installation: GameInstallation,
+        destination: Path,
+    ) -> Path:
+        destination = destination.resolve(strict=False)
+        counter = 1
+        staging = destination.with_name(self._staging_name(destination, counter))
+        while staging.exists():
+            counter += 1
+            staging = destination.with_name(self._staging_name(destination, counter))
+
+        def create_owned_staging() -> None:
+            with staging.open("xb") as stream:
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(staging.parent)
+
+        transaction.step(
+            "own copy staging for {}".format(destination.name),
+            UndoRecord(
+                "remove_staging",
+                {"path": str(staging), "destination": str(destination)},
+            ),
+            create_owned_staging,
+        )
+        return staging
+
     def _install_file(
         self,
         transaction: Transaction,
+        installation: GameInstallation,
         path: Path,
         source: Path,
         name: str,
@@ -924,10 +978,21 @@ class Installer:
                     },
                 )
 
+            backup_staging = (
+                self._prepare_copy_staging(transaction, installation, backup)
+                if not backup.exists()
+                else None
+            )
+            destination_staging = self._prepare_copy_staging(
+                transaction, installation, path
+            )
+
             def replace() -> None:
                 if not backup.exists():
-                    _atomic_copy_file(path, backup)
-                _atomic_copy_file(source, path)
+                    if backup_staging is None:
+                        raise RuntimeError("missing backup staging path")
+                    _atomic_copy_file(path, backup, backup_staging)
+                _atomic_copy_file(source, path, destination_staging)
 
             transaction.step(name, undo, replace)
             self._upsert(
@@ -940,6 +1005,9 @@ class Installer:
                 },
             )
         else:
+            destination_staging = self._prepare_copy_staging(
+                transaction, installation, path
+            )
             undo = UndoRecord(
                 "remove_path",
                 {
@@ -948,7 +1016,11 @@ class Installer:
                     "expected_sha256": desired_digest,
                 },
             )
-            transaction.step(name, undo, lambda: _atomic_copy_file(source, path))
+            transaction.step(
+                name,
+                undo,
+                lambda: _atomic_copy_file(source, path, destination_staging),
+            )
         self._upsert(
             self._owned_files, {"path": str(path), "sha256": desired_digest}
         )
@@ -974,6 +1046,7 @@ class Installer:
                 )
             self._install_file(
                 transaction,
+                installation,
                 installation.game_dir.resolve() / name,
                 self.package_root / entry.relative_path,
                 "stage {}".format(name),
@@ -1000,6 +1073,9 @@ class Installer:
         if path.exists():
             original_digest = _file_digest(path)
             backup = self._choose_backup(path)
+            backup_staging = self._prepare_copy_staging(
+                transaction, installation, backup
+            )
             undo = UndoRecord(
                 "restore_file",
                 {
@@ -1012,7 +1088,7 @@ class Installer:
             )
 
             def replace() -> None:
-                _atomic_copy_file(path, backup)
+                _atomic_copy_file(path, backup, backup_staging)
                 _atomic_write_bytes(path, desired, stat_mode(path))
 
             transaction.step("write game app id", undo, replace)
@@ -1137,6 +1213,9 @@ class Installer:
             return
         backup = self._choose_backup(path)
         installed_digest = _bytes_digest(desired)
+        backup_staging = self._prepare_copy_staging(
+            transaction, installation, backup
+        )
         transaction.step(
             "set bottle environment",
             UndoRecord(
@@ -1149,7 +1228,7 @@ class Installer:
                     "original_sha256": original_digest,
                 },
             ),
-            lambda: self._backup_and_write(path, backup, desired),
+            lambda: self._backup_and_write(path, backup, backup_staging, desired),
         )
         self._config = {
             "backup": str(backup),
@@ -1210,6 +1289,9 @@ class Installer:
                 return
             backup = self._choose_backup(path)
             installed_digest = _bytes_digest(desired)
+            backup_staging = self._prepare_copy_staging(
+                transaction, installation, backup
+            )
             transaction.step(
                 "set safe graphics",
                 UndoRecord(
@@ -1222,7 +1304,9 @@ class Installer:
                         "original_sha256": original_digest,
                     },
                 ),
-                lambda: self._backup_and_write(path, backup, desired),
+                lambda: self._backup_and_write(
+                    path, backup, backup_staging, desired
+                ),
             )
             self._settings = {
                 "backup": str(backup),
@@ -1267,10 +1351,12 @@ class Installer:
         }
 
     @staticmethod
-    def _backup_and_write(path: Path, backup: Path, data: bytes) -> None:
+    def _backup_and_write(
+        path: Path, backup: Path, backup_staging: Path, data: bytes
+    ) -> None:
         mode = stat_mode(path)
         if not backup.exists():
-            _atomic_copy_file(path, backup)
+            _atomic_copy_file(path, backup, backup_staging)
         _atomic_write_bytes(path, data, mode)
 
     def _completed_time(self) -> str:
@@ -1511,6 +1597,35 @@ class Installer:
         self._remove_empty_owned_directories(
             installation, record.data.get("owned_directories", [])
         )
+
+    def _undo_remove_staging(
+        self, installation: GameInstallation, record: UndoRecord
+    ) -> None:
+        path_text = record.data.get("path")
+        destination_text = record.data.get("destination")
+        if not isinstance(path_text, str) or not isinstance(destination_text, str):
+            return
+        path = Path(path_text)
+        destination = Path(destination_text)
+        if (
+            not path.is_absolute()
+            or not destination.is_absolute()
+            or path.parent != destination.parent
+            or not self._allowed_atomic_copy_destination(installation, destination)
+        ):
+            return
+        base_name = self._staging_name(destination, 1)
+        suffix = (
+            path.name[len(base_name) + 1 :]
+            if path.name.startswith(base_name + "-")
+            else ""
+        )
+        valid_name = path.name == base_name or (
+            suffix.isdigit() and str(int(suffix)) == suffix and int(suffix) >= 2
+        )
+        if not valid_name or path.is_symlink() or not path.is_file():
+            return
+        path.unlink()
 
     def _remove_empty_owned_directories(
         self, installation: GameInstallation, directories: object

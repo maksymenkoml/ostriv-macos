@@ -49,6 +49,7 @@ class FakeRunner:
         self.delete_failures = 0
         self.query_failures = 0
         self.query_failures_after_delete = 0
+        self.query_results = []
         self.status_result = CommandResult(0, "running\n", "")
 
     def run(self, argv, timeout=None):
@@ -63,11 +64,17 @@ class FakeRunner:
         value = argv[argv.index("/v") + 1]
         identity = (key, value)
         if operation == "query":
+            if self.query_results:
+                return self.query_results.pop(0)
             if self.query_failures:
                 self.query_failures -= 1
                 return CommandResult(2, "", "\ufffd registry query failed")
             if identity not in self.registry:
-                return CommandResult(1, "\ufffd missing\n", "\ufffd not found")
+                return CommandResult(
+                    1,
+                    "",
+                    "reg: Unable to find the specified registry key or value\n",
+                )
             return CommandResult(
                 0,
                 "\ufffd ignored\n{}    REG_SZ    {}\n".format(
@@ -280,6 +287,92 @@ class FakeBottleFixture:
 
 
 class InstallerTests(unittest.TestCase):
+    def test_incomplete_copy_journal_removes_owned_staging_file(self):
+        fixture = FakeBottleFixture()
+        try:
+            destination = (fixture.game_dir / "opengl32.dll").resolve()
+            genuine = destination.read_bytes()
+            installer = fixture.installer()
+            installer.preflight(fixture.installation, fixture.payload)
+            installer._start_ownership()
+
+            class TerminateBeforeReplace(Transaction):
+                def step(inner_self, name, undo, action):
+                    if name != "stage opengl32.dll":
+                        return super(TerminateBeforeReplace, inner_self).step(
+                            name, undo, action
+                        )
+                    cleanup_records = [
+                        item
+                        for item in inner_self.journal.data["records"]
+                        if item["undo"]["kind"] == "remove_staging"
+                        and item["undo"]["data"].get("destination")
+                        == str(destination)
+                    ]
+                    self.assertEqual(1, len(cleanup_records))
+                    staging = Path(cleanup_records[0]["undo"]["data"]["path"])
+                    self.assertEqual(destination.parent, staging.parent)
+                    inner_self.journal.begin(name, undo)
+                    staging.write_bytes(b"partial driver bytes")
+                    raise SystemExit("simulated hard termination")
+
+            journal = InstallJournal(installer.journal_path(fixture.installation))
+            interrupted = TerminateBeforeReplace(
+                journal, installer.undo_handlers(fixture.installation)
+            )
+            interrupted.start("install")
+            with self.assertRaisesRegex(SystemExit, "hard termination"):
+                installer.stage_driver_files(
+                    interrupted, fixture.installation, fixture.payload
+                )
+
+            cleanup = next(
+                item
+                for item in journal.data["records"]
+                if item["undo"]["kind"] == "remove_staging"
+            )
+            staging = Path(cleanup["undo"]["data"]["path"])
+            self.assertTrue(staging.is_file())
+            self.assertEqual(genuine, destination.read_bytes())
+
+            recovered = fixture.installer().transaction_for(fixture.installation)
+            recovered.recover_incomplete()
+
+            self.assertFalse(staging.exists())
+            self.assertEqual(genuine, destination.read_bytes())
+        finally:
+            fixture.cleanup()
+
+    def test_successful_driver_copy_has_ordered_staging_cleanup_and_no_artifact(self):
+        fixture = FakeBottleFixture()
+        try:
+            installer = fixture.installer()
+            installer.install(fixture.installation, fixture.payload)
+            records = installer.transactions[-1].journal.data["records"]
+
+            for driver in DRIVERS:
+                destination = (fixture.game_dir / driver).resolve()
+                mutation_index = next(
+                    index
+                    for index, item in enumerate(records)
+                    if item["name"] == "stage {}".format(driver)
+                )
+                cleanup_indexes = [
+                    index
+                    for index, item in enumerate(records)
+                    if item["undo"]["kind"] == "remove_staging"
+                    and item["undo"]["data"].get("destination")
+                    == str(destination)
+                ]
+                self.assertEqual(1, len(cleanup_indexes))
+                self.assertLess(cleanup_indexes[0], mutation_index)
+                staging = Path(
+                    records[cleanup_indexes[0]]["undo"]["data"]["path"]
+                )
+                self.assertFalse(staging.exists())
+        finally:
+            fixture.cleanup()
+
     def test_driver_copy_failure_before_replace_preserves_genuine_destination(self):
         fixture = FakeBottleFixture()
         try:
@@ -544,6 +637,79 @@ class InstallerTests(unittest.TestCase):
                 fixture.bin_dir / "wine", fixture.bottle, fixture.runner
             )
             self.assertEqual("builtin", registry.query(REGISTRY_KEY, REGISTRY_VALUE))
+        finally:
+            fixture.cleanup()
+
+    def test_registry_missing_requires_exact_wine_registry_diagnostic(self):
+        exact_missing = (
+            "reg: Unable to find the specified registry key",
+            "reg: Unable to find the specified registry value",
+            "reg: The system was unable to find the specified registry key or value.",
+        )
+        for diagnostic in exact_missing:
+            with self.subTest(exact_missing=diagnostic):
+                fixture = FakeBottleFixture()
+                try:
+                    fixture.runner.query_results = [
+                        CommandResult(1, "", diagnostic + "\n")
+                    ]
+                    registry = WineRegistry(
+                        fixture.bin_dir / "wine", fixture.bottle, fixture.runner
+                    )
+                    self.assertIsNone(
+                        registry.query(REGISTRY_KEY, REGISTRY_VALUE)
+                    )
+                finally:
+                    fixture.cleanup()
+
+        ambiguous_failures = (
+            "wine: selected bottle not found",
+            "wine: unable to find ntdll.dll dependency",
+            "reg: backend not found while querying registry",
+            "The system was unable to find the specified registry key or value.",
+        )
+        for diagnostic in ambiguous_failures:
+            with self.subTest(ambiguous_failure=diagnostic):
+                fixture = FakeBottleFixture()
+                try:
+                    failure = CommandResult(2, "", diagnostic + "\n")
+                    fixture.runner.query_results = [failure, failure]
+                    registry = WineRegistry(
+                        fixture.bin_dir / "wine", fixture.bottle, fixture.runner
+                    )
+                    with self.assertRaises(PatchError) as caught:
+                        registry.query(REGISTRY_KEY, REGISTRY_VALUE)
+                    self.assertEqual("install.registry", caught.exception.code)
+                    query_calls = [
+                        call for call, _timeout in fixture.runner.calls if "query" in call
+                    ]
+                    self.assertEqual(2, len(query_calls))
+                finally:
+                    fixture.cleanup()
+
+    def test_registry_delete_rejects_ambiguous_not_found_output(self):
+        fixture = FakeBottleFixture()
+        try:
+            ambiguous = CommandResult(
+                2, "", "wine: selected bottle not found while running reg\n"
+            )
+            fixture.runner.query_results = [ambiguous] * 4
+            registry = WineRegistry(
+                fixture.bin_dir / "wine", fixture.bottle, fixture.runner
+            )
+
+            with self.assertRaises(PatchError) as caught:
+                registry.delete(REGISTRY_KEY, REGISTRY_VALUE)
+
+            self.assertEqual("restore.registry", caught.exception.code)
+            delete_calls = [
+                call for call, _timeout in fixture.runner.calls if "delete" in call
+            ]
+            query_calls = [
+                call for call, _timeout in fixture.runner.calls if "query" in call
+            ]
+            self.assertEqual(2, len(delete_calls))
+            self.assertEqual(4, len(query_calls))
         finally:
             fixture.cleanup()
 
