@@ -36,6 +36,14 @@ PLAYER_PATHS = (
 )
 _IGNORED_NAMES = {"__pycache__"}
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+_MAX_ZIP_MEMBERS = 64
+_MAX_PATH_BYTES = 512
+_MAX_PATH_COMPONENT_BYTES = 255
+_MAX_MEMBER_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+_MAX_TOTAL_UNCOMPRESSED_BYTES = 96 * 1024 * 1024
+_MAX_COMPRESSION_RATIO = 200
+_STREAM_CHUNK_BYTES = 1024 * 1024
+_SUPPORTED_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
 
 def _copy_directory(source: Path, destination: Path) -> None:
@@ -92,10 +100,24 @@ def _validated_members(
     root = destination.resolve()
     validated = []
     seen = {}
-    for member in bundle.infolist():
+    members = bundle.infolist()
+    if len(members) > _MAX_ZIP_MEMBERS:
+        raise ValueError("ZIP contains too many members")
+    total_size = 0
+    for member in members:
         name = member.filename
-        if not name or "\x00" in name or "\\" in name:
+        if not isinstance(name, str) or not name or "\x00" in name or "\\" in name:
             raise ValueError("unsafe ZIP member: {}".format(name))
+        try:
+            path_variants = (
+                name.encode("utf-8"),
+                unicodedata.normalize("NFC", name).encode("utf-8"),
+                unicodedata.normalize("NFD", name).encode("utf-8"),
+            )
+        except UnicodeEncodeError as error:
+            raise ValueError("unsafe ZIP member encoding") from error
+        if max(len(value) for value in path_variants) > _MAX_PATH_BYTES:
+            raise ValueError("ZIP member path is too long: {}".format(name))
         posix = PurePosixPath(name)
         windows = PureWindowsPath(name)
         raw_parts = name.rstrip("/").split("/")
@@ -107,6 +129,20 @@ def _validated_members(
             or any(part in ("", ".", "..") for part in raw_parts)
         ):
             raise ValueError("unsafe ZIP member: {}".format(name))
+        for part in raw_parts:
+            variants = (
+                part.encode("utf-8"),
+                unicodedata.normalize("NFC", part).encode("utf-8"),
+                unicodedata.normalize("NFD", part).encode("utf-8"),
+            )
+            if max(len(value) for value in variants) > _MAX_PATH_COMPONENT_BYTES:
+                raise ValueError("ZIP member path component is too long: {}".format(name))
+        if member.flag_bits & 0x1:
+            raise ValueError("encrypted ZIP member is not supported: {}".format(name))
+        if member.compress_type not in _SUPPORTED_COMPRESSION:
+            raise ValueError("unsupported ZIP compression: {}".format(name))
+        if member.file_size < 0 or member.compress_size < 0:
+            raise ValueError("invalid ZIP member size: {}".format(name))
 
         canonical = "/".join(
             unicodedata.normalize("NFC", part).casefold() for part in raw_parts
@@ -114,6 +150,18 @@ def _validated_members(
         if canonical in seen:
             raise ValueError("duplicate ZIP member: {}".format(name))
         kind, mode = _member_kind(member)
+        if kind == "directory" and (member.file_size or member.compress_size):
+            raise ValueError("ZIP directory contains data: {}".format(name))
+        if member.file_size > _MAX_MEMBER_UNCOMPRESSED_BYTES:
+            raise ValueError("ZIP member is too large: {}".format(name))
+        total_size += member.file_size
+        if total_size > _MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise ValueError("ZIP expands beyond the total size limit")
+        if member.file_size:
+            if member.compress_size == 0:
+                raise ValueError("invalid zero compressed size: {}".format(name))
+            if member.file_size > member.compress_size * _MAX_COMPRESSION_RATIO:
+                raise ValueError("implausible ZIP compression ratio: {}".format(name))
         seen[canonical] = kind
         target = root.joinpath(*raw_parts)
         resolved = target.resolve(strict=False)
@@ -134,26 +182,61 @@ def _validated_members(
 def safe_extract(bundle: zipfile.ZipFile, destination: Path) -> None:
     """Extract validated regular files/directories without trusting extractall."""
     validated = _validated_members(bundle, destination)
-    root = destination.resolve()
-    for _, target, kind, _ in validated:
-        if target == root:
-            raise ValueError("unsafe ZIP member targets extraction root")
-        if target.is_symlink():
-            raise ValueError("unsafe existing extraction path: {}".format(target))
-        if target.exists() and not (kind == "directory" and target.is_dir()):
-            raise ValueError("existing extraction path: {}".format(target))
+    requested = Path(destination).absolute()
+    root = requested.resolve()
+    if requested.is_symlink() or root.exists():
+        raise ValueError("extraction destination already exists: {}".format(destination))
+    root.parent.mkdir(parents=True, exist_ok=True)
 
-    root.mkdir(parents=True, exist_ok=True)
-    for member, target, kind, mode in validated:
-        if kind == "directory":
-            target.mkdir(parents=True, exist_ok=True)
-            permissions = (mode & 0o777) or 0o755
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with bundle.open(member, "r") as source, target.open("xb") as output:
-                shutil.copyfileobj(source, output)
-            permissions = (mode & 0o777) or 0o644
-        target.chmod(permissions)
+    with tempfile.TemporaryDirectory(
+        prefix=".{}-extract-".format(root.name), dir=str(root.parent)
+    ) as directory:
+        stage = Path(directory) / "payload"
+        stage.mkdir()
+        directory_modes = []
+        actual_total = 0
+        for member, target, kind, mode in validated:
+            relative = target.relative_to(root)
+            staged_target = stage / relative
+            if kind == "directory":
+                staged_target.mkdir(parents=True, exist_ok=True)
+                directory_modes.append((staged_target, (mode & 0o777) or 0o755))
+                continue
+
+            staged_target.parent.mkdir(parents=True, exist_ok=True)
+            actual_member = 0
+            with bundle.open(member, "r") as source, staged_target.open("xb") as output:
+                while True:
+                    chunk = source.read(_STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    actual_member += len(chunk)
+                    actual_total += len(chunk)
+                    if actual_member > member.file_size:
+                        raise ValueError(
+                            "ZIP member exceeds its declared size: {}".format(member.filename)
+                        )
+                    if actual_member > _MAX_MEMBER_UNCOMPRESSED_BYTES:
+                        raise ValueError("ZIP member exceeded the extraction size limit")
+                    if actual_total > _MAX_TOTAL_UNCOMPRESSED_BYTES:
+                        raise ValueError("ZIP exceeded the total extraction size limit")
+                    output.write(chunk)
+            if actual_member != member.file_size:
+                raise ValueError(
+                    "ZIP member size differs from its declaration: {}".format(
+                        member.filename
+                    )
+                )
+            staged_target.chmod((mode & 0o777) or 0o644)
+
+        for path, permissions in sorted(
+            directory_modes, key=lambda item: len(item[0].parts), reverse=True
+        ):
+            path.chmod(permissions)
+        stage.chmod(0o755)
+        if requested.is_symlink() or root.exists():
+            raise ValueError("extraction destination appeared during extraction")
+        stage.replace(root)
 
 
 def _stage_files(stage: Path) -> Iterable[Path]:

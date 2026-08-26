@@ -1,4 +1,5 @@
 import hashlib
+import io
 import os
 import stat
 import subprocess
@@ -154,6 +155,25 @@ class SafeExtractTests(unittest.TestCase):
                 for info, content in members:
                     bundle.writestr(info, content)
 
+    @staticmethod
+    def _member(
+        name,
+        *,
+        size=0,
+        compressed_size=0,
+        compression=zipfile.ZIP_STORED,
+        flags=0,
+    ):
+        info = zipfile.ZipInfo("placeholder")
+        info.filename = name
+        info.create_system = 3
+        info.external_attr = (stat.S_IFREG | 0o644) << 16
+        info.file_size = size
+        info.compress_size = compressed_size
+        info.compress_type = compression
+        info.flag_bits = flags
+        return info
+
     def test_rejects_hostile_members_before_extracting_anything(self):
         # Each mutation would otherwise escape, alias, or materialize a non-file.
         symlink = zipfile.ZipInfo("link")
@@ -181,6 +201,100 @@ class SafeExtractTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         safe_extract(bundle, destination)
                 self.assertFalse(destination.exists())
+
+    def test_rejects_resource_abusive_inventory_without_touching_destination(self):
+        # Removing any central-directory resource guard would let hostile metadata
+        # reach extraction or alter a pre-existing player directory.
+        class InventoryBundle:
+            def __init__(self, members):
+                self.members = members
+
+            def infolist(self):
+                return self.members
+
+            def open(self, *_args, **_kwargs):
+                raise AssertionError("invalid inventory reached streaming")
+
+        cases = {
+            "encrypted": [self._member("file", size=1, compressed_size=1, flags=1)],
+            "unsupported compression": [
+                self._member(
+                    "file",
+                    size=1,
+                    compressed_size=1,
+                    compression=zipfile.ZIP_BZIP2,
+                )
+            ],
+            "too many entries": [
+                self._member("file-{:02d}".format(index)) for index in range(65)
+            ],
+            "path too long": [self._member("a/" * 256 + "b")],
+            "component too long": [self._member("a" * 256)],
+            "NUL path": [self._member("bad\x00name")],
+            "surrogate path": [self._member("bad\ud800name")],
+            "member too large": [
+                self._member(
+                    "large",
+                    size=64 * 1024 * 1024 + 1,
+                    compressed_size=64 * 1024 * 1024 + 1,
+                )
+            ],
+            "total too large": [
+                self._member(
+                    "large-a",
+                    size=50 * 1024 * 1024,
+                    compressed_size=50 * 1024 * 1024,
+                ),
+                self._member(
+                    "large-b",
+                    size=50 * 1024 * 1024,
+                    compressed_size=50 * 1024 * 1024,
+                ),
+            ],
+            "compression ratio": [
+                self._member(
+                    "ratio",
+                    size=1_000_000,
+                    compressed_size=1,
+                    compression=zipfile.ZIP_DEFLATED,
+                )
+            ],
+            "zero compressed size": [
+                self._member(
+                    "impossible",
+                    size=1,
+                    compressed_size=0,
+                    compression=zipfile.ZIP_DEFLATED,
+                )
+            ],
+        }
+        for label, members in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory) / "destination"
+                destination.mkdir()
+                sentinel = destination / "sentinel"
+                sentinel.write_bytes(b"keep")
+                with self.assertRaises(ValueError):
+                    safe_extract(InventoryBundle(members), destination)
+                self.assertEqual(b"keep", sentinel.read_bytes())
+                self.assertEqual(["sentinel"], [path.name for path in destination.iterdir()])
+
+    def test_declared_actual_size_breach_leaves_no_partial_destination(self):
+        # A stream that exceeds its declared size must not publish bytes already read.
+        member = self._member("file", size=1, compressed_size=1)
+
+        class MismatchedBundle:
+            def infolist(self):
+                return [member]
+
+            def open(self, *_args, **_kwargs):
+                return io.BytesIO(b"two bytes")
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "destination"
+            with self.assertRaises(ValueError):
+                safe_extract(MismatchedBundle(), destination)
+            self.assertFalse(destination.exists())
 
     def test_extracts_only_validated_directories_and_regular_files(self):
         # Catches validation that rejects legitimate directory entries or loses
