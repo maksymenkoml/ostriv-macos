@@ -1,4 +1,5 @@
 import base64
+import errno
 import hashlib
 import io
 import json
@@ -1881,7 +1882,11 @@ class InstallerTests(unittest.TestCase):
             fixture.cleanup()
 
     def _assert_owned_lock_at_allowed_path_rejected(
-        self, *, identity_integrity, multiply_linked=False
+        self,
+        *,
+        identity_integrity,
+        multiply_linked=False,
+        classification_error=None,
     ):
         fixture = FakeBottleFixture()
         try:
@@ -1998,10 +2003,56 @@ class InstallerTests(unittest.TestCase):
                 for path in protected_paths
             }
 
-            error = self.assert_recovery_rejected_before_mutation(
-                fixture, installer, profiles
-            )
-            if identity_integrity == "rebound":
+            if classification_error is None:
+                error = self.assert_recovery_rejected_before_mutation(
+                    fixture, installer, profiles
+                )
+            else:
+                relation_active = [False]
+                injected_failures = [0]
+                real_lstat = os.lstat
+                real_relation = type(installer)._recovery_path_relation.__func__
+
+                def classify_relation(selected_class, *args, **kwargs):
+                    relation_active[0] = True
+                    try:
+                        return real_relation(selected_class, *args, **kwargs)
+                    finally:
+                        relation_active[0] = False
+
+                def fail_preliminary_candidate_lstat(path):
+                    if (
+                        relation_active[0]
+                        and Path(path) == allowed_path
+                    ):
+                        injected_failures[0] += 1
+                        raise classification_error
+                    return real_lstat(path)
+
+                with patch.object(
+                    type(installer),
+                    "_recovery_path_relation",
+                    classmethod(classify_relation),
+                ), patch.object(
+                    installer_module.os,
+                    "lstat",
+                    side_effect=fail_preliminary_candidate_lstat,
+                ):
+                    error = self.assert_recovery_rejected_before_mutation(
+                        fixture, installer, profiles
+                    )
+                self.assertGreater(injected_failures[0], 0)
+                self.assertIn(
+                    "Launcher lock content could not be classified in",
+                    error.detail,
+                )
+                self.assertNotIn(
+                    "private preliminary metadata detail",
+                    "\n".join(
+                        (error.player_message, error.detail, str(error))
+                    ),
+                )
+            if identity_integrity == "rebound" and classification_error is None:
                 self.assertIn("Launcher lock alias appears in", error.detail)
             self.assertFalse(os.path.lexists(lock))
             self.assertTrue(state_path.is_file())
@@ -2053,6 +2104,173 @@ class InstallerTests(unittest.TestCase):
             identity_integrity="rebound",
             multiply_linked=True,
         )
+
+    def test_restore_restart_fails_closed_on_preliminary_path_inspection_errors(self):
+        """Unknown referenced-leaf metadata never authorizes recovery replay."""
+        failures = (
+            PermissionError(
+                errno.EACCES,
+                "private preliminary metadata detail",
+            ),
+            OSError(
+                errno.EIO,
+                "private preliminary metadata detail",
+            ),
+        )
+        for failure in failures:
+            with self.subTest(error=type(failure).__name__):
+                self._assert_owned_lock_at_allowed_path_rejected(
+                    identity_integrity="rebound",
+                    classification_error=failure,
+                )
+
+    def test_recovery_path_relation_fails_closed_on_other_preliminary_errors(self):
+        """Every failed preliminary identity check remains an unsafe relation."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            candidate = root / "referenced-leaf"
+            lock = root / ".ostriv-launcher.lock"
+            expected = b"protected owner token\n"
+            candidate.write_bytes(expected)
+            candidate.chmod(0o600)
+
+            real_resolve = Path.resolve
+
+            def fail_candidate_resolve(path, strict=False):
+                if path == candidate:
+                    raise PermissionError(
+                        errno.EACCES,
+                        "private relation resolution detail",
+                    )
+                return real_resolve(path, strict=strict)
+
+            with self.subTest(stage="resolve"), patch.object(
+                Path,
+                "resolve",
+                new=fail_candidate_resolve,
+            ):
+                self.assertEqual(
+                    "unsafe",
+                    Installer._recovery_path_relation(
+                        str(candidate),
+                        lock,
+                        None,
+                        expected_data=expected,
+                        expected_digest=digest(expected),
+                    ),
+                )
+
+            real_lstat = os.lstat
+
+            def fail_lock_lstat(path):
+                if Path(path) == lock:
+                    raise OSError(
+                        errno.EIO,
+                        "private lock metadata detail",
+                    )
+                return real_lstat(path)
+
+            with self.subTest(stage="lock_lstat"), patch.object(
+                installer_module.os,
+                "lstat",
+                side_effect=fail_lock_lstat,
+            ):
+                self.assertEqual(
+                    "unsafe",
+                    Installer._recovery_path_relation(
+                        str(candidate),
+                        lock,
+                        None,
+                        expected_data=expected,
+                        expected_digest=digest(expected),
+                    ),
+                )
+
+    def test_recovery_path_relation_fails_closed_on_content_inspection_errors(self):
+        """A present leaf must remain stable through bounded no-follow inspection."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            candidate = root / "referenced-leaf"
+            lock = root / ".ostriv-launcher.lock"
+            expected = b"protected owner token\n"
+            candidate.write_bytes(expected)
+            candidate.chmod(0o600)
+
+            def relation():
+                return Installer._recovery_path_relation(
+                    str(candidate),
+                    lock,
+                    None,
+                    expected_data=expected,
+                    expected_digest=digest(expected),
+                )
+
+            failures = (
+                ("open", installer_module.os, "open", PermissionError(errno.EACCES)),
+                ("fstat", installer_module.os, "fstat", OSError(errno.EIO)),
+                ("read", installer_module.os, "read", OSError(errno.EIO)),
+            )
+            for stage, target, name, failure in failures:
+                with self.subTest(stage=stage), patch.object(
+                    target,
+                    name,
+                    side_effect=failure,
+                ):
+                    self.assertEqual("unsafe", relation())
+
+            real_lstat = os.lstat
+            candidate_lookups = [0]
+
+            def disappear_on_restat(path):
+                if Path(path) == candidate:
+                    candidate_lookups[0] += 1
+                    if candidate_lookups[0] == 3:
+                        raise FileNotFoundError(errno.ENOENT, "disappeared")
+                return real_lstat(path)
+
+            with patch.object(
+                installer_module.os,
+                "lstat",
+                side_effect=disappear_on_restat,
+            ):
+                self.assertEqual("unsafe", relation())
+            self.assertEqual(3, candidate_lookups[0])
+
+    def test_restore_restart_accepts_absent_referenced_owned_leaf(self):
+        """Initial absence remains valid for a state-consistent owned snapshot."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            _launcher, installer = real_launcher_for_restore(fixture, profiles)
+            before = fixture.snapshot()
+            installer.install(fixture.installation, fixture.payload)
+            leaf = fixture.game_dir.resolve() / "dxil.dll"
+
+            interrupt_restore_after_final_lock_unlink(
+                installer, fixture.installation
+            )
+
+            journal = json.loads(
+                installer.journal_path(fixture.installation).read_text(
+                    encoding="utf-8"
+                )
+            )
+            snapshot = active_record_snapshot(
+                journal, "remove dxil.dll", leaf
+            )
+            self.assertEqual("file", snapshot["type"])
+            with self.assertRaises(FileNotFoundError):
+                os.lstat(leaf)
+
+            installer.restore(fixture.installation)
+
+            self.assertEqual(before, fixture.snapshot())
+            self.assertEqual([], profiles.calls)
+            self.assertFalse(
+                installer.journal_path(fixture.installation).exists()
+            )
+        finally:
+            fixture.cleanup()
 
     def test_restore_restart_rejects_invalid_final_lock_identity_components(self):
         """Only concrete bounded stat identities may authenticate final unlink."""

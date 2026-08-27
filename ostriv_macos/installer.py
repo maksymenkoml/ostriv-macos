@@ -3529,18 +3529,22 @@ class Installer:
             if candidate.resolve(strict=False) == lock:
                 return "alias"
         except (OSError, RuntimeError, ValueError):
-            pass
+            return "unsafe"
         try:
             status = os.lstat(str(candidate))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return None
+        except (OSError, ValueError):
+            return "unsafe"
         identities = []
         if old_identity is not None:
             identities.append(old_identity)
         try:
             lock_status = os.lstat(str(lock))
-        except OSError:
+        except FileNotFoundError:
             lock_status = None
+        except (OSError, ValueError):
+            return "unsafe"
         if lock_status is not None:
             identities.append((lock_status.st_dev, lock_status.st_ino))
         if stat.S_ISREG(status.st_mode) and (status.st_dev, status.st_ino) in identities:
