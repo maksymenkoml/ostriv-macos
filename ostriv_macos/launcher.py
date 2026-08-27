@@ -232,6 +232,20 @@ def _inventory(root: Path) -> List[Dict[str, object]]:
     return sorted(inventory, key=lambda item: str(item["relative_path"]))
 
 
+def _inventory_root_mode(inventory: object) -> Optional[int]:
+    if not isinstance(inventory, list):
+        return None
+    for item in inventory:
+        if (
+            isinstance(item, dict)
+            and item.get("relative_path") == "."
+            and item.get("type") == "directory"
+            and type(item.get("mode")) is int
+        ):
+            return item["mode"]
+    return None
+
+
 def _remove_inventory_tree(root: Path, inventory: object) -> None:
     if not isinstance(inventory, list) or _inventory(root) != inventory:
         raise PatchError(
@@ -855,9 +869,18 @@ class LauncherInstaller:
                     recreate_command = "exec /usr/bin/env python3 {}".format(
                         installation.bottle.root.resolve() / RUNTIME_NAME
                     )
+                menu_icon = self._find_game_icon(installation, app)
+                if menu_icon is None:
+                    raise PatchError(
+                        "restore.launcher_menu",
+                        "Restore failed.",
+                        "Verified Ostriv icon is unavailable during menu rollback",
+                    )
                 result = self._run_cxmenu(
                     installation,
-                    self._menu_create_command(installation, recreate_command),
+                    self._menu_create_command(
+                        installation, recreate_command, menu_icon
+                    ),
                 )
                 if result.returncode != 0:
                     raise PatchError(
@@ -2025,6 +2048,18 @@ class LauncherInstaller:
             canonical = self._canonical_plist(installation, identity)
             if not self._is_crossover_generated_plist(actual_plist, canonical):
                 return recorded
+            actual_root_mode = stat.S_IMODE(app.lstat().st_mode)
+            recorded_root_mode = _inventory_root_mode(recorded)
+            if actual_root_mode not in {recorded_root_mode, 0o755}:
+                return recorded
+            actual_icon = app / "Contents/Resources/CrossOverHelper.icns"
+            actual_icon_digest = _file_digest(actual_icon)
+            allowed_icon_digests = {
+                str(state["icon_sha256"]),
+                self._crossover_default_icon_digest(installation),
+            }
+            if actual_icon_digest not in allowed_icon_digests:
+                return recorded
             with tempfile.TemporaryDirectory(
                 prefix="ostriv-launcher-refresh-"
             ) as temporary:
@@ -2035,9 +2070,9 @@ class LauncherInstaller:
                     plist_path.read_bytes()
                 )
                 (destination / "Contents/Resources/CrossOverHelper.icns").write_bytes(
-                    (app / "Contents/Resources/CrossOverHelper.icns").read_bytes()
+                    actual_icon.read_bytes()
                 )
-                destination.chmod(stat.S_IMODE(app.lstat().st_mode))
+                destination.chmod(actual_root_mode)
                 expected_inventory = _inventory(destination)
             if actual_inventory == expected_inventory:
                 return actual_inventory
@@ -2628,6 +2663,14 @@ class LauncherInstaller:
                     "Installation failed.",
                     "Info.plist digest does not match",
                 )
+            if self._current_owned_app_inventory(
+                installation, state, app=app
+            ) != _inventory(app):
+                raise PatchError(
+                    "install.launcher_verify",
+                    "Installation failed.",
+                    "Launcher bundle inventory does not match",
+                )
         except PatchError:
             raise
         except (KeyError, OSError, TypeError, ValueError) as error:
@@ -2684,25 +2727,36 @@ class LauncherInstaller:
                 path.unlink()
         if app.is_dir() and not app.is_symlink():
             directory_entries = [
-                app / Path(str(item["relative_path"]))
+                (app / Path(str(item["relative_path"])), item.get("mode"))
                 for item in inventory
                 if isinstance(item, dict)
                 and item.get("type") == "directory"
                 and item.get("relative_path") != "."
             ]
-            for directory in sorted(
+            for directory, expected_mode in sorted(
                 directory_entries,
-                key=lambda path: len(path.parts),
+                key=lambda entry: len(entry[0].parts),
                 reverse=True,
             ):
+                if (
+                    type(expected_mode) is not int
+                    or not directory.is_dir()
+                    or directory.is_symlink()
+                    or stat.S_IMODE(directory.lstat().st_mode) != expected_mode
+                ):
+                    continue
                 try:
                     directory.rmdir()
                 except OSError:
                     pass
-            try:
-                app.rmdir()
-            except OSError:
-                pass
+            if (
+                _inventory_root_mode(inventory)
+                == stat.S_IMODE(app.lstat().st_mode)
+            ):
+                try:
+                    app.rmdir()
+                except OSError:
+                    pass
 
     def _remove_legacy_app(
         self, installation: GameInstallation, app: Path

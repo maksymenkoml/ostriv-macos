@@ -1281,6 +1281,39 @@ class LauncherInstallerTests(unittest.TestCase):
 
         self.assertFalse(fixture.app.exists())
 
+    def test_restore_preserves_foreign_changes_to_generated_launcher(self):
+        """CrossOver's plist rewrite must not broaden Restore ownership."""
+        for change in ("icon", "executable", "root mode"):
+            with self.subTest(change=change):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                state = fixture.installer.install(
+                    fixture.transaction, fixture.installation
+                )
+                fixture.transaction.journal.commit()
+                fixture.apply_crossover_generated_launcher_refresh()
+                if change == "icon":
+                    changed_path = (
+                        fixture.app / "Contents/Resources/CrossOverHelper.icns"
+                    )
+                    changed_path.write_bytes(b"foreign-icon")
+                elif change == "executable":
+                    changed_path = fixture.app / "Contents/MacOS/Menu Helper"
+                    changed_path.write_bytes(b"foreign-executable")
+                else:
+                    changed_path = fixture.app
+                    changed_path.chmod(0o777)
+
+                fixture.installer.restore(fixture.installation, state)
+
+                self.assertTrue(changed_path.exists())
+                if change == "icon":
+                    self.assertEqual(b"foreign-icon", changed_path.read_bytes())
+                elif change == "executable":
+                    self.assertEqual(b"foreign-executable", changed_path.read_bytes())
+                else:
+                    self.assertEqual(0o777, stat.S_IMODE(changed_path.stat().st_mode))
+
     def test_incomplete_reinstall_recovers_crossover_generated_backup(self):
         """A durable rollback must recognize CrossOver's trusted helper refresh."""
         fixture = LauncherFixture()
@@ -1323,6 +1356,48 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertFalse(backup.exists())
         self.assertEqual(generated_plist, (app / "Contents/Info.plist").read_bytes())
 
+    def test_incomplete_reinstall_rejects_foreign_generated_backup_icon(self):
+        """Recovery must not adopt an icon change absent from its durable inventory."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.transaction.journal.commit()
+        (fixture.bottle_root / "ostriv-macos-state.json").write_text(
+            json.dumps({"launcher_artifacts": dict(state)}), encoding="utf-8"
+        )
+        fixture.apply_crossover_generated_launcher_refresh()
+        app = fixture.installer._app_path()
+        backup = app.with_name("." + app.name + ".ostriv-macos.replaced")
+        os.replace(app, backup)
+        shutil.copytree(backup, app)
+        foreign_icon = backup / "Contents/Resources/CrossOverHelper.icns"
+        foreign_icon.write_bytes(b"foreign-icon")
+        record = UndoRecord(
+            "restore_launcher",
+            {
+                "snapshots": [],
+                "owned_root": str(backup),
+                "owned_directories": [str(backup)],
+                "remove_owned_tree": False,
+                "moved_tree": {
+                    "source": str(backup),
+                    "destination": str(app),
+                    "source_inventory": list(state["app_inventory"]),
+                    "replacement_inventory": launcher_module._inventory(app),
+                },
+            },
+        )
+        handler = fixture.installer.undo_handler(
+            fixture.installation, fixture._restore_snapshots
+        )
+
+        with self.assertRaises(PatchError) as caught:
+            handler(record)
+
+        self.assertEqual("restore.launcher_ownership", caught.exception.code)
+        self.assertEqual(b"foreign-icon", foreign_icon.read_bytes())
+        self.assertTrue(app.exists())
+
     def test_crossover_generated_refresh_rejects_unknown_icon(self):
         """A trusted plist rewrite must not authorize unrelated bundle content."""
         fixture = LauncherFixture()
@@ -1338,6 +1413,22 @@ class LauncherInstallerTests(unittest.TestCase):
 
         self.assertEqual("install.launcher_verify", caught.exception.code)
         self.assertEqual("Launcher icon digest does not match", caught.exception.detail)
+
+    def test_crossover_generated_refresh_rejects_unknown_root_mode(self):
+        """CrossOver's known rewrite allows only its observed bundle root modes."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.apply_crossover_generated_launcher_refresh()
+        fixture.app.chmod(0o777)
+
+        with self.assertRaises(PatchError) as caught:
+            fixture.installer.verify(fixture.installation, state)
+
+        self.assertEqual("install.launcher_verify", caught.exception.code)
+        self.assertEqual(
+            "Launcher bundle inventory does not match", caught.exception.detail
+        )
 
     def test_new_launcher_verifies_before_legacy_is_removed(self):
         """A failed pending app must not destroy the working legacy launcher."""
@@ -1501,6 +1592,19 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertEqual(
             ["--create", "StartMenu/Ostriv (patched)", "--type", "raw"],
             recreate[recreate.index("--create") : recreate.index("--create") + 4],
+        )
+        self.assertEqual(
+            str(
+                (
+                    fixture.game_launcher
+                    / "Contents/Resources/CrossOverHelper.icns"
+                ).resolve()
+            ),
+            recreate[recreate.index("--icon") + 1],
+        )
+        self.assertEqual(
+            {"CX_BOTTLE_PATH": str(fixture.bottle_root.resolve().parent)},
+            fixture.runner.environments[-1],
         )
 
     def test_restore_filesystem_error_is_typed_after_exact_transaction_rollback(self):
