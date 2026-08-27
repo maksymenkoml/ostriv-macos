@@ -9,11 +9,12 @@ import stat
 import struct
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 import ostriv_macos.installer as installer_module
+from ostriv_macos.cli import _player_action
 from ostriv_macos.diagnostics import CommandResult, PatchError, configure_logger
 from ostriv_macos.discovery import Bottle, CrossOverInstall, GameInstallation
 from ostriv_macos.installer import (
@@ -275,6 +276,43 @@ def interrupt_restore_after_final_lock_unlink(installer, installation):
         except FinalLockUnlinkInterruption:
             return
     raise AssertionError("Restore reached completion instead of final-unlink interruption")
+
+
+class LauncherRestoreInterruption(BaseException):
+    pass
+
+
+def interrupt_restore_after_launcher(installer, installation):
+    """Leave the exact journal produced after Restore changes the launcher."""
+    class InterruptingTransaction(Transaction):
+        def __init__(self, journal, handlers):
+            super().__init__(journal, handlers)
+            self.interrupted = False
+
+        def step(self, name, undo, action):
+            result = super().step(name, undo, action)
+            if name == "restore launcher":
+                self.interrupted = True
+                raise LauncherRestoreInterruption()
+            return result
+
+        def rollback(self):
+            if self.interrupted:
+                raise LauncherRestoreInterruption()
+            return super().rollback()
+
+    def transaction_for(selected):
+        return InterruptingTransaction(
+            InstallJournal(installer.journal_path(selected)),
+            installer.undo_handlers(selected),
+        )
+
+    with patch.object(installer, "transaction_for", side_effect=transaction_for):
+        try:
+            installer.restore(installation)
+        except LauncherRestoreInterruption:
+            return
+    raise AssertionError("Restore reached completion instead of launcher interruption")
 
 
 class StateUnlinkInterruption(BaseException):
@@ -1267,6 +1305,125 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(installer.state_path(fixture.installation).exists())
             self.assertFalse(installer.journal_path(fixture.installation).exists())
             self.assertEqual(before, fixture.snapshot())
+        finally:
+            fixture.cleanup()
+
+    def test_reinstall_requires_protected_restore_recovery_before_any_work(self):
+        """Reinstall must never replay a Restore journal through generic recovery."""
+        fixture = FakeBottleFixture()
+        try:
+            profiles = FakeRestoreProfiles()
+            launcher, installer = real_launcher_for_restore(fixture, profiles)
+            state = installer.install(fixture.installation, fixture.payload)
+            marker = Path(str(state.launcher_artifacts["recovery_marker"]))
+            marker.write_text(
+                json.dumps(
+                    {
+                        "owner": state.launcher_artifacts["profile_owner_token"],
+                        "original": "/Profiles/Player Custom.icc",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            interrupt_restore_after_launcher(installer, fixture.installation)
+
+            journal_path = installer.journal_path(fixture.installation)
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            self.assertEqual("restore", journal["operation"])
+            self.assertFalse(journal["complete"])
+            self.assertEqual(
+                [("restore launcher", "applied")],
+                [(item["name"], item["status"]) for item in journal["records"]],
+            )
+            journal_before = journal_path.read_bytes()
+            filesystem_before = fixture.snapshot()
+            runner_before = list(fixture.runner.calls)
+            profile_before = (profiles.current, list(profiles.calls))
+            undo_calls = []
+            payload_validation_calls = []
+            preflight_calls = []
+            journal_save_calls = []
+            launcher_calls = []
+
+            class ObservedLauncher:
+                def __getattr__(self, name):
+                    value = getattr(launcher, name)
+                    if not callable(value):
+                        return value
+
+                    def call(*args, **kwargs):
+                        launcher_calls.append(name)
+                        return value(*args, **kwargs)
+
+                    return call
+
+            original_undo = Transaction._undo
+
+            def observe_undo(selected, record_data, index=None):
+                undo_calls.append((record_data["kind"], index))
+                return original_undo(selected, record_data, index)
+
+            original_validate_payload = installer_module.validate_payload
+
+            def observe_payload_validation(*args, **kwargs):
+                payload_validation_calls.append(None)
+                return original_validate_payload(*args, **kwargs)
+
+            original_preflight = installer.preflight
+
+            def observe_preflight(*args, **kwargs):
+                preflight_calls.append(None)
+                return original_preflight(*args, **kwargs)
+
+            original_save = InstallJournal._save
+
+            def observe_save(selected, candidate):
+                journal_save_calls.append(None)
+                return original_save(selected, candidate)
+
+            installer.launcher = ObservedLauncher()
+            caught = None
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(Transaction, "_undo", observe_undo)
+                )
+                stack.enter_context(
+                    patch.object(
+                        installer_module,
+                        "validate_payload",
+                        observe_payload_validation,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(installer, "preflight", observe_preflight)
+                )
+                stack.enter_context(
+                    patch.object(InstallJournal, "_save", observe_save)
+                )
+                try:
+                    installer.install(fixture.installation, fixture.payload)
+                except PatchError as error:
+                    caught = error
+
+            self.assertEqual([], undo_calls)
+            self.assertEqual([], payload_validation_calls)
+            self.assertEqual([], preflight_calls)
+            self.assertEqual([], journal_save_calls)
+            self.assertEqual([], launcher_calls)
+            self.assertEqual(runner_before, fixture.runner.calls)
+            self.assertEqual(profile_before, (profiles.current, profiles.calls))
+            self.assertEqual(journal_before, journal_path.read_bytes())
+            self.assertEqual(filesystem_before, fixture.snapshot())
+            self.assertIsNotNone(caught)
+            self.assertEqual("install.recovery_required", caught.code)
+            self.assertEqual(
+                "A previous installation needs recovery.",
+                caught.player_message,
+            )
+            self.assertEqual(
+                "A previous installation needs recovery. Run Restore, then try again.",
+                _player_action(caught),
+            )
         finally:
             fixture.cleanup()
 

@@ -2280,6 +2280,17 @@ class Installer:
         installation: GameInstallation,
         payload: Sequence[PayloadEntry],
     ) -> InstallState:
+        # Route Restore recovery before binding generic or launcher undo handlers.
+        journal = InstallJournal(self.journal_path(installation))
+        if (
+            journal.data.get("complete") is False
+            and journal.data.get("operation") == "restore"
+        ):
+            raise PatchError(
+                "install.recovery_required",
+                RECOVERY_REQUIRED_MESSAGE,
+                "Install cannot recover an incomplete Restore journal",
+            )
         logger.info(
             "install start bottle=%s game=%s payload_files=%s",
             installation.bottle.name,
