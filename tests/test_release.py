@@ -428,8 +428,8 @@ class WorkflowTests(unittest.TestCase):
             abort "manual release recovery is missing" \
               unless triggers.key?("workflow_dispatch")
             concurrency = workflow.fetch("concurrency")
-            abort "release concurrency is not global" \
-              unless concurrency["group"] == "player-release"
+            abort "release concurrency can discard a different verified commit" \
+              unless concurrency["group"].include?("workflow_run.head_sha || github.sha")
             abort "a newer merge may cancel an older release" \
               unless concurrency["cancel-in-progress"] == false
             condition = workflow.fetch("jobs").fetch("prepare").fetch("if")
@@ -442,10 +442,12 @@ class WorkflowTests(unittest.TestCase):
             abort "manual recovery can publish a feature branch" \
               unless condition.include?("github.ref == 'refs/heads/main'")
             abort "non-publishing jobs can write repository contents" \
-              unless workflow.fetch("permissions") == {"contents" => "read"}
+              unless workflow.fetch("permissions") == {
+                "actions" => "read", "contents" => "read"
+              }
             release_permissions = workflow.fetch("jobs").fetch("release").fetch("permissions")
             abort "publishing job cannot create the tag and release" \
-              unless release_permissions == {"contents" => "write"}
+              unless release_permissions == {"actions" => "read", "contents" => "write"}
             """
         )
 
@@ -457,7 +459,7 @@ class WorkflowTests(unittest.TestCase):
             jobs = workflow.fetch("jobs")
             prepare = jobs.fetch("prepare")
             outputs = prepare.fetch("outputs")
-            %w[publish tag tag_exists release_sha].each do |name|
+            %w[publish tag release_sha].each do |name|
               abort "missing prepare output #{name}" unless outputs.key?(name)
             end
             prepare_steps = prepare.fetch("steps")
@@ -465,6 +467,8 @@ class WorkflowTests(unittest.TestCase):
             abort "prepare does not check out the verified SHA" \
               unless checkout.fetch("with").fetch("ref").include?("workflow_run.head_sha")
             prepare_commands = prepare_steps.map { |step| step["run"] }.compact.join("\n")
+            abort "manual runs can publish a commit without successful Test CI" \
+              unless prepare_commands.include?("scripts/verify_ci.py")
             abort "tested release planning is not used" \
               unless prepare_commands.include?("scripts/release_plan.py")
             abort "release planning does not receive the verified SHA" \
@@ -477,16 +481,16 @@ class WorkflowTests(unittest.TestCase):
             abort "existing versions are not skipped" \
               unless release.fetch("if").include?("needs.prepare.outputs.publish == 'true'")
             release_commands = release.fetch("steps").map { |step| step["run"] }.compact.join("\n")
+            abort "recovered tags are not checked for exact successful Test CI" \
+              unless release_commands.include?("scripts/verify_ci.py")
             abort "release bundle is not built" \
               unless release_commands.include?("scripts/build-release.py")
             abort "release bundle is not preflighted" \
               unless release_commands.include?("dist/ostriv-macos-player.zip")
-            abort "existing tags cannot be recovered" \
-              unless release_commands.include?("--verify-tag")
-            abort "new tags do not target the verified SHA" \
-              unless release_commands.include?('--target "$RELEASE_SHA"')
-            abort "release notes are not generated" \
-              unless release_commands.include?("--generate-notes")
+            abort "atomic tested publication is not used" \
+              unless release_commands.include?("scripts/publish_release.py")
+            abort "publication does not receive the verified SHA" \
+              unless release_commands.include?('--release-sha "$RELEASE_SHA"')
             """
         )
 
@@ -530,11 +534,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(1, release.count("actions/setup-python@v7"))
         self.assertEqual(1, release.count("lfs: true"))
         self.assertIn("needs: prepare", release)
-        self.assertIn("--verify-tag", release)
-        self.assertIn(
-            '"dist/ostriv-macos-player.zip#Ostriv for macOS (Apple Silicon)"',
-            release,
-        )
+        self.assertIn("scripts/publish_release.py", release)
+        self.assertIn("--asset dist/ostriv-macos-player.zip", release)
         self.assertNotIn("actions/create-release", release)
         self.assertNotIn("actions/upload-release-asset", release)
 

@@ -18,14 +18,9 @@ class ReleaseVersionError(ValueError):
     """The project does not declare one canonical release version."""
 
 
-def read_release_version(path: Path) -> str:
-    path = Path(path)
+def parse_release_version(source: str, filename: str = "<version>") -> str:
     try:
-        source = path.read_text(encoding="utf-8")
-    except OSError as error:
-        raise ReleaseVersionError("cannot read the version file") from error
-    try:
-        tree = ast.parse(source, filename=str(path))
+        tree = ast.parse(source, filename=filename)
     except SyntaxError as error:
         raise ReleaseVersionError("the version file is not valid Python") from error
 
@@ -52,6 +47,15 @@ def read_release_version(path: Path) -> str:
     if SEMANTIC_VERSION.fullmatch(value.value) is None:
         raise ReleaseVersionError("__version__ must use X.Y.Z without leading zeros")
     return value.value
+
+
+def read_release_version(path: Path) -> str:
+    path = Path(path)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ReleaseVersionError("cannot read the version file") from error
+    return parse_release_version(source, filename=str(path))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

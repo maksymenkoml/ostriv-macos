@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ostriv_macos import __version__ as PROJECT_VERSION
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY_ROOT / "scripts/release_version.py"
@@ -44,7 +46,7 @@ class ReleaseVersionTests(unittest.TestCase):
         )
 
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual("v0.1.3\n", result.stdout)
+        self.assertEqual("v{}\n".format(PROJECT_VERSION), result.stdout)
         self.assertEqual("", result.stderr)
 
     def test_invalid_or_ambiguous_versions_fail_with_one_clean_error(self):

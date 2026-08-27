@@ -6,8 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
+from urllib.parse import quote
 
-from release_version import ReleaseVersionError, read_release_version
+from github_api import GitHubAPIError, repository_from_environment, request_json
+from release_version import (
+    ReleaseVersionError,
+    parse_release_version,
+    read_release_version,
+)
 
 
 VERSION_FILE = Path("ostriv_macos/__init__.py")
@@ -52,16 +58,6 @@ def plan_release(release_sha: str) -> dict:
     except ReleaseVersionError as error:
         raise ReleasePlanError(str(error)) from error
 
-    history = _git("rev-list", "--parents", "-n", "1", verified_sha).split()
-    version_changed = False
-    if len(history) > 1:
-        diff_status = _git_status(
-            "diff", "--quiet", history[1], verified_sha, "--", str(VERSION_FILE)
-        )
-        if diff_status not in (0, 1):
-            raise ReleasePlanError("git could not compare the release version")
-        version_changed = diff_status == 1
-
     tag_ref = "refs/tags/{}".format(tag)
     tag_status = _git_status("show-ref", "--verify", "--quiet", tag_ref)
     if tag_status not in (0, 1):
@@ -78,12 +74,33 @@ def plan_release(release_sha: str) -> dict:
                 raise ReleasePlanError("the release tag is outside verified main history")
             if ancestor_status != 0:
                 raise ReleasePlanError("git could not verify the release tag")
-            if version_changed:
-                raise ReleasePlanError(
-                    "{} already points to another commit; choose a new version".format(tag)
-                )
+        try:
+            tagged_version = parse_release_version(
+                _git("show", "{}:{}".format(tag_sha, VERSION_FILE)),
+                filename="{}:{}".format(tag, VERSION_FILE),
+            )
+        except ReleaseVersionError as error:
+            raise ReleasePlanError("{} has an invalid version file".format(tag)) from error
+        if tagged_version != tag[1:]:
+            raise ReleasePlanError(
+                "{} does not declare {}".format(tag, tag[1:])
+            )
+        if tag_sha != verified_sha and _git(
+            "rev-list", "{}..{}".format(tag_sha, verified_sha), "--", str(VERSION_FILE)
+        ):
+            raise ReleasePlanError(
+                "the version file changed after {}; choose a new version".format(tag)
+            )
 
-    release_exists = _run(["gh", "release", "view", tag]).returncode == 0
+    repository = repository_from_environment()
+    endpoint = "repos/{}/releases/tags/{}".format(repository, quote(tag, safe=""))
+    try:
+        request_json(["api", "--method", "GET", endpoint])
+        release_exists = True
+    except GitHubAPIError as error:
+        if error.status != 404:
+            raise ReleasePlanError(str(error)) from error
+        release_exists = False
     if release_exists and not tag_exists:
         raise ReleasePlanError("the GitHub release exists but its tag is unavailable")
 

@@ -28,6 +28,18 @@ class ReleasePlanTests(unittest.TestCase):
         gh = bin_directory / "gh"
         gh.write_text(
             "#!/bin/sh\n"
+            'if [ "$FAKE_GH_ERROR" = true ]; then\n'
+            '  echo "gh: server error (HTTP 500)" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+            'if [ "$1" = api ]; then\n'
+            '  case "$*" in\n'
+            '    *"/releases/tags/$FAKE_RELEASE_TAG"*) '
+            '[ -n "$FAKE_RELEASE_TAG" ] && echo "{}" && exit 0 ;;\n'
+            "  esac\n"
+            '  echo "gh: Not Found (HTTP 404)" >&2\n'
+            "  exit 1\n"
+            "fi\n"
             'if [ "$1" = release ] && [ "$2" = view ] && '
             '[ "$3" = "$FAKE_RELEASE_TAG" ]; then\n'
             "  exit 0\n"
@@ -41,6 +53,8 @@ class ReleasePlanTests(unittest.TestCase):
             bin_directory, os.pathsep, self.environment["PATH"]
         )
         self.environment["FAKE_RELEASE_TAG"] = ""
+        self.environment["FAKE_GH_ERROR"] = "false"
+        self.environment["GITHUB_REPOSITORY"] = "owner/repository"
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -68,9 +82,10 @@ class ReleasePlanTests(unittest.TestCase):
         self._git("commit", "-q", "-m", message)
         return self._git("rev-parse", "HEAD")
 
-    def _run(self, release_sha, released_tag=""):
+    def _run(self, release_sha, released_tag="", api_error=False):
         environment = self.environment.copy()
         environment["FAKE_RELEASE_TAG"] = released_tag
+        environment["FAKE_GH_ERROR"] = str(api_error).lower()
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--release-sha", release_sha],
             cwd=self.repository,
@@ -134,7 +149,42 @@ class ReleasePlanTests(unittest.TestCase):
 
         self.assertEqual(2, result.returncode)
         self.assertEqual("", result.stdout)
-        self.assertIn("already points to another commit", result.stderr)
+        self.assertIn("choose a new version", result.stderr)
+
+    def test_tagged_commit_must_declare_the_matching_version(self):
+        initial_sha = self._git("rev-parse", "HEAD")
+        self._git("tag", "v0.1.4", initial_sha)
+        self._write_version("0.1.4")
+        self._commit("Release 0.1.4")
+        release_sha = self._commit("Later documentation", filename="README.md")
+
+        result = self._run(release_sha)
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("does not declare 0.1.4", result.stderr)
+
+    def test_version_history_cannot_change_after_a_recovery_tag(self):
+        tagged_sha = self._git("rev-parse", "HEAD")
+        self._git("tag", "v0.1.3", tagged_sha)
+        self._write_version("0.1.4")
+        self._commit("Temporary version")
+        self._write_version("0.1.3")
+        self._commit("Reuse old version")
+        release_sha = self._commit("Later documentation", filename="README.md")
+
+        result = self._run(release_sha)
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("changed after v0.1.3", result.stderr)
+
+    def test_github_api_failure_does_not_look_like_an_absent_release(self):
+        release_sha = self._git("rev-parse", "HEAD")
+
+        result = self._run(release_sha, api_error=True)
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("GitHub API request failed", result.stderr)
 
 
 if __name__ == "__main__":
