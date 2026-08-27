@@ -1,0 +1,45 @@
+name: Publish player ZIP
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          lfs: true
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+      - run: python -m unittest discover -s tests -v
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          lfs: true
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+      - run: python scripts/build-release.py --output dist/ostriv-macos-player.zip
+      - name: Publish verified player ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/ostriv-macos-player.zip#Ostriv for macOS (Apple Silicon)" \
+            --verify-tag \
+            --generate-notes

@@ -1,7 +1,8 @@
 # Bug B: cold Steam start never launches the game
 
 > **Fixed and verified live** — on a cold start (Steam not running) the game now launches on
-> the first try to a playable main menu (user-confirmed). Two defects had to be fixed.
+> the first try to a playable main menu (user-confirmed). The initial fix described below was
+> later superseded by the hardened launcher's stable readiness state machine and targeted retry.
 
 ## Symptom
 
@@ -35,7 +36,7 @@ cold client sets `ActiveUser` seconds before it can service `SteamAPI_Init`. The
 Error" dialog that *hangs the process* (so a naive "is the process alive?" check reads a hung
 crash as a running game — it is not).
 
-## Fix
+## Initial fix (historical)
 
 Wait until Steam can actually serve the API, then launch. `steam_ready()` requires all three:
 client running, login finished (`ActiveUser` nonzero), **and** the CEF UI up (a
@@ -56,7 +57,34 @@ for _ in range(80):
 time.sleep(8)   # settle once the client's UI is up
 ```
 
-This also removes the reused-pid gate (defect 1). No other launcher behavior changed.
+This removed the reused-pid gate (defect 1), but the readiness predicate was still only a point-in-
+time heuristic. The old warm-client early return and this heuristic-only wait are no longer the
+current implementation.
+
+## Current hardened behavior
+
+`ostriv_macos/launcher_runtime.py` now owns a deterministic readiness state machine:
+
+1. Acquire a per-bottle advisory lock so a repeated click cannot start another Steam/game path.
+2. Probe all three signals: the selected bottle's Wine task table must contain Steam, its registry
+   must report a nonzero `ActiveUser`, and an exact helper PID from that same task table must have
+   `--type=renderer` in its bounded macOS process detail. Another bottle's helper, a non-renderer
+   helper, process presence, or login alone is never ready. Captured process details are omitted
+   from diagnostics.
+3. For an already warm client, require two consecutive ready probes two seconds apart.
+4. For a stopped or transitioning client, open the matching CrossOver Steam app at most once and
+   require all readiness signals to remain stable for 15 seconds. Any dropped signal resets the
+   stable interval; the absolute timeout is five minutes.
+5. If login or readiness fails, do not launch Ostriv. Show one concise action and keep details in
+   the local launcher log.
+6. Classify only Ostriv log bytes appended by this launch. A fresh `SteamAPI_Init() failed` marker
+   receives one 30-second readiness pass and exactly one game retry. Graphics-context and unrelated
+   failures never retry.
+
+The runtime also creates the log before external adapters, restores a stale display-profile marker
+before Steam work, restores the exact original profile on every handled exit path, and releases
+the lock last. Automated tests use fake clocks, processes, logs, dialogs, and profiles; they do not
+launch installed Steam or Ostriv.
 
 ## Dead ends (tried and removed — do not reintroduce)
 
@@ -70,12 +98,21 @@ This also removes the reused-pid gate (defect 1). No other launcher behavior cha
 
 ## Files changed
 
-`patch.py` — only the `LAUNCHER_SCRIPT` template: added `steam_ready()` and gated
-`start_steam()`'s wait on it.
+- `ostriv_macos/launcher_runtime.py` — stable readiness, lock, fresh-log classification, targeted
+  retry, and profile recovery.
+- `ostriv_macos/launcher.py` — copied runtime/config and matching CrossOver Steam-app paths.
+- `tests/test_launcher_runtime.py` and `tests/test_launcher_profile.py` — deterministic state,
+  retry, lock, and recovery matrices.
 
-## Verification (live, cold start)
+The former embedded `patch.py` launcher template and its early-return behavior are superseded.
+
+## Historical verification (live, cold start)
 
 Killed Steam, emptied the game log (so all markers are from the fresh session), launched once:
 the launcher held the profile switch until a `steamwebhelper` renderer was up, then the game
 reached `uiMainMenu` with **zero** `SteamAPI_Init() failed` lines and stayed stable. User
 visually confirmed a **playable main menu** on the first cold try.
+
+That live result is evidence for the original CrossOver 26.2 setup, not a community testing gate
+or a claim about every machine. The hardened behavior is regression-tested without asking players
+to run raw procedures.
