@@ -74,7 +74,7 @@ class FakeRunner:
         self.query_results = []
         self.status_result = CommandResult(0, "running\n", "")
 
-    def run(self, argv, timeout=None):
+    def run(self, argv, timeout=None, environment=None):
         argv = list(argv)
         self.calls.append((argv, timeout))
         if argv[-1:] == ["--status"]:
@@ -3144,7 +3144,7 @@ class InstallerTests(unittest.TestCase):
             state = fixture.installer().install(fixture.installation, fixture.payload)
             stored = json.loads((fixture.bottle_root / "ostriv-macos-state.json").read_text())
             self.assertEqual(1, stored["schema"])
-            self.assertEqual("0.1.1", stored["project_version"])
+            self.assertEqual("0.1.2", stored["project_version"])
             self.assertEqual(str(fixture.bottle_root.resolve()), stored["bottle_realpath"])
             self.assertEqual(str(fixture.game_dir.resolve()), stored["game_realpath"])
             self.assertTrue(stored["owned_files"])

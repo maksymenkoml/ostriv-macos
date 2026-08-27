@@ -391,6 +391,8 @@ def _player_action(error: PatchError) -> str:
             "The launcher could not be created. "
             "Download the latest player ZIP and try again."
         )
+    if code == "install.crossover_running":
+        return "Quit CrossOver completely, then run the patcher again."
     if code == "command.timeout":
         return (
             "CrossOver took too long to respond. "
