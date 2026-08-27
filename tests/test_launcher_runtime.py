@@ -45,31 +45,89 @@ class FakeResult:
 
 
 class ProbeRunner:
-    def __init__(self, process=True, registry=b"ActiveUser    REG_DWORD    0x1\n", renderer=True):
+    def __init__(
+        self,
+        process=True,
+        registry=b"ActiveUser    REG_DWORD    0x1\n",
+        renderer=True,
+        root="/tmp",
+    ):
         self.process = process
         self.registry = registry
         self.renderer = renderer
+        self.root = root
         self.calls = []
 
     def run(self, argv, timeout=None):
         argv = list(argv)
         self.calls.append((argv, timeout))
-        if "tasklist" in argv:
+        if argv == [
+            "/usr/bin/pgrep",
+            "-f",
+            "steam[.]exe|steamwebhelper[.]exe",
+        ]:
+            pids = []
+            if self.process:
+                pids.append("9417")
+            if self.renderer:
+                pids.append("9418")
+            return FakeResult(0 if pids else 1, "\n".join(pids))
+        if argv[:1] == ["/bin/ps"]:
             rows = []
             if self.process:
-                rows.append('"steam.exe","417","Console","1","12,000 K"')
+                rows.append("9417 00:10 C:\\Steam\\steam.exe")
             if self.renderer:
                 rows.append(
-                    '"steamwebhelper.exe","418","Console","1","24,000 K"'
+                    "9418 00:09 C:\\Steam\\steamwebhelper.exe --type=renderer"
                 )
             return FakeResult(0, "\n".join(rows))
+        if argv[:1] == ["/usr/sbin/lsof"]:
+            rows = []
+            for pid in ("9417", "9418"):
+                if pid in argv[-4]:
+                    rows.append(
+                        "p{}\nfcwd\n"
+                        "n{}/Bottles/Ostriv/drive_c/Program Files (x86)/Steam".format(
+                            pid, self.root
+                        )
+                    )
+            return FakeResult(0, "\n".join(rows))
+        return FakeResult(0, self.registry)
+
+
+class BottleScopedHostRunner:
+    def __init__(self, cwd, cwd_error=None):
+        self.cwd = cwd
+        self.cwd_error = cwd_error
+        self.calls = []
+
+    def run(self, argv, timeout=None):
+        argv = list(argv)
+        self.calls.append((argv, timeout))
+        if argv == [
+            "/usr/bin/pgrep",
+            "-f",
+            "steam[.]exe|steamwebhelper[.]exe",
+        ]:
+            return FakeResult(0, "89520\n89528\n89570\n")
         if argv[:1] == ["/bin/ps"]:
-            role = "renderer" if self.renderer else "gpu-process"
             return FakeResult(
                 0,
-                "418 /selected/steamwebhelper.exe --type={}\n".format(role),
+                "89520 00:10 C:\\Steam\\steam.exe\n"
+                "89528 00:09 C:\\Steam\\steamwebhelper.exe --type=utility\n"
+                "89570 00:08 C:\\Steam\\steamwebhelper.exe --type=renderer\n",
             )
-        return FakeResult(0, self.registry)
+        if argv[:1] == ["/usr/sbin/lsof"]:
+            if self.cwd_error is not None:
+                raise self.cwd_error
+            return FakeResult(
+                0,
+                "p89520\nfcwd\nn{}\n"
+                "p89570\nfcwd\nn{}\n".format(self.cwd, self.cwd),
+            )
+        if "reg" in argv:
+            return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
+        raise AssertionError(argv)
 
 
 def make_config(root="/tmp"):
@@ -96,14 +154,236 @@ def write_config(config, path):
     Path(path).write_text(json.dumps(config.__dict__), encoding="utf-8")
 
 
+def write_active_user(config, active=True):
+    registry = Path(config.bottle_realpath) / "user.reg"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        "[Software\\\\Valve\\\\Steam\\\\ActiveProcess] 1\n"
+        '"ActiveUser"=dword:{:08x}\n'.format(1 if active else 0),
+        encoding="utf-8",
+    )
+
+
 class SteamControllerTests(unittest.TestCase):
+    def test_probe_uses_fast_bottle_scoped_host_signals_and_registry_file(self):
+        """A healthy client must not pay for Wine commands on every poll."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            write_active_user(config)
+            bottle = Path(config.bottle_realpath)
+            calls = []
+
+            class NativeRunner:
+                def run(self, argv, timeout=None):
+                    argv = list(argv)
+                    calls.append(argv)
+                    if argv == [
+                        "/usr/bin/pgrep",
+                        "-f",
+                        "steam[.]exe|steamwebhelper[.]exe",
+                    ]:
+                        return FakeResult(0, "9417\n9418\n")
+                    if argv[:1] == ["/bin/ps"]:
+                        return FakeResult(
+                            0,
+                            "9417 00:10 C:\\Steam\\steam.exe\n"
+                            "9418 00:09 C:\\Steam\\steamwebhelper.exe --type=renderer\n",
+                        )
+                    if argv[:1] == ["/usr/sbin/lsof"]:
+                        cwd = bottle / "drive_c/Program Files (x86)/Steam"
+                        return FakeResult(
+                            0,
+                            "p9417\nfcwd\nn{}\n"
+                            "p9418\nfcwd\nn{}\n".format(cwd, cwd),
+                        )
+                    raise AssertionError(argv)
+
+            signals = SteamController(config=config, runner=NativeRunner()).probe()
+
+        self.assertEqual(SteamSignals(True, True, True), signals)
+        self.assertEqual(3, len(calls))
+        self.assertFalse(any("wine" in Path(call[0]).name for call in calls))
+
+    def test_logged_out_registry_file_does_not_fall_back_to_slow_wine_query(self):
+        """A valid zero ActiveUser is definitive, not a reason to run Wine."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            write_active_user(config, active=False)
+            runner = ProbeRunner(root=directory)
+
+            signals = SteamController(config=config, runner=runner).probe()
+
+        self.assertEqual(SteamSignals(True, False, True), signals)
+        self.assertFalse(
+            any("reg" in call for call, _timeout in runner.calls),
+        )
+
+    def test_stale_nonzero_registry_file_requires_live_wine_confirmation(self):
+        """Persisted login state from an older Steam process is not current evidence."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            write_active_user(config)
+            registry_path = Path(config.bottle_realpath) / "user.reg"
+            os.utime(registry_path, (1, 1))
+            runner = ProbeRunner(
+                registry=b"ActiveUser REG_DWORD 0x0\n",
+                root=directory,
+            )
+
+            signals = SteamController(config=config, runner=runner).probe()
+
+        self.assertEqual(SteamSignals(True, False, True), signals)
+        self.assertTrue(any("reg" in call for call, _timeout in runner.calls))
+
+    def test_failed_wine_registry_query_cannot_supply_active_user(self):
+        """Valid-looking partial stdout from a failed query is not login evidence."""
+
+        class FailedRegistryRunner(ProbeRunner):
+            def run(self, argv, timeout=None):
+                if "reg" in argv:
+                    return FakeResult(1, b"ActiveUser REG_DWORD 0x1\n")
+                return super().run(argv, timeout)
+
+        signals = SteamController(
+            config=make_config(), runner=FailedRegistryRunner()
+        ).probe()
+
+        self.assertEqual(SteamSignals(True, False, True), signals)
+
+    def test_live_registry_confirmation_is_cached_for_unchanged_process_and_file(self):
+        """A stale snapshot gets one live check, not Wine polling on every probe."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            write_active_user(config)
+            registry_path = Path(config.bottle_realpath) / "user.reg"
+            os.utime(registry_path, (1, 1))
+            runner = ProbeRunner(root=directory)
+            controller = SteamController(config=config, runner=runner)
+
+            first = controller.probe()
+            second = controller.probe()
+
+        self.assertTrue(first.ready)
+        self.assertTrue(second.ready)
+        registry_calls = [
+            call for call, _timeout in runner.calls if "reg" in call
+        ]
+        self.assertEqual(1, len(registry_calls))
+
+    def test_logged_out_live_confirmation_is_rechecked_on_the_next_probe(self):
+        """Signing in after a logged-out query must become visible during the wait."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            write_active_user(config)
+            registry_path = Path(config.bottle_realpath) / "user.reg"
+            os.utime(registry_path, (1, 1))
+
+            class SigningInRunner(ProbeRunner):
+                def __init__(self):
+                    super().__init__(root=directory)
+                    self.registry_results = iter(
+                        (
+                            b"ActiveUser REG_DWORD 0x0\n",
+                            b"ActiveUser REG_DWORD 0x1\n",
+                        )
+                    )
+
+                def run(self, argv, timeout=None):
+                    if "reg" in argv:
+                        self.calls.append((list(argv), timeout))
+                        return FakeResult(0, next(self.registry_results))
+                    return super().run(argv, timeout)
+
+            controller = SteamController(config=config, runner=SigningInRunner())
+
+            first = controller.probe()
+            second = controller.probe()
+
+        self.assertFalse(first.active_user)
+        self.assertTrue(second.active_user)
+
+    def test_live_confirmation_expires_while_process_and_file_are_unchanged(self):
+        """A cached login result must not mask a later sign-out indefinitely."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            write_active_user(config)
+            registry_path = Path(config.bottle_realpath) / "user.reg"
+            os.utime(registry_path, (1, 1))
+            clock = FakeClock()
+
+            class SigningOutRunner(ProbeRunner):
+                def __init__(self):
+                    super().__init__(root=directory)
+                    self.registry_results = iter(
+                        (
+                            b"ActiveUser REG_DWORD 0x1\n",
+                            b"ActiveUser REG_DWORD 0x0\n",
+                        )
+                    )
+
+                def run(self, argv, timeout=None):
+                    if "reg" in argv:
+                        self.calls.append((list(argv), timeout))
+                        return FakeResult(0, next(self.registry_results))
+                    return super().run(argv, timeout)
+
+            controller = SteamController(
+                config=config,
+                runner=SigningOutRunner(),
+                monotonic=clock.monotonic,
+            )
+
+            first = controller.probe()
+            clock.sleep(60.0)
+            second = controller.probe()
+
+        self.assertTrue(first.active_user)
+        self.assertFalse(second.active_user)
+
+    def test_live_confirmation_is_not_reused_for_a_new_process_generation(self):
+        """PID reuse must not carry login state from an older Steam process."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            write_active_user(config)
+            registry_path = Path(config.bottle_realpath) / "user.reg"
+            os.utime(registry_path, (1, 1))
+            observations = iter((100.0, 200.0))
+
+            class RestartedSteamRunner(ProbeRunner):
+                def __init__(self):
+                    super().__init__(root=directory)
+                    self.registry_results = iter(
+                        (
+                            b"ActiveUser REG_DWORD 0x1\n",
+                            b"ActiveUser REG_DWORD 0x0\n",
+                        )
+                    )
+
+                def run(self, argv, timeout=None):
+                    if "reg" in argv:
+                        self.calls.append((list(argv), timeout))
+                        return FakeResult(0, next(self.registry_results))
+                    return super().run(argv, timeout)
+
+            controller = SteamController(
+                config=config,
+                runner=RestartedSteamRunner(),
+                wall_time=lambda: next(observations),
+            )
+
+            first = controller.probe()
+            second = controller.probe()
+
+        self.assertTrue(first.active_user)
+        self.assertFalse(second.active_user)
+
     def test_probe_records_each_readiness_signal_in_the_launcher_file_log(self):
         with TemporaryDirectory() as directory:
             log_path = Path(directory) / "launcher.log"
             logger = runtime._create_launcher_log(log_path)
             controller = SteamController(
                 config=make_config(directory),
-                runner=ProbeRunner(process=True, renderer=False),
+                runner=ProbeRunner(process=True, renderer=False, root=directory),
             )
             controller.logger = logger
 
@@ -111,7 +391,8 @@ class SteamControllerTests(unittest.TestCase):
 
             self.assertEqual(SteamSignals(True, True, False), signals)
             self.assertIn(
-                "steam probe process=True active_user=True renderer=False ready=False",
+                "steam probe process=True process_known=True active_user=True "
+                "renderer=False ready=False",
                 log_path.read_text(encoding="utf-8"),
             )
 
@@ -137,8 +418,9 @@ class SteamControllerTests(unittest.TestCase):
 
                 signals = controller.probe()
 
+                expected_active_user = active_user if process else False
                 self.assertEqual(
-                    SteamSignals(process, active_user, renderer), signals
+                    SteamSignals(process, expected_active_user, renderer), signals
                 )
                 self.assertEqual(ready, signals.ready)
 
@@ -149,6 +431,37 @@ class SteamControllerTests(unittest.TestCase):
         signals = SteamController(config=make_config(), runner=runner).probe()
 
         self.assertTrue(signals.active_user)
+
+    def test_transient_host_probe_failure_does_not_abort_cold_start(self):
+        """One failed host probe must not abort the five-minute readiness window."""
+        clock = FakeClock()
+
+        class TimeoutOnceRunner(ProbeRunner):
+            def __init__(self):
+                super().__init__()
+                self.timed_out = False
+
+            def run(self, argv, timeout=None):
+                if list(argv)[:1] == ["/usr/bin/pgrep"] and not self.timed_out:
+                    self.timed_out = True
+                    raise runtime.ExternalCommandError("host process probe failed")
+                return super().run(argv, timeout)
+
+        opened = []
+        controller = SteamController(
+            config=make_config(),
+            runner=TimeoutOnceRunner(),
+            open_steam=lambda: opened.append(True),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_seconds=1.0,
+            transition_stable_seconds=0.0,
+        )
+
+        controller.ensure_ready()
+
+        self.assertEqual(1.0, clock.now)
+        self.assertEqual([], opened)
 
     def test_transitioning_client_must_stay_ready_for_15_seconds(self):
         """Returning after the first ready probe would preserve the cold-start race."""
@@ -458,80 +771,147 @@ class SteamControllerTests(unittest.TestCase):
             self.assertFalse(controller._open_configured_steam())
             self.assertEqual([], calls)
 
-    def test_selected_bottle_task_query_reports_its_process_and_renderer(self):
-        """Selected tasks remain detectable when their argv has BottleID but no root."""
+    def test_probe_never_uses_crossover_windows_pid_namespace(self):
+        """CrossOver's Windows PIDs must never be treated as macOS process IDs."""
         config = make_config("/private/tmp/selected")
-        expected_task = [
-            "/Applications/CrossOver.app/wine",
-            "--bottle",
-            "Ostriv",
-            "--scope",
-            "managed",
-            "--no-update",
-            "--no-lock",
-            "tasklist",
-            "/fo",
-            "csv",
-            "/nh",
-        ]
-        expected_registry = [
-            "/Applications/CrossOver.app/wine",
-            "--bottle",
-            "Ostriv",
-            "--scope",
-            "managed",
-            "--no-update",
-            "--no-lock",
-            "reg",
-            "query",
-            r"HKCU\Software\Valve\Steam\ActiveProcess",
-        ]
-        expected_renderer = [
-            "/bin/ps",
-            "-ww",
-            "-o",
-            "pid=,command=",
-            "-p",
-            "418",
-        ]
-        calls = []
-
-        class RepresentativeRunner:
-            def run(self, argv, timeout=None):
-                argv = list(argv)
-                calls.append(argv)
-                if argv == expected_task:
-                    return FakeResult(
-                        0,
-                        '"steam.exe","417","Console","1","12,000 K"\n'
-                        '"steamwebhelper.exe","418","Console","1","24,000 K"\n',
-                    )
-                if argv == expected_registry:
-                    return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
-                if argv == expected_renderer:
-                    return FakeResult(
-                        0,
-                        "418 /CrossOver-selected-id/steamwebhelper.exe "
-                        "--type=renderer\n",
-                    )
-                raise AssertionError(argv)
-
-        signals = SteamController(config=config, runner=RepresentativeRunner()).probe()
+        runner = BottleScopedHostRunner(
+            "/private/tmp/selected/Bottles/Ostriv/drive_c/"
+            "Program Files (x86)/Steam"
+        )
+        signals = SteamController(
+            config=config, runner=runner
+        ).probe()
 
         self.assertEqual(SteamSignals(True, True, True), signals)
-        self.assertEqual([expected_task, expected_renderer, expected_registry], calls)
-
-    def test_tasklist_pid_parser_rejects_non_ascii_and_pathological_decimals(self):
-        """Untrusted decimal text must not reach Python's bounded integer parser."""
-        pathological = "9" * 5000
-        output = (
-            '"steam.exe","\uff11\uff12\uff13","Console","1","12,000 K"\n'
-            '"steamwebhelper.exe","{}","Console","1","24,000 K"\n'.format(
-                pathological
-            )
+        self.assertFalse(
+            any("tasklist" in call for call, _timeout in runner.calls),
+            "the native probe must never consume CrossOver's Windows PIDs",
         )
 
-        self.assertEqual({}, SteamController._task_processes(output))
+    def test_process_image_requires_windows_executable_position_and_boundary(self):
+        self.assertEqual(
+            "steam.exe",
+            SteamController._process_image("C:\\Program Files\\Steam\\steam.exe -silent"),
+        )
+        self.assertEqual(
+            "",
+            SteamController._process_image("C:\\Steam\\steam.exe.backup -silent"),
+        )
+        self.assertEqual(
+            "",
+            SteamController._process_image("--note=C:\\Steam\\steam.exe"),
+        )
+
+    def test_elapsed_time_parser_is_bounded_and_accepts_macos_ps_formats(self):
+        self.assertEqual(452, SteamController._elapsed_seconds("07:32"))
+        self.assertEqual(93784, SteamController._elapsed_seconds("1-02:03:04"))
+        self.assertIsNone(SteamController._elapsed_seconds("9" * 5000))
+        self.assertIsNone(SteamController._elapsed_seconds("25:00:00"))
+
+    def test_steam_and_renderer_are_scoped_to_the_bottle_independently(self):
+        selected = "/private/tmp/selected/Bottles/Ostriv/drive_c/Steam"
+        other = "/private/tmp/other/Bottles/Ostriv/drive_c/Steam"
+
+        class SplitOwnershipRunner(ProbeRunner):
+            def __init__(self, steam_cwd, renderer_cwd):
+                super().__init__(root="/private/tmp/selected")
+                self.steam_cwd = steam_cwd
+                self.renderer_cwd = renderer_cwd
+
+            def run(self, argv, timeout=None):
+                if list(argv)[:1] == ["/usr/sbin/lsof"]:
+                    return FakeResult(
+                        0,
+                        "p9417\nfcwd\nn{}\n"
+                        "p9418\nfcwd\nn{}\n".format(
+                            self.steam_cwd, self.renderer_cwd
+                        ),
+                    )
+                return super().run(argv, timeout)
+
+        config = make_config("/private/tmp/selected")
+        for steam_cwd, renderer_cwd, expected in (
+            (selected, other, SteamSignals(True, True, False)),
+            (other, selected, SteamSignals(False, False, True)),
+        ):
+            with self.subTest(steam_cwd=steam_cwd, renderer_cwd=renderer_cwd):
+                signals = SteamController(
+                    config=config,
+                    runner=SplitOwnershipRunner(steam_cwd, renderer_cwd),
+                ).probe()
+                self.assertEqual(expected, signals)
+
+    def test_renderer_from_another_bottle_cannot_satisfy_readiness(self):
+        """A host renderer is ready only when its cwd belongs to the selected bottle."""
+        config = make_config("/private/tmp/selected")
+        runner = BottleScopedHostRunner(
+            "/private/tmp/other/Bottles/Ostriv/drive_c/Program Files (x86)/Steam"
+        )
+        signals = SteamController(
+            config=config, runner=runner
+        ).probe()
+
+        self.assertEqual(SteamSignals(False, False, False), signals)
+
+    def test_bottle_cwd_probe_failure_is_a_safe_false_negative(self):
+        """An unavailable cwd probe must not crash or trust an unscoped renderer."""
+        runner = BottleScopedHostRunner(
+            "/tmp/Bottles/Ostriv",
+            cwd_error=runtime.ExternalCommandError("lsof unavailable"),
+        )
+
+        result = SteamController(config=make_config(), runner=runner).probe()
+
+        self.assertEqual(SteamSignals(False, False, False, False), result)
+
+    def test_incomplete_cwd_evidence_is_unknown_instead_of_known_absence(self):
+        """Missing CWD rows must not make a running Steam client look absent."""
+        selected = (
+            "/private/tmp/selected/Bottles/Ostriv/drive_c/"
+            "Program Files (x86)/Steam"
+        )
+
+        class IncompleteCwdRunner(ProbeRunner):
+            def __init__(self, output):
+                super().__init__(root="/private/tmp/selected")
+                self.output = output
+
+            def run(self, argv, timeout=None):
+                if list(argv)[:1] == ["/usr/sbin/lsof"]:
+                    return FakeResult(0, self.output)
+                return super().run(argv, timeout)
+
+        config = make_config("/private/tmp/selected")
+        for output in (
+            "",
+            "p9417\nfcwd\nn{}\n".format(selected),
+            "p9417\nn{}\np9418\nfcwd\nn{}\n".format(selected, selected),
+        ):
+            with self.subTest(output=output):
+                signals = SteamController(
+                    config=config,
+                    runner=IncompleteCwdRunner(output),
+                ).probe()
+
+                self.assertEqual(
+                    SteamSignals(False, False, False, False), signals
+                )
+
+    def test_host_pid_parser_rejects_non_ascii_and_pathological_decimals(self):
+        """Untrusted host PID text must not reach Python's bounded integer parser."""
+        pathological = "9" * 5000
+
+        class PathologicalCandidateRunner(ProbeRunner):
+            def run(self, argv, timeout=None):
+                if list(argv)[:1] == ["/usr/bin/pgrep"]:
+                    return FakeResult(0, "\uff11\uff12\uff13\n{}\n".format(pathological))
+                return super().run(argv, timeout)
+
+        signals = SteamController(
+            config=make_config(), runner=PathologicalCandidateRunner()
+        ).probe()
+
+        self.assertEqual(SteamSignals(False, False, False, False), signals)
 
     def test_ps_pid_parser_treats_pathological_decimal_as_safe_false(self):
         """A huge ps PID field cannot crash selected-helper role correlation."""
@@ -549,10 +929,10 @@ class SteamControllerTests(unittest.TestCase):
                 return super().run(argv, timeout)
 
         signals = SteamController(
-            config=config, runner=PathologicalPsRunner()
+            config=config, runner=PathologicalPsRunner(root="/private/tmp/selected")
         ).probe()
 
-        self.assertEqual(SteamSignals(True, True, False), signals)
+        self.assertEqual(SteamSignals(False, False, False, False), signals)
 
     def test_non_renderer_helper_never_passes_selected_bottle_readiness_gate(self):
         """A helper without the renderer role must not satisfy the 15-second gate."""
@@ -564,17 +944,20 @@ class SteamControllerTests(unittest.TestCase):
             def run(self, argv, timeout=None):
                 argv = list(argv)
                 calls.append(argv)
-                if "tasklist" in argv:
-                    return FakeResult(
-                        0,
-                        '"steam.exe","417","Console","1","12,000 K"\n'
-                        '"steamwebhelper.exe","418","Console","1","24,000 K"\n',
-                    )
+                if argv[:1] == ["/usr/bin/pgrep"]:
+                    return FakeResult(0, "9417\n9418\n")
                 if argv[:1] == ["/bin/ps"]:
                     return FakeResult(
                         0,
-                        "418 /selected/steamwebhelper.exe --type=gpu-process\n"
-                        "999 /other/steamwebhelper.exe --type=renderer\n",
+                        "9417 00:10 C:\\Steam\\steam.exe\n"
+                        "9418 00:09 C:\\Steam\\steamwebhelper.exe --type=gpu-process\n",
+                    )
+                if argv[:1] == ["/usr/sbin/lsof"]:
+                    return FakeResult(
+                        0,
+                        "p9417\nfcwd\n"
+                        "n/private/tmp/selected/Bottles/Ostriv/drive_c/"
+                        "Program Files (x86)/Steam\n",
                     )
                 return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
 
@@ -592,10 +975,12 @@ class SteamControllerTests(unittest.TestCase):
 
         self.assertEqual("steam_timeout", caught.exception.message_key)
         self.assertEqual(18.0, clock.now)
-        queried_pids = next(
-            call[-1] for call in calls if call[:1] == ["/bin/ps"]
+        lsof_call = next(call for call in calls if call[:1] == ["/usr/sbin/lsof"])
+        self.assertEqual(
+            "9417",
+            lsof_call[lsof_call.index("-p") + 1],
+            "a non-renderer must not reach bottle ownership probing",
         )
-        self.assertNotIn("999", queried_pids)
 
     def test_renderer_detail_query_failure_is_a_safe_false_negative(self):
         """Missing host detail evidence must never infer a renderer from its image name."""
@@ -608,78 +993,10 @@ class SteamControllerTests(unittest.TestCase):
                 return super().run(argv, timeout)
 
         signals = SteamController(
-            config=config, runner=FailedDetailRunner()
+            config=config, runner=FailedDetailRunner(root="/private/tmp/selected")
         ).probe()
 
-        self.assertEqual(SteamSignals(True, True, False), signals)
-
-    def test_other_and_same_named_bottle_tasks_cannot_satisfy_selected_readiness(self):
-        """Only the owning CrossOver and resolved bottle command may supply tasks."""
-        cases = (
-            (
-                "other bottle",
-                "/Applications/CrossOver.app/wine",
-                "Another Bottle",
-            ),
-            (
-                "same name in other CrossOver",
-                "/Applications/Other CrossOver.app/wine",
-                "Ostriv",
-            ),
-        )
-        for label, other_wine, other_bottle in cases:
-            with self.subTest(label=label):
-                config = make_config("/private/tmp/selected")
-                selected_task = [
-                    config.wine,
-                    "--bottle",
-                    config.bottle_argument,
-                    "--scope",
-                    "managed",
-                    "--no-update",
-                    "--no-lock",
-                    "tasklist",
-                    "/fo",
-                    "csv",
-                    "/nh",
-                ]
-                other_task = [
-                    other_wine,
-                    "--bottle",
-                    other_bottle,
-                    "--scope",
-                    "managed",
-                    "--no-update",
-                    "--no-lock",
-                    "tasklist",
-                    "/fo",
-                    "csv",
-                    "/nh",
-                ]
-                calls = []
-
-                class OtherBottleRunner:
-                    def run(self, argv, timeout=None):
-                        argv = list(argv)
-                        calls.append(argv)
-                        if argv == selected_task:
-                            return FakeResult(0, "")
-                        if argv == other_task:
-                            return FakeResult(
-                                0,
-                                '"steam.exe","517","Console","1","12,000 K"\n'
-                                '"steamwebhelper.exe","518","Console","1","24,000 K"\n',
-                            )
-                        if argv[:2] == ["pgrep", "-f"]:
-                            return FakeResult(0)
-                        return FakeResult(0, b"ActiveUser REG_DWORD 0x1\n")
-
-                signals = SteamController(
-                    config=config, runner=OtherBottleRunner()
-                ).probe()
-
-                self.assertEqual(SteamSignals(False, True, False), signals)
-                self.assertNotIn(other_task, calls)
+        self.assertEqual(SteamSignals(False, False, False, False), signals)
 
 
 class ExternalProcessRunnerTests(unittest.TestCase):
@@ -711,6 +1028,49 @@ class ExternalProcessRunnerTests(unittest.TestCase):
         self.assertIn("<truncated", text)
         self.assertNotIn("private-value", text)
         self.assertLess(len(text), 6000)
+
+    @patch("subprocess.run")
+    def test_lsof_cwd_output_is_omitted_from_the_launcher_log(self, run):
+        """Bottle paths from host process inspection are private diagnostics."""
+        private_path = "/Users/player/Library/CrossOver/Private Bottle"
+        run.return_value = FakeResult(0, ("n" + private_path + "\n").encode(), b"")
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "launcher.log"
+            runner = runtime.ExternalProcessRunner(
+                logger=runtime._create_launcher_log(log_path)
+            )
+
+            result = runner.run(
+                ["/usr/sbin/lsof", "-w", "-b", "-a", "-p", "9418", "-Fn"],
+                timeout=5,
+            )
+
+            text = log_path.read_text(encoding="utf-8")
+        self.assertIn(private_path, result.stdout)
+        self.assertIn("<process details omitted>", text)
+        self.assertNotIn(private_path, text)
+
+    @patch("subprocess.run")
+    def test_private_bottle_and_open_paths_are_redacted_from_log(self, run):
+        private_bottle = "/Users/player/Library/CrossOver/Bottles/Private"
+        private_app = "/Users/player/Applications/CrossOver/Steam.app"
+        run.return_value = FakeResult(0, b"", b"")
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "launcher.log"
+            runner = runtime.ExternalProcessRunner(
+                logger=runtime._create_launcher_log(log_path)
+            )
+            runner.run(
+                ["wine", "--bottle", private_bottle, "reg", "query", "HKCU\\Key"],
+                timeout=5,
+            )
+            runner.run(["open", private_app], timeout=5)
+
+            text = log_path.read_text(encoding="utf-8")
+
+        self.assertNotIn(private_bottle, text)
+        self.assertNotIn(private_app, text)
+        self.assertIn("<redacted>", text)
 
     @patch("subprocess.run")
     def test_process_detail_query_never_logs_captured_command_lines(self, run):
@@ -947,6 +1307,7 @@ class LaunchLogTests(unittest.TestCase):
             self.assertEqual(
                 "graphics_context", classify_launch("windows_createWindow FAILED")
             )
+            self.assertEqual("clean_exit", classify_launch("done exiting."))
 
     def test_generation_reader_handles_append_truncate_recreate_and_in_place_overwrite(self):
         """Ostriv may append, truncate, recreate, or overwrite its per-run log."""
@@ -1265,6 +1626,34 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     self.assertEqual(0, run_launcher(config, **arguments))
                 self.assertEqual(1, runner.calls)
                 self.assertEqual(1, events.count("restore"))
+
+    def test_clean_game_exit_ignores_crossover_wrapper_status_one(self):
+        """CrossOver returns one after a normal playable session and clean game shutdown."""
+        with TemporaryDirectory() as directory:
+            config = make_config(directory)
+            events = []
+            runner = FakeGameRunner(
+                events,
+                config.game_log,
+                [b"uiMainMenu\ndone exiting.\n"],
+                returncodes=[1],
+            )
+
+            code = run_launcher(
+                config,
+                lock=FakeLock(events),
+                log_factory=lambda _path: FakeLogger(events),
+                runner=runner,
+                steam=FakeSteam(events),
+                profile=FakeProfile(events),
+                dialog=lambda _message: self.fail("unexpected dialog"),
+                install_handlers=lambda _profile: None,
+            )
+
+            self.assertEqual(0, code)
+            self.assertIn(("final", "clean_exit"), events)
+            self.assertEqual(1, events.count("restore"))
+            self.assertEqual("unlock", events[-1])
 
     def test_terminal_steam_graphics_and_nonzero_results_are_typed_and_clean_up(self):
         """A completed Wine command is not success when fresh evidence says launch failed."""

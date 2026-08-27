@@ -5,11 +5,9 @@ keep working after the release directory that supplied it has gone away.
 """
 
 import atexit
-import csv
 import ctypes
 import fcntl
 import hashlib
-import io
 import json
 import logging
 import os
@@ -113,8 +111,10 @@ class ProcessLock:
 
 MAX_LOG_EVIDENCE_BYTES = 256 * 1024
 LOG_TOKEN_TAIL_BYTES = 64 * 1024
-MAX_RENDERER_HELPER_PIDS = 64
+MAX_STEAM_HOST_PIDS = 64
 MAX_PID_TEXT_DIGITS = 10
+MAX_USER_REGISTRY_BYTES = 4 * 1024 * 1024
+ACTIVE_USER_CONFIRMATION_SECONDS = 10.0
 _AMBIGUOUS_LOG_EVIDENCE = "<changed log generation outside bounded evidence>"
 
 
@@ -255,6 +255,8 @@ def classify_launch(text: str) -> str:
         return "steam_api"
     if "windows_createWindow FAILED" in text:
         return "graphics_context"
+    if "done exiting." in text:
+        return "clean_exit"
     return "other"
 
 
@@ -280,10 +282,27 @@ class SteamSignals:
     process: bool
     active_user: bool
     renderer: bool
+    process_known: bool = True
 
     @property
     def ready(self) -> bool:
         return self.process and self.active_user and self.renderer
+
+
+@dataclass(frozen=True)
+class HostSteamProbe:
+    process: bool
+    renderer: bool
+    process_known: bool
+    steam_pids: frozenset
+    started_at: Optional[float]
+
+
+@dataclass(frozen=True)
+class ActiveUserSnapshot:
+    value: Optional[bool]
+    generation: Optional[tuple] = None
+    mtime: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -301,9 +320,11 @@ class ExternalCommandError(RuntimeError):
 class ExternalProcessRunner:
     """Run external commands without ever exposing their raw output to the player."""
 
-    ALLOWED_EXECUTABLES = frozenset({"open", "osascript", "ps", "wine"})
+    ALLOWED_EXECUTABLES = frozenset(
+        {"lsof", "open", "osascript", "pgrep", "ps", "wine"}
+    )
     SENSITIVE_OPTIONS = frozenset(
-        {"--api-key", "--password", "--secret", "--token", "/d"}
+        {"--api-key", "--bottle", "--password", "--secret", "--token", "/d"}
     )
 
     def __init__(self, logger=None):
@@ -323,9 +344,10 @@ class ExternalProcessRunner:
     def _safe_argv(cls, argv):
         redacted = []
         hide_next = False
-        for value in argv:
+        executable = Path(str(argv[0])).name if argv else ""
+        for index, value in enumerate(argv):
             text = str(value)
-            if hide_next:
+            if hide_next or (executable == "open" and index > 0):
                 redacted.append("<redacted>")
                 hide_next = False
                 continue
@@ -335,11 +357,14 @@ class ExternalProcessRunner:
 
     @classmethod
     def _sensitive_values(cls, argv):
-        return tuple(
+        values = tuple(
             str(argv[index + 1])
             for index, value in enumerate(argv[:-1])
             if str(value).lower() in cls.SENSITIVE_OPTIONS and str(argv[index + 1])
         )
+        if argv and Path(str(argv[0])).name == "open":
+            values += tuple(str(value) for value in argv[1:] if str(value))
+        return values
 
     @staticmethod
     def _bounded(text, sensitive_values=(), limit=2048):
@@ -357,7 +382,7 @@ class ExternalProcessRunner:
 
     @classmethod
     def _diagnostic(cls, command, returncode, stdout, stderr, status=None):
-        if Path(command[0]).name == "ps":
+        if Path(command[0]).name in {"lsof", "pgrep", "ps"}:
             stdout = "<process details omitted>"
             stderr = "<process details omitted>"
         sensitive_values = cls._sensitive_values(command)
@@ -458,6 +483,7 @@ class SteamController:
         probe=None,
         open_steam=None,
         monotonic=time.monotonic,
+        wall_time=time.time,
         sleep=time.sleep,
         poll_seconds: float = 2.0,
         transition_stable_seconds: float = 15.0,
@@ -472,6 +498,7 @@ class SteamController:
         self.runner = runner
         self.open_steam = open_steam or self._open_configured_steam
         self.monotonic = monotonic
+        self.wall_time = wall_time
         self.sleep = sleep
         self.poll_seconds = poll_seconds
         self.transition_stable_seconds = transition_stable_seconds
@@ -480,6 +507,7 @@ class SteamController:
         self.logger = logger or logging.getLogger("ostriv_macos.launcher")
         self._opened = False
         self._notified = False
+        self._active_user_confirmation = None
 
     def _wine_command(self, *arguments: str) -> List[str]:
         command = [self.config.wine, "--bottle", self.config.bottle_argument]
@@ -532,56 +560,309 @@ class SteamController:
         return True
 
     @staticmethod
-    def _task_processes(output) -> Dict[str, set]:
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", errors="replace")
-        processes: Dict[str, set] = {}
-        try:
-            rows = csv.reader(io.StringIO(str(output)[: MAX_LOG_EVIDENCE_BYTES]))
-            for row in rows:
-                if len(row) < 2:
-                    continue
-                image = row[0].lstrip("\ufeff").strip().lower()
-                pid = _parse_pid(row[1])
-                if not image or pid is None:
-                    continue
-                processes.setdefault(image, set()).add(pid)
-        except csv.Error:
-            return {}
-        return processes
+    def _process_image(command: str) -> str:
+        normalized = command.strip().lower().replace("\\", "/")
+        if (
+            len(normalized) < 4
+            or not normalized[0].isascii()
+            or not normalized[0].isalpha()
+            or normalized[1:3] != ":/"
+        ):
+            return ""
+        executable_end = normalized.find(".exe")
+        if executable_end < 0:
+            return ""
+        suffix = normalized[executable_end + 4 : executable_end + 5]
+        if suffix and not suffix.isspace():
+            return ""
+        return normalized[: executable_end + 4].rsplit("/", 1)[-1]
 
-    def _renderer_running(self, helper_pids) -> bool:
-        selected = sorted(set(helper_pids))
-        if not selected or len(selected) > MAX_RENDERER_HELPER_PIDS:
-            return False
-        command = [
-            "/bin/ps",
-            "-ww",
-            "-o",
-            "pid=,command=",
-            "-p",
-            ",".join(str(pid) for pid in selected),
+    @staticmethod
+    def _elapsed_seconds(value: str) -> Optional[int]:
+        text = value.strip()
+        if not text or len(text) > 20 or not text.isascii():
+            return None
+        days = 0
+        if "-" in text:
+            day_text, text = text.split("-", 1)
+            if not day_text.isdigit():
+                return None
+            days = int(day_text, 10)
+        fields = text.split(":")
+        if len(fields) == 2:
+            hours = 0
+            minute_text, second_text = fields
+        elif len(fields) == 3:
+            hour_text, minute_text, second_text = fields
+            if not hour_text.isdigit():
+                return None
+            hours = int(hour_text, 10)
+        else:
+            return None
+        if not minute_text.isdigit() or not second_text.isdigit():
+            return None
+        minutes = int(minute_text, 10)
+        seconds = int(second_text, 10)
+        if hours > 23 or minutes > 59 or seconds > 59:
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+    @staticmethod
+    def _unknown_host_probe() -> HostSteamProbe:
+        return HostSteamProbe(False, False, False, frozenset(), None)
+
+    def _host_process_roles(self) -> HostSteamProbe:
+        candidates = [
+            "/usr/bin/pgrep",
+            "-f",
+            "steam[.]exe|steamwebhelper[.]exe",
         ]
         try:
-            result = self.runner.run(command, timeout=5.0)
+            result = self.runner.run(candidates, timeout=5.0)
         except (ExternalCommandError, OSError, ValueError):
-            return False
+            return self._unknown_host_probe()
+        if result.returncode == 1:
+            return HostSteamProbe(False, False, True, frozenset(), None)
         if result.returncode != 0:
-            return False
+            return self._unknown_host_probe()
         output = result.stdout
         if isinstance(output, bytes):
             output = output.decode("utf-8", errors="replace")
-        selected_set = set(selected)
+        host_pids = {
+            pid
+            for line in str(output)[:MAX_LOG_EVIDENCE_BYTES].splitlines()
+            if (pid := _parse_pid(line.strip())) is not None
+        }
+        if not host_pids or len(host_pids) > MAX_STEAM_HOST_PIDS:
+            return self._unknown_host_probe()
+
+        ordered_pids = sorted(host_pids)
+        details = [
+            "/bin/ps",
+            "-ww",
+            "-o",
+            "pid=,etime=,command=",
+            "-p",
+            ",".join(str(pid) for pid in ordered_pids),
+        ]
+        try:
+            result = self.runner.run(details, timeout=5.0)
+        except (ExternalCommandError, OSError, ValueError):
+            return self._unknown_host_probe()
+        if result.returncode != 0:
+            return self._unknown_host_probe()
+        output = result.stdout
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        candidate_pids = set(ordered_pids)
+        steam_pids = set()
+        steam_started_at = {}
+        renderer_pids = set()
+        candidate_rows = 0
+        observed_at = self.wall_time()
         for line in str(output)[:MAX_LOG_EVIDENCE_BYTES].splitlines():
-            fields = line.strip().split(None, 1)
-            if len(fields) != 2:
+            fields = line.strip().split(None, 2)
+            if len(fields) != 3:
                 continue
             pid = _parse_pid(fields[0])
-            if pid is None or pid not in selected_set:
+            if pid is None or pid not in candidate_pids:
                 continue
-            if "--type=renderer" in fields[1].split():
-                return True
-        return False
+            candidate_rows += 1
+            image = self._process_image(fields[2])
+            if image == "steam.exe":
+                steam_pids.add(pid)
+                elapsed = self._elapsed_seconds(fields[1])
+                if elapsed is not None:
+                    steam_started_at[pid] = float(int(observed_at - elapsed))
+            elif (
+                image == "steamwebhelper.exe"
+                and "--type=renderer" in fields[2].split()
+            ):
+                renderer_pids.add(pid)
+        role_pids = steam_pids | renderer_pids
+        if candidate_rows == 0:
+            return self._unknown_host_probe()
+        if not role_pids:
+            return HostSteamProbe(False, False, True, frozenset(), None)
+
+        cwd_query = [
+            "/usr/sbin/lsof",
+            "-w",
+            "-b",
+            "-a",
+            "-n",
+            "-p",
+            ",".join(str(pid) for pid in sorted(role_pids)),
+            "-d",
+            "cwd",
+            "-Fn",
+        ]
+        try:
+            result = self.runner.run(cwd_query, timeout=5.0)
+        except (ExternalCommandError, OSError, ValueError):
+            return self._unknown_host_probe()
+        if result.returncode != 0 or self.config is None:
+            return self._unknown_host_probe()
+        output = result.stdout
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        bottle = Path(
+            os.path.realpath(
+                self.config.bottle_realpath or self.config.bottle_argument
+            )
+        )
+        cwd_by_pid = {}
+        current_pid = None
+        has_cwd_field = False
+        for line in str(output)[:MAX_LOG_EVIDENCE_BYTES].splitlines():
+            if line.startswith("p"):
+                current_pid = _parse_pid(line[1:])
+                has_cwd_field = False
+                continue
+            if line == "fcwd":
+                has_cwd_field = current_pid in role_pids
+                continue
+            if (
+                current_pid not in role_pids
+                or not has_cwd_field
+                or not line.startswith("n/")
+                or len(line) > 4097
+                or current_pid in cwd_by_pid
+            ):
+                continue
+            cwd_by_pid[current_pid] = Path(os.path.realpath(line[1:]))
+            has_cwd_field = False
+        if set(cwd_by_pid) != role_pids:
+            return self._unknown_host_probe()
+        owned_pids = set()
+        for pid, cwd in cwd_by_pid.items():
+            if cwd == bottle or bottle in cwd.parents:
+                owned_pids.add(pid)
+        owned_steam_pids = steam_pids & owned_pids
+        start_times = [
+            steam_started_at[pid]
+            for pid in owned_steam_pids
+            if pid in steam_started_at
+        ]
+        return HostSteamProbe(
+            bool(owned_steam_pids),
+            bool(renderer_pids & owned_pids),
+            True,
+            frozenset(owned_steam_pids),
+            max(start_times) if start_times else None,
+        )
+
+    def _active_user_from_file(self) -> ActiveUserSnapshot:
+        if self.config is None:
+            return ActiveUserSnapshot(None)
+        bottle = Path(
+            os.path.realpath(
+                self.config.bottle_realpath or self.config.bottle_argument
+            )
+        )
+        try:
+            with (bottle / "user.reg").open("rb") as stream:
+                status = os.fstat(stream.fileno())
+                data = stream.read(MAX_USER_REGISTRY_BYTES + 1)
+        except OSError:
+            return ActiveUserSnapshot(None)
+        if len(data) > MAX_USER_REGISTRY_BYTES:
+            return ActiveUserSnapshot(None)
+        generation = (
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            getattr(
+                status,
+                "st_mtime_ns",
+                int(status.st_mtime * 1_000_000_000),
+            ),
+        )
+
+        target_section = r"[Software\\Valve\\Steam\\ActiveProcess]".casefold()
+        in_section = False
+        for raw_line in data.decode("utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if line.startswith("["):
+                section = line.split("]", 1)[0] + "]" if "]" in line else ""
+                in_section = section.casefold() == target_section
+                continue
+            if not in_section or not line.startswith('"ActiveUser"=dword:'):
+                continue
+            value = line.split(":", 1)[1]
+            if len(value) != 8 or any(
+                character not in "0123456789abcdefABCDEF" for character in value
+            ):
+                return ActiveUserSnapshot(None, generation, status.st_mtime)
+            return ActiveUserSnapshot(
+                int(value, 16) != 0,
+                generation,
+                status.st_mtime,
+            )
+        return ActiveUserSnapshot(None, generation, status.st_mtime)
+
+    def _active_user_from_wine(self) -> Optional[bool]:
+        registry_command = self._wine_command(
+            "--no-update",
+            "--no-lock",
+            "reg",
+            "query",
+            r"HKCU\Software\Valve\Steam\ActiveProcess",
+        )
+        try:
+            registry = self.runner.run(registry_command, timeout=10.0)
+        except (ExternalCommandError, OSError, ValueError):
+            return None
+        if registry.returncode != 0:
+            return None
+        output = registry.stdout
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        for line in str(output).splitlines():
+            parts = line.split()
+            if (
+                len(parts) == 3
+                and parts[0] == "ActiveUser"
+                and parts[2].startswith("0x")
+            ):
+                try:
+                    return int(parts[2], 16) != 0
+                except ValueError:
+                    return None
+        return None
+
+    def _active_user(self, host: HostSteamProbe) -> bool:
+        if not host.process:
+            return False
+        snapshot = self._active_user_from_file()
+        if (
+            snapshot.value is not None
+            and host.started_at is not None
+            and snapshot.mtime + 2.0 >= host.started_at
+        ):
+            self._active_user_confirmation = None
+            return snapshot.value
+
+        confirmation_key = (
+            host.steam_pids,
+            host.started_at,
+            snapshot.generation,
+        )
+        now = self.monotonic()
+        if self._active_user_confirmation is not None:
+            cached_key, cached_value, expires_at = self._active_user_confirmation
+            if cached_key == confirmation_key and now < expires_at:
+                return cached_value
+        confirmed = self._active_user_from_wine()
+        if confirmed is not True:
+            self._active_user_confirmation = None
+            return False
+        self._active_user_confirmation = (
+            confirmation_key,
+            True,
+            now + ACTIVE_USER_CONFIRMATION_SECONDS,
+        )
+        return True
 
     def probe(self) -> SteamSignals:
         if self._probe is not None:
@@ -590,49 +871,17 @@ class SteamController:
             if self.config is None or self.runner is None:
                 raise TypeError("SteamController requires a probe or config and runner")
 
-            task_command = self._wine_command(
-                "--no-update",
-                "--no-lock",
-                "tasklist",
-                "/fo",
-                "csv",
-                "/nh",
+            host = self._host_process_roles()
+            signals = SteamSignals(
+                host.process,
+                self._active_user(host),
+                host.renderer,
+                host.process_known,
             )
-            tasks = self.runner.run(task_command, timeout=10.0)
-            processes = (
-                self._task_processes(tasks.stdout) if tasks.returncode == 0 else {}
-            )
-            process = bool(processes.get("steam.exe"))
-            renderer = self._renderer_running(
-                processes.get("steamwebhelper.exe", set())
-            )
-            registry_command = self._wine_command(
-                "--no-update",
-                "--no-lock",
-                "reg",
-                "query",
-                r"HKCU\Software\Valve\Steam\ActiveProcess",
-            )
-            registry = self.runner.run(registry_command, timeout=10.0)
-            output = registry.stdout
-            if isinstance(output, bytes):
-                output = output.decode("utf-8", errors="replace")
-            active_user = False
-            for line in str(output).splitlines():
-                parts = line.split()
-                if (
-                    len(parts) == 3
-                    and parts[0] == "ActiveUser"
-                    and parts[2].startswith("0x")
-                ):
-                    try:
-                        active_user = int(parts[2], 16) != 0
-                    except ValueError:
-                        active_user = False
-            signals = SteamSignals(process, active_user, renderer)
         self.logger.info(
-            "steam probe process=%s active_user=%s renderer=%s ready=%s",
+            "steam probe process=%s process_known=%s active_user=%s renderer=%s ready=%s",
             signals.process,
+            signals.process_known,
             signals.active_user,
             signals.renderer,
             signals.ready,
@@ -661,7 +910,7 @@ class SteamController:
             return now
 
         def open_if_absent(signals: SteamSignals) -> None:
-            if not signals.process and not self._opened:
+            if signals.process_known and not signals.process and not self._opened:
                 self.open_steam()
                 self._opened = True
 
@@ -1067,10 +1316,11 @@ def run_launcher(
             final_state = classify_launch(read_new_log(game_log, generation))
             logger.info("launcher classification=%s attempt=2", final_state)
         returncode = getattr(result, "returncode", None)
-        if (
-            final_state in ("steam_api", "graphics_context", "ambiguous_log")
-            or returncode != 0
-        ):
+        if final_state in (
+            "steam_api",
+            "graphics_context",
+            "ambiguous_log",
+        ) or (returncode != 0 and final_state != "clean_exit"):
             raise LauncherRuntimeError(
                 "game_failed",
                 "Game launch failed: classification={} returncode={}".format(

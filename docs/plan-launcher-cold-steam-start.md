@@ -66,20 +66,27 @@ current implementation.
 `ostriv_macos/launcher_runtime.py` now owns a deterministic readiness state machine:
 
 1. Acquire a per-bottle advisory lock so a repeated click cannot start another Steam/game path.
-2. Probe all three signals: the selected bottle's Wine task table must contain Steam, its registry
-   must report a nonzero `ActiveUser`, and an exact helper PID from that same task table must have
-   `--type=renderer` in its bounded macOS process detail. Another bottle's helper, a non-renderer
-   helper, process presence, or login alone is never ready. Captured process details are omitted
-   from diagnostics.
+2. Probe all three signals without polling Wine: host `steam.exe` and
+   `steamwebhelper.exe --type=renderer` processes must both have working directories inside the
+   selected bottle, and that bottle's bounded `user.reg` data must report a nonzero `ActiveUser`.
+   The file is trusted only when its modification time belongs to the current host Steam process
+   generation; otherwise Wine confirms the live value. Logged-out results are checked again on
+   the next poll, while positive results are cached for at most ten seconds and only for the same
+   process generation and registry-file generation.
+   CrossOver's Windows task PIDs are never reused as macOS PIDs; the two namespaces are unrelated.
+   Another bottle's process or renderer, a non-renderer helper, process presence, or login alone is
+   never ready. Captured process details and bottle paths are omitted from diagnostics.
 3. For an already warm client, require two consecutive ready probes two seconds apart.
 4. For a stopped or transitioning client, open the matching CrossOver Steam app at most once and
    require all readiness signals to remain stable for 15 seconds. Any dropped signal resets the
-   stable interval; the absolute timeout is five minutes.
+   stable interval; the absolute timeout is five minutes. An unavailable or malformed host probe
+   is “unknown,” not “Steam absent,” so it never triggers another open.
 5. If login or readiness fails, do not launch Ostriv. Show one concise action and keep details in
    the local launcher log.
 6. Classify only Ostriv log bytes appended by this launch. A fresh `SteamAPI_Init() failed` marker
    receives one 30-second readiness pass and exactly one game retry. Graphics-context and unrelated
-   failures never retry.
+   failures never retry. Ostriv's fresh `done exiting.` marker is a clean session end even when
+   CrossOver's wrapper returns status 1 after the player quits.
 
 The runtime also creates the log before external adapters, restores a stale display-profile marker
 before Steam work, restores the exact original profile on every handled exit path, and releases
@@ -95,6 +102,13 @@ launch installed Steam or Ostriv.
 - **`open -g` (background) for Steam.** Speculative focus hardening; the real bug was never
   focus. Reverted to a plain foreground `open` (a backgrounded Steam may also initialise more
   slowly).
+- **Using Wine `tasklist` PIDs with macOS `ps`.** CrossOver reports Windows PIDs (for example,
+  `488`) that do not identify the corresponding host process (for example, `89570`). Query host
+  candidates independently, then prove bottle ownership from the renderer's working directory.
+- **Polling Wine `tasklist` and `reg query`.** During Steam startup either call can consume its
+  ten-second subprocess limit even when Steam is healthy. Repeating both made a warm launch take
+  more than a minute. Native process inspection plus a bounded bottle registry read keeps normal
+  probes fast; a transient probe failure remains “not ready yet” until the overall deadline.
 
 ## Files changed
 
