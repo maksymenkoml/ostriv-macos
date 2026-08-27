@@ -2034,7 +2034,8 @@ class LauncherInstaller:
             if actual_inventory == recorded:
                 return actual_inventory
             plist_path = app / "Contents/Info.plist"
-            actual_plist = plistlib.loads(plist_path.read_bytes())
+            actual_plist_data = plist_path.read_bytes()
+            actual_plist = plistlib.loads(actual_plist_data)
             identity = {
                 "CFBundleName": LAUNCHER_NAME,
                 "CFBundleDisplayName": LAUNCHER_NAME,
@@ -2060,20 +2061,36 @@ class LauncherInstaller:
             }
             if actual_icon_digest not in allowed_icon_digests:
                 return recorded
-            with tempfile.TemporaryDirectory(
-                prefix="ostriv-launcher-refresh-"
-            ) as temporary:
-                destination = Path(temporary) / "template"
-                destination.mkdir()
-                self.extractor(self._template(installation), destination)
-                (destination / "Contents/Info.plist").write_bytes(
-                    plist_path.read_bytes()
-                )
-                (destination / "Contents/Resources/CrossOverHelper.icns").write_bytes(
-                    actual_icon.read_bytes()
-                )
-                destination.chmod(actual_root_mode)
-                expected_inventory = _inventory(destination)
+            changes = {
+                ".": ("directory", "mode", actual_root_mode),
+                "Contents/Info.plist": (
+                    "file",
+                    "sha256",
+                    _digest(actual_plist_data),
+                ),
+                "Contents/Resources/CrossOverHelper.icns": (
+                    "file",
+                    "sha256",
+                    actual_icon_digest,
+                ),
+            }
+            expected_inventory = []
+            changed = set()
+            for recorded_item in recorded:
+                if not isinstance(recorded_item, dict):
+                    return recorded
+                item = dict(recorded_item)
+                relative = item.get("relative_path")
+                change = changes.get(relative)
+                if change is not None:
+                    expected_type, field, value = change
+                    if item.get("type") != expected_type:
+                        return recorded
+                    item[field] = value
+                    changed.add(relative)
+                expected_inventory.append(item)
+            if changed != set(changes):
+                return recorded
             if actual_inventory == expected_inventory:
                 return actual_inventory
         except (KeyError, OSError, TypeError, ValueError, plistlib.InvalidFileException):

@@ -1283,7 +1283,12 @@ class LauncherInstallerTests(unittest.TestCase):
 
     def test_restore_preserves_foreign_changes_to_generated_launcher(self):
         """CrossOver's plist rewrite must not broaden Restore ownership."""
-        for change in ("icon", "executable", "root mode"):
+        for change in (
+            "icon",
+            "executable",
+            "executable matching newer template",
+            "root mode",
+        ):
             with self.subTest(change=change):
                 fixture = LauncherFixture()
                 self.addCleanup(fixture.cleanup)
@@ -1297,9 +1302,19 @@ class LauncherInstallerTests(unittest.TestCase):
                         fixture.app / "Contents/Resources/CrossOverHelper.icns"
                     )
                     changed_path.write_bytes(b"foreign-icon")
-                elif change == "executable":
+                elif change in ("executable", "executable matching newer template"):
                     changed_path = fixture.app / "Contents/MacOS/Menu Helper"
                     changed_path.write_bytes(b"foreign-executable")
+                    if change == "executable matching newer template":
+                        original_extractor = fixture.installer.extractor
+
+                        def newer_extractor(template, destination):
+                            original_extractor(template, destination)
+                            (
+                                destination / "Contents/MacOS/Menu Helper"
+                            ).write_bytes(b"foreign-executable")
+
+                        fixture.installer.extractor = newer_extractor
                 else:
                     changed_path = fixture.app
                     changed_path.chmod(0o777)
@@ -1309,7 +1324,7 @@ class LauncherInstallerTests(unittest.TestCase):
                 self.assertTrue(changed_path.exists())
                 if change == "icon":
                     self.assertEqual(b"foreign-icon", changed_path.read_bytes())
-                elif change == "executable":
+                elif change in ("executable", "executable matching newer template"):
                     self.assertEqual(b"foreign-executable", changed_path.read_bytes())
                 else:
                     self.assertEqual(0o777, stat.S_IMODE(changed_path.stat().st_mode))
@@ -1356,47 +1371,69 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertFalse(backup.exists())
         self.assertEqual(generated_plist, (app / "Contents/Info.plist").read_bytes())
 
-    def test_incomplete_reinstall_rejects_foreign_generated_backup_icon(self):
-        """Recovery must not adopt an icon change absent from its durable inventory."""
-        fixture = LauncherFixture()
-        self.addCleanup(fixture.cleanup)
-        state = fixture.installer.install(fixture.transaction, fixture.installation)
-        fixture.transaction.journal.commit()
-        (fixture.bottle_root / "ostriv-macos-state.json").write_text(
-            json.dumps({"launcher_artifacts": dict(state)}), encoding="utf-8"
-        )
-        fixture.apply_crossover_generated_launcher_refresh()
-        app = fixture.installer._app_path()
-        backup = app.with_name("." + app.name + ".ostriv-macos.replaced")
-        os.replace(app, backup)
-        shutil.copytree(backup, app)
-        foreign_icon = backup / "Contents/Resources/CrossOverHelper.icns"
-        foreign_icon.write_bytes(b"foreign-icon")
-        record = UndoRecord(
-            "restore_launcher",
-            {
-                "snapshots": [],
-                "owned_root": str(backup),
-                "owned_directories": [str(backup)],
-                "remove_owned_tree": False,
-                "moved_tree": {
-                    "source": str(backup),
-                    "destination": str(app),
-                    "source_inventory": list(state["app_inventory"]),
-                    "replacement_inventory": launcher_module._inventory(app),
-                },
-            },
-        )
-        handler = fixture.installer.undo_handler(
-            fixture.installation, fixture._restore_snapshots
-        )
+    def test_incomplete_reinstall_rejects_foreign_generated_backup_changes(self):
+        """Recovery trusts recorded content, never current CrossOver template content."""
+        for change in ("icon", "executable matching newer template"):
+            with self.subTest(change=change):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                state = fixture.installer.install(
+                    fixture.transaction, fixture.installation
+                )
+                fixture.transaction.journal.commit()
+                (fixture.bottle_root / "ostriv-macos-state.json").write_text(
+                    json.dumps({"launcher_artifacts": dict(state)}), encoding="utf-8"
+                )
+                fixture.apply_crossover_generated_launcher_refresh()
+                app = fixture.installer._app_path()
+                backup = app.with_name("." + app.name + ".ostriv-macos.replaced")
+                os.replace(app, backup)
+                shutil.copytree(backup, app)
+                if change == "icon":
+                    foreign_path = (
+                        backup / "Contents/Resources/CrossOverHelper.icns"
+                    )
+                    foreign_content = b"foreign-icon"
+                else:
+                    foreign_path = backup / "Contents/MacOS/Menu Helper"
+                    foreign_content = b"foreign-executable"
+                    original_extractor = fixture.installer.extractor
 
-        with self.assertRaises(PatchError) as caught:
-            handler(record)
+                    def newer_extractor(template, destination):
+                        original_extractor(template, destination)
+                        (destination / "Contents/MacOS/Menu Helper").write_bytes(
+                            foreign_content
+                        )
 
-        self.assertEqual("restore.launcher_ownership", caught.exception.code)
-        self.assertEqual(b"foreign-icon", foreign_icon.read_bytes())
-        self.assertTrue(app.exists())
+                    fixture.installer.extractor = newer_extractor
+                foreign_path.write_bytes(foreign_content)
+                record = UndoRecord(
+                    "restore_launcher",
+                    {
+                        "snapshots": [],
+                        "owned_root": str(backup),
+                        "owned_directories": [str(backup)],
+                        "remove_owned_tree": False,
+                        "moved_tree": {
+                            "source": str(backup),
+                            "destination": str(app),
+                            "source_inventory": list(state["app_inventory"]),
+                            "replacement_inventory": launcher_module._inventory(app),
+                        },
+                    },
+                )
+                handler = fixture.installer.undo_handler(
+                    fixture.installation, fixture._restore_snapshots
+                )
+
+                with self.assertRaises(PatchError) as caught:
+                    handler(record)
+
+                self.assertEqual(
+                    "restore.launcher_ownership", caught.exception.code
+                )
+                self.assertEqual(foreign_content, foreign_path.read_bytes())
+                self.assertTrue(app.exists())
 
     def test_crossover_generated_refresh_rejects_unknown_icon(self):
         """A trusted plist rewrite must not authorize unrelated bundle content."""
