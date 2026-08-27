@@ -1,5 +1,6 @@
 import io
 import logging
+import os
 import subprocess
 import tempfile
 import unittest
@@ -97,6 +98,33 @@ class DiagnosticsTests(unittest.TestCase):
         run.assert_called_once_with(
             ["wine", "--check"], capture_output=True, check=False, timeout=2
         )
+
+    @patch("ostriv_macos.diagnostics.subprocess.run")
+    def test_command_runner_applies_only_allowed_environment_overrides(self, run):
+        """Dropping CX_BOTTLE_PATH makes a named external bottle impossible to select."""
+        run.return_value = subprocess.CompletedProcess(["cxmenu"], 0, b"", b"")
+
+        CommandRunner().run(
+            ["cxmenu", "--bottle", "Steam", "--scope", "private"],
+            timeout=2,
+            environment={"CX_BOTTLE_PATH": "/Volumes/Games/Bottles"},
+        )
+
+        command_environment = run.call_args.kwargs.get("env", {})
+        self.assertEqual(
+            "/Volumes/Games/Bottles", command_environment.get("CX_BOTTLE_PATH")
+        )
+        self.assertEqual(os.environ.get("PATH"), command_environment.get("PATH"))
+
+    @patch("ostriv_macos.diagnostics.subprocess.run")
+    def test_command_runner_rejects_unlisted_environment_overrides(self, run):
+        """A generic environment escape hatch would bypass the command allowlist."""
+        run.return_value = subprocess.CompletedProcess(["cxmenu"], 0, b"", b"")
+        with self.assertRaisesRegex(ValueError, "environment variable is not allowed"):
+            CommandRunner().run(
+                ["cxmenu", "--bottle", "Steam"],
+                environment={"DYLD_INSERT_LIBRARIES": "/tmp/injected.dylib"},
+            )
 
     @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_command_timeout_is_typed_and_keeps_partial_output_private(self, run):

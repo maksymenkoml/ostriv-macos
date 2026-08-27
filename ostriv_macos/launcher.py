@@ -16,7 +16,7 @@ import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 from .diagnostics import CommandRunner, PatchError, command_failure_detail
 from .discovery import GameInstallation
@@ -763,12 +763,23 @@ class LauncherInstaller:
                 source_inventory = moved.get("source_inventory")
                 replacement_inventory = moved.get("replacement_inventory")
                 if _lexists(source):
-                    if _inventory(source) != source_inventory:
-                        raise PatchError(
-                            "restore.launcher_ownership",
-                            "Restore failed.",
-                            "Moved launcher backup changed: {}".format(source),
+                    actual_source_inventory = _inventory(source)
+                    if actual_source_inventory != source_inventory:
+                        prior = self._prior_launcher_state(installation)
+                        trusted_refresh = (
+                            prior is not None
+                            and source_inventory == prior.get("app_inventory")
+                            and self._current_owned_app_inventory(
+                                installation, prior, app=source
+                            )
+                            == actual_source_inventory
                         )
+                        if not trusted_refresh:
+                            raise PatchError(
+                                "restore.launcher_ownership",
+                                "Restore failed.",
+                                "Moved launcher backup changed: {}".format(source),
+                            )
                     if _lexists(destination):
                         _remove_inventory_tree(destination, replacement_inventory)
                     os.replace(source, destination)
@@ -828,12 +839,10 @@ class LauncherInstaller:
             if record.data.get("purge_menu") is True:
                 command = [
                     str(self._cxmenu(installation)),
-                    "--bottle",
-                    self._command_bottle(installation),
                 ]
-                command.extend(installation.bottle.scope_args())
+                command.extend(self._cxmenu_bottle_args(installation))
                 command.extend(["--purge", "--filter", LAUNCHER_MENU])
-                result = self.runner.run(command, timeout=60.0)
+                result = self._run_cxmenu(installation, command)
                 if result.returncode != 0:
                     raise PatchError(
                         "restore.launcher_menu",
@@ -846,11 +855,9 @@ class LauncherInstaller:
                     recreate_command = "exec /usr/bin/env python3 {}".format(
                         installation.bottle.root.resolve() / RUNTIME_NAME
                     )
-                result = self.runner.run(
-                    self._menu_create_command(
-                        installation, recreate_command
-                    ),
-                    timeout=60.0,
+                result = self._run_cxmenu(
+                    installation,
+                    self._menu_create_command(installation, recreate_command),
                 )
                 if result.returncode != 0:
                     raise PatchError(
@@ -884,14 +891,15 @@ class LauncherInstaller:
         )
 
     def _menu_create_command(
-        self, installation: GameInstallation, command: str
+        self,
+        installation: GameInstallation,
+        command: str,
+        icon: Optional[Path] = None,
     ) -> List[str]:
         argv = [
             str(self._cxmenu(installation)),
-            "--bottle",
-            self._command_bottle(installation),
         ]
-        argv.extend(installation.bottle.scope_args())
+        argv.extend(self._cxmenu_bottle_args(installation))
         argv.extend(
             [
                 "--create",
@@ -902,9 +910,11 @@ class LauncherInstaller:
                 command,
                 "--description",
                 "Ostriv with the sRGB color-profile FPS fix",
-                "--install",
             ]
         )
+        if icon is not None:
+            argv.extend(["--icon", str(icon)])
+        argv.append("--install")
         return argv
 
     def _restore_undo_data(
@@ -1393,6 +1403,8 @@ class LauncherInstaller:
 
     def preflight(self, installation: GameInstallation) -> None:
         """Reject reserved launcher leaves that could redirect later mutations."""
+        if self._catalog_has_absolute_identity(installation):
+            self._require_crossover_closed(installation)
         app = self._app_path()
         bottle_root = installation.bottle.root.resolve()
         runtime = bottle_root / RUNTIME_NAME
@@ -1519,6 +1531,88 @@ class LauncherInstaller:
     def _command_bottle(installation: GameInstallation) -> str:
         bottle = installation.bottle
         return bottle.name if bottle.scope == "managed" else str(bottle.root.resolve())
+
+    @staticmethod
+    def _cxmenu_bottle_args(installation: GameInstallation) -> List[str]:
+        bottle = installation.bottle
+        return ["--bottle", bottle.name, "--scope", bottle.scope]
+
+    @staticmethod
+    def _cxmenu_environment(
+        installation: GameInstallation,
+    ) -> Optional[Mapping[str, str]]:
+        bottle = installation.bottle
+        if bottle.scope != "private":
+            return None
+        return {"CX_BOTTLE_PATH": str(bottle.root.resolve().parent)}
+
+    @classmethod
+    def _catalog_has_absolute_identity(cls, installation: GameInstallation) -> bool:
+        catalog = (
+            installation.bottle.root.resolve()
+            / "desktopdata/cxmenu/cxmenu_macosx.plist"
+        )
+        try:
+            with catalog.open("rb") as stream:
+                contents = plistlib.load(stream)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return False
+        bottle = contents.get("CrossOver-{}/".format(cls._bottle_id(installation)))
+        return isinstance(bottle, dict) and bottle.get("Description") == str(
+            installation.bottle.root.resolve()
+        )
+
+    def _require_crossover_closed(self, installation: GameInstallation) -> None:
+        executable = (
+            installation.bottle.crossover.app.resolve()
+            / "Contents/MacOS/CrossOver"
+        )
+        result = self.runner.run(["/bin/ps", "-axo", "command="], timeout=5.0)
+        if result.returncode != 0:
+            raise PatchError(
+                "install.crossover_process",
+                "CrossOver could not be checked.",
+                command_failure_detail(result, "ps failed"),
+            )
+        executable_text = str(executable)
+        if any(
+            command == executable_text or command.startswith(executable_text + " ")
+            for command in (line.strip() for line in result.stdout.splitlines())
+        ):
+            raise PatchError(
+                "install.crossover_running",
+                "Quit CrossOver completely, then run the patcher again.",
+                "CrossOver is running while its launcher cache needs repair",
+            )
+
+    def _reset_cached_catalog(self, installation: GameInstallation) -> None:
+        self._require_crossover_closed(installation)
+        bottle_tag = "CrossOver-{}/".format(self._bottle_id(installation))
+        command = [
+            "/usr/bin/defaults",
+            "write",
+            "com.codeweavers.CrossOver",
+            "MostRecentCXFBMenuPlist",
+            "-dict-add",
+            bottle_tag,
+            "{}",
+        ]
+        result = self.runner.run(command, timeout=10.0)
+        if result.returncode != 0:
+            raise PatchError(
+                "install.launcher_cache",
+                "CrossOver's launcher cache could not be repaired.",
+                command_failure_detail(result, "defaults failed"),
+            )
+
+    def _run_cxmenu(
+        self, installation: GameInstallation, command: Sequence[str]
+    ):
+        return self.runner.run(
+            command,
+            timeout=60.0,
+            environment=self._cxmenu_environment(installation),
+        )
 
     @staticmethod
     def _bottle_id(installation: GameInstallation) -> str:
@@ -1863,7 +1957,98 @@ class LauncherInstaller:
         return properties
 
     @staticmethod
-    def _swap_snapshots(app: Path, pending: Path, previous: Optional[Path]) -> List[Dict[str, object]]:
+    def _is_crossover_generated_plist(
+        actual: Mapping[str, object], canonical: Mapping[str, object]
+    ) -> bool:
+        helper_version = actual.get("CXHelperAppVersion")
+        if type(helper_version) is not int or helper_version <= 0:
+            return False
+        expected = dict(canonical)
+        expected.pop("CFBundleDisplayName", None)
+        expected.update(
+            {
+                "CFBundleDocumentTypes": [
+                    {
+                        "CFBundleTypeRole": "Viewer",
+                        "LSItemContentTypes": [
+                            "com.codeweavers.CrossOverHelper.MenuDummyType"
+                        ],
+                    }
+                ],
+                "CFBundleIconFile": "CrossOverHelper",
+                "CrossOverHelperMenuPath": LAUNCHER_MENU,
+                "CXHelperAppVersion": helper_version,
+                "CXOriginalMenuName": LAUNCHER_NAME,
+                "UTImportedTypeDeclarations": [
+                    {
+                        "UTTypeIdentifier": (
+                            "com.codeweavers.CrossOverHelper.MenuDummyType"
+                        )
+                    }
+                ],
+            }
+        )
+        return dict(actual) == expected
+
+    @staticmethod
+    def _crossover_default_icon_digest(installation: GameInstallation) -> str:
+        return _file_digest(
+            installation.bottle.crossover.app.resolve()
+            / "Contents/Resources/exeIcon.icns"
+        )
+
+    def _current_owned_app_inventory(
+        self,
+        installation: GameInstallation,
+        state: Mapping[str, object],
+        *,
+        app: Optional[Path] = None,
+    ) -> object:
+        recorded = state.get("app_inventory")
+        app = self._app_path() if app is None else Path(app)
+        try:
+            actual_inventory = _inventory(app)
+            if actual_inventory == recorded:
+                return actual_inventory
+            plist_path = app / "Contents/Info.plist"
+            actual_plist = plistlib.loads(plist_path.read_bytes())
+            identity = {
+                "CFBundleName": LAUNCHER_NAME,
+                "CFBundleDisplayName": LAUNCHER_NAME,
+                "CFBundleIdentifier": self._bundle_id(installation.bottle.name),
+                "CrossOverHelperCommand": str(state["command"]),
+                "CXHelperAppBottleName": installation.bottle.name,
+                "CXHelperAppBottleTag": str(state["bottle_tag"]),
+                "CFBundleExecutable": "Menu Helper",
+                "CFBundleIconFile": "CrossOverHelper.icns",
+            }
+            canonical = self._canonical_plist(installation, identity)
+            if not self._is_crossover_generated_plist(actual_plist, canonical):
+                return recorded
+            with tempfile.TemporaryDirectory(
+                prefix="ostriv-launcher-refresh-"
+            ) as temporary:
+                destination = Path(temporary) / "template"
+                destination.mkdir()
+                self.extractor(self._template(installation), destination)
+                (destination / "Contents/Info.plist").write_bytes(
+                    plist_path.read_bytes()
+                )
+                (destination / "Contents/Resources/CrossOverHelper.icns").write_bytes(
+                    (app / "Contents/Resources/CrossOverHelper.icns").read_bytes()
+                )
+                destination.chmod(stat.S_IMODE(app.lstat().st_mode))
+                expected_inventory = _inventory(destination)
+            if actual_inventory == expected_inventory:
+                return actual_inventory
+        except (KeyError, OSError, TypeError, ValueError, plistlib.InvalidFileException):
+            pass
+        return recorded
+
+    @staticmethod
+    def _swap_snapshots(
+        app: Path, pending: Path, previous: Optional[Path]
+    ) -> List[Dict[str, object]]:
         pending_by_relative = {
             path.relative_to(pending): _file_digest(path) for path in _tree_files(pending)
         }
@@ -1956,7 +2141,9 @@ class LauncherInstaller:
             prior = self._prior_launcher_state(installation)
             if prior is not None:
                 self.verify(installation, prior)
-                app_before_inventory = _inventory(app)
+                app_before_inventory = self._current_owned_app_inventory(
+                    installation, prior
+                )
                 previous_text = prior.get("previous_app")
                 previous = Path(previous_text) if isinstance(previous_text, str) else None
                 previous_inventory = list(prior.get("previous_app_inventory", []))
@@ -2128,13 +2315,17 @@ class LauncherInstaller:
                 self._remove_verified_tree(
                     transaction,
                     app_backup,
-                    prior.get("app_inventory"),
+                    app_before_inventory,
                 )
 
-            menu_command = self._menu_create_command(installation, command)
+            if self._catalog_has_absolute_identity(installation):
+                self._reset_cached_catalog(installation)
+            menu_command = self._menu_create_command(
+                installation, command, icon_source
+            )
 
             def register_menu() -> None:
-                result = self.runner.run(menu_command, timeout=60.0)
+                result = self._run_cxmenu(installation, menu_command)
                 if result.returncode != 0:
                     raise PatchError(
                         "install.launcher_menu",
@@ -2343,7 +2534,10 @@ class LauncherInstaller:
             canonical_plist = self._canonical_plist(
                 installation, expected_identity
             )
-            if actual_plist != canonical_plist:
+            crossover_generated = self._is_crossover_generated_plist(
+                actual_plist, canonical_plist
+            )
+            if actual_plist != canonical_plist and not crossover_generated:
                 differing = sorted(
                     key
                     for key in set(actual_plist) | set(canonical_plist)
@@ -2356,6 +2550,24 @@ class LauncherInstaller:
                         ", ".join(differing)
                     ),
                 )
+            actual_icon_sha256 = _file_digest(
+                app / "Contents/Resources/CrossOverHelper.icns"
+            )
+            allowed_icon_digests = {str(state["icon_sha256"])}
+            if crossover_generated:
+                allowed_icon_digests.add(
+                    self._crossover_default_icon_digest(installation)
+                )
+            if actual_icon_sha256 not in allowed_icon_digests:
+                raise PatchError(
+                    "install.launcher_verify",
+                    "Installation failed.",
+                    "Launcher icon digest does not match",
+                )
+            materialized_identity = dict(expected_identity)
+            if crossover_generated:
+                materialized_identity.pop("CFBundleDisplayName", None)
+                materialized_identity["CFBundleIconFile"] = "CrossOverHelper"
             self._verify_materialized(
                 installation,
                 app,
@@ -2363,8 +2575,8 @@ class LauncherInstaller:
                 config,
                 str(state["runtime_sha256"]),
                 str(state["config_sha256"]),
-                expected_identity,
-                str(state["icon_sha256"]),
+                materialized_identity,
+                actual_icon_sha256,
             )
             loaded_config = LauncherConfig.load(config)
             if (
@@ -2406,7 +2618,11 @@ class LauncherInstaller:
                     "Installation failed.",
                     "Menu Helper executable digest does not match",
                 )
-            if _file_digest(app / "Contents/Info.plist") != state.get("plist_sha256"):
+            if (
+                not crossover_generated
+                and _file_digest(app / "Contents/Info.plist")
+                != state.get("plist_sha256")
+            ):
                 raise PatchError(
                     "install.launcher_verify",
                     "Installation failed.",
@@ -2693,12 +2909,10 @@ class LauncherInstaller:
         if should_purge:
             command = [
                 str(self._cxmenu(installation)),
-                "--bottle",
-                self._command_bottle(installation),
             ]
-            command.extend(installation.bottle.scope_args())
+            command.extend(self._cxmenu_bottle_args(installation))
             command.extend(["--purge", "--filter", menu_name])
-            result = self.runner.run(command, timeout=60.0)
+            result = self._run_cxmenu(installation, command)
             if result.returncode != 0:
                 raise PatchError(
                     "restore.launcher_menu",
@@ -2726,7 +2940,9 @@ class LauncherInstaller:
         config = Path(str(state.get("config", installation.bottle.root.resolve() / CONFIG_NAME)))
         self._restore_saved(runtime, str(state.get("runtime_sha256", "")), state.get("previous_runtime"))
         self._restore_saved(config, str(state.get("config_sha256", "")), state.get("previous_config"))
-        self._remove_owned_app(app, state.get("app_inventory"))
+        self._remove_owned_app(
+            app, self._current_owned_app_inventory(installation, state)
+        )
         previous_text = state.get("previous_app")
         if isinstance(previous_text, str):
             self._restore_previous_app(

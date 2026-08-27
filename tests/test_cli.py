@@ -387,6 +387,19 @@ class CliTests(unittest.TestCase):
                 "Installation: FAILED",
             ),
             (
+                "CrossOver launcher repair",
+                FakeServices(
+                    operation_error=PatchError(
+                        "install.crossover_running",
+                        "Quit CrossOver completely, then run the patcher again.",
+                        "CrossOver process is still running",
+                    )
+                ),
+                "",
+                "Quit CrossOver completely, then run the patcher again.",
+                "Installation: FAILED",
+            ),
+            (
                 "CrossOver timeout",
                 FakeServices(
                     operation_error=PatchError(

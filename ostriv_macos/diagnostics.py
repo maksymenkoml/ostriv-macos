@@ -1,15 +1,17 @@
 import json
 import logging
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Optional, Sequence
+from typing import IO, Mapping, Optional, Sequence
 
 
 ALLOWED_EXTERNAL_EXECUTABLES = frozenset(
-    {"cxbottle", "cxmenu", "lsregister", "mdfind", "wine"}
+    {"cxbottle", "cxmenu", "defaults", "lsregister", "mdfind", "ps", "wine"}
 )
+ALLOWED_EXTERNAL_ENVIRONMENT = frozenset({"CX_BOTTLE_PATH"})
 _SENSITIVE_OPTIONS = frozenset(
     {"--api-key", "--password", "--secret", "--token", "/d"}
 )
@@ -52,6 +54,21 @@ def _validate_external_argv(argv: Sequence[str], allowed=ALLOWED_EXTERNAL_EXECUT
     if executable not in allowed:
         raise ValueError("external executable is not allowed: {}".format(executable))
     return command
+
+
+def _external_environment(overrides: Optional[Mapping[str, str]]):
+    if overrides is None:
+        return None
+    environment = os.environ.copy()
+    for key, value in overrides.items():
+        if key not in ALLOWED_EXTERNAL_ENVIRONMENT:
+            raise ValueError(
+                "external environment variable is not allowed: {}".format(key)
+            )
+        if not isinstance(value, str) or "\0" in value:
+            raise ValueError("external environment value is invalid: {}".format(key))
+        environment[key] = value
+    return environment
 
 
 def _safe_argv(argv: Sequence[str]) -> str:
@@ -123,18 +140,22 @@ class CommandRunner:
         self,
         argv: Sequence[str],
         timeout: Optional[float] = None,
+        environment: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         command = _validate_external_argv(argv)
+        command_environment = _external_environment(environment)
         self.logger.info(
             "command start argv=%s timeout=%s", _safe_argv(command), timeout
         )
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-            )
+            options = {
+                "capture_output": True,
+                "check": False,
+                "timeout": timeout,
+            }
+            if command_environment is not None:
+                options["env"] = command_environment
+            result = subprocess.run(command, **options)
         except subprocess.TimeoutExpired as error:
             diagnostic = "timeout={} {}".format(
                 timeout,
