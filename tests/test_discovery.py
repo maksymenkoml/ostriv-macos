@@ -249,9 +249,12 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_find_crossover_apps_keeps_fallback_when_spotlight_result_is_unusable(self):
         """A stale Spotlight hit must not hide a usable Launch Services bundle."""
-        stale = self.home / "Stale/CrossOver.app"
+        fixture_root = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(fixture_root.cleanup)
+        root = Path(fixture_root.name)
+        stale = root / "Stale/CrossOver.app"
         stale.mkdir(parents=True)
-        usable = make_crossover(self.home / "Registered")
+        usable = make_crossover(root / "Registered")
 
         class ListingRunner:
             def run(self, argv, timeout=None):
