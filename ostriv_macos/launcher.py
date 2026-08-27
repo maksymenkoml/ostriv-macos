@@ -413,12 +413,13 @@ def _validated_cpio_entry(
     if (
         not name
         or path.is_absolute()
-        or path == PurePosixPath(".")
         or ".." in path.parts
         or path in seen
     ):
         raise OSError("Unsafe Menu Helper archive path: {!r}".format(name))
     kind = stat.S_IFMT(mode)
+    if path == PurePosixPath(".") and kind != stat.S_IFDIR:
+        raise OSError("Menu Helper archive root is not a directory")
     if kind == stat.S_IFREG:
         if links != 1:
             raise OSError("Menu Helper archive hard links are not allowed")
@@ -499,12 +500,10 @@ def _odc_entries(data: bytes) -> List[tuple[PurePosixPath, int, bytes]]:
         except UnicodeError as error:
             raise OSError("Menu Helper archive name is not UTF-8") from error
         offset += name_size
-        offset += offset % 2
         if offset + size > len(data):
             raise OSError("Menu Helper archive entry is truncated")
         content = data[offset : offset + size]
         offset += size
-        offset += offset % 2
         entry = _validated_cpio_entry(name, mode, links, content, seen)
         if entry is None:
             return entries

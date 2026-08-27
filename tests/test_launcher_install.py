@@ -82,9 +82,7 @@ def odc_archive(entries):
         )
         archive.extend(header.encode("ascii"))
         archive.extend(encoded_name)
-        archive.extend(b"\0" * (len(archive) % 2))
         archive.extend(data)
-        archive.extend(b"\0" * (len(archive) % 2))
         inode += 1
     return bz2.compress(bytes(archive))
 
@@ -745,6 +743,34 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertEqual(
             b"portable-helper", (destination / "Contents/Menu Helper").read_bytes()
         )
+
+    def test_menu_helper_extractor_accepts_archive_root_directory(self):
+        """CrossOver 26.3 prefixes its valid portable archive with a dot root."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        destination = fixture.root / "pending-odc-root"
+        destination.mkdir()
+        fixture.template.write_bytes(
+            odc_archive(
+                [
+                    (".", 0o040755, b"", 2),
+                    ("./Contents", 0o040755, b"", 2),
+                    ("./Contents/MacOS", 0o040755, b"", 2),
+                    (
+                        "./Contents/MacOS/Menu Helper",
+                        0o100755,
+                        b"crossover-26.3-helper",
+                        1,
+                    ),
+                ]
+            )
+        )
+
+        _extract_menu_helper(fixture.template, destination)
+
+        executable = destination / "Contents/MacOS/Menu Helper"
+        self.assertEqual(b"crossover-26.3-helper", executable.read_bytes())
+        self.assertEqual(0o755, executable.stat().st_mode & 0o777)
 
     def test_app_renames_are_each_followed_by_destination_directory_fsync(self):
         """A durable journal cannot recover a rename the filesystem never persisted."""

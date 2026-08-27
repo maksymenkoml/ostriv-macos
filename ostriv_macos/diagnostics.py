@@ -36,6 +36,14 @@ def decode_output(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _decode_timeout_output(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return decode_output(data)
+    return str(data)
+
+
 def _validate_external_argv(argv: Sequence[str], allowed=ALLOWED_EXTERNAL_EXECUTABLES):
     command = list(argv)
     if not command or not isinstance(command[0], str):
@@ -120,12 +128,29 @@ class CommandRunner:
         self.logger.info(
             "command start argv=%s timeout=%s", _safe_argv(command), timeout
         )
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            diagnostic = "timeout={} {}".format(
+                timeout,
+                _command_diagnostic(
+                    command,
+                    "timeout",
+                    _decode_timeout_output(error.stdout),
+                    _decode_timeout_output(error.stderr),
+                ),
+            )
+            self.logger.error("command timeout %s", diagnostic)
+            raise PatchError(
+                "command.timeout",
+                "CrossOver took too long to respond.",
+                diagnostic,
+            ) from error
         stdout = decode_output(result.stdout)
         stderr = decode_output(result.stderr)
         diagnostic = _command_diagnostic(
@@ -166,9 +191,27 @@ class PlayerOutput:
         self.color = stream.isatty() if color is None else color
         self._title_printed = False
         self._stages = set()
+        self._progress_active = False
+
+    def _clear_progress(self) -> None:
+        if not self._progress_active:
+            return
+        self.stream.write("\r\x1b[K")
+        self.stream.flush()
+        self._progress_active = False
 
     def _line(self, text: str = "") -> None:
+        self._clear_progress()
         print(text, file=self.stream)
+
+    def progress(self, label: str, detail: str = "") -> None:
+        """Replace one temporary TTY line while a slow operation is running."""
+        if not self.color:
+            return
+        suffix = " " + detail if detail else ""
+        self.stream.write("\r\x1b[K{}…{}".format(label, suffix))
+        self.stream.flush()
+        self._progress_active = True
 
     def title(self) -> None:
         if not self._title_printed:

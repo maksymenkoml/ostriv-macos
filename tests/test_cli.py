@@ -151,6 +151,28 @@ class CliTests(unittest.TestCase):
             stream.getvalue(),
         )
 
+    def test_tty_names_slow_work_before_each_blocking_boundary(self):
+        """A player must never wait at a silent prompt after Package: OK."""
+
+        class TtyStream(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = TtyStream()
+        code = main(
+            [],
+            services=FakeServices.success(),
+            stdin=io.StringIO("\n"),
+            stdout=stream,
+        )
+
+        self.assertEqual(0, code)
+        text = stream.getvalue()
+        self.assertIn("Checking package…", text)
+        self.assertIn("Finding CrossOver and Ostriv…", text)
+        self.assertIn("Installing… preparing", text)
+        self.assertEqual(1, text.count("Installation: OK"))
+
     def test_expected_failure_has_one_action_and_no_traceback(self):
         stream = io.StringIO()
         code = main(
@@ -349,6 +371,32 @@ class CliTests(unittest.TestCase):
                 ),
                 "",
                 "Installation failed. Try Reinstall once.",
+                "Installation: FAILED",
+            ),
+            (
+                "launcher materialization",
+                FakeServices(
+                    operation_error=PatchError(
+                        "install.launcher_materialize",
+                        "Installation failed.",
+                        "Menu Helper extraction failed",
+                    )
+                ),
+                "",
+                "The launcher could not be created. Download the latest player ZIP and try again.",
+                "Installation: FAILED",
+            ),
+            (
+                "CrossOver timeout",
+                FakeServices(
+                    operation_error=PatchError(
+                        "command.timeout",
+                        "CrossOver took too long to respond.",
+                        "timeout=90 partial output",
+                    )
+                ),
+                "",
+                "CrossOver took too long to respond. Quit CrossOver completely, then try again.",
                 "Installation: FAILED",
             ),
             (

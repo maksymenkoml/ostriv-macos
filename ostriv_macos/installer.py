@@ -1001,7 +1001,9 @@ class WineRegistry:
             )
         )
         for _attempt in range(2):
-            result = self.runner.run(self._base() + ["query", key, "/v", value])
+            result = self.runner.run(
+                self._base() + ["query", key, "/v", value], timeout=90.0
+            )
             if result.returncode != 0:
                 if self._missing(result):
                     return None
@@ -1023,7 +1025,8 @@ class WineRegistry:
         last_detail = ""
         for _attempt in range(2):
             result = self.runner.run(
-                self._base() + ["add", key, "/v", value, "/d", data, "/f"]
+                self._base() + ["add", key, "/v", value, "/d", data, "/f"],
+                timeout=90.0,
             )
             last_detail = command_failure_detail(result)
             if result.returncode == 0:
@@ -1032,6 +1035,8 @@ class WineRegistry:
                         return
                     last_detail = "Registry query did not return the required value"
                 except PatchError as error:
+                    if error.code == "command.timeout":
+                        raise
                     last_detail = error.detail
         raise PatchError("install.registry", "Installation failed.", last_detail)
 
@@ -1039,7 +1044,8 @@ class WineRegistry:
         last_detail = ""
         for _attempt in range(2):
             result = self.runner.run(
-                self._base() + ["delete", key, "/v", value, "/f"]
+                self._base() + ["delete", key, "/v", value, "/f"],
+                timeout=90.0,
             )
             last_detail = command_failure_detail(result)
             if result.returncode == 0:
@@ -1048,6 +1054,8 @@ class WineRegistry:
                         return
                     last_detail = "Registry value remains after deletion"
                 except PatchError as error:
+                    if error.code == "command.timeout":
+                        raise
                     last_detail = error.detail
         raise PatchError("restore.registry", "Restore failed.", last_detail)
 
@@ -1060,6 +1068,7 @@ class Installer:
         runner: Optional[CommandRunner] = None,
         launcher_destination: Optional[Path] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        progress: Optional[Callable[[str, str], None]] = None,
     ):
         self.package_root = package_root.resolve()
         self.launcher = launcher
@@ -1070,12 +1079,14 @@ class Installer:
             else Path.home() / "Applications/CrossOver"
         )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.progress = progress or (lambda _label, _detail: None)
         self._existing_state: Optional[InstallState] = None
         self._owned_files: List[Dict[str, object]] = []
         self._backup_files: List[Dict[str, object]] = []
         self._config: Dict[str, object] = {}
         self._settings: Dict[str, object] = {}
         self._registry_before: Optional[str] = None
+        self._registry_verified = False
 
     def state_path(self, installation: GameInstallation) -> Path:
         return installation.bottle.root.resolve() / STATE_NAME
@@ -1504,7 +1515,7 @@ class Installer:
                 + installation.bottle.scope_args()
                 + ["--status"]
             )
-            result = self.runner.run(argv)
+            result = self.runner.run(argv, timeout=60.0)
             if result.returncode != 0:
                 issues.append(
                     command_failure_detail(
@@ -1902,6 +1913,7 @@ class Installer:
         else:
             self._registry_before = self._existing_state.prior_registry_value
         if current == REGISTRY_DATA:
+            self._registry_verified = True
             return
         transaction.step(
             "set game registry override",
@@ -1916,6 +1928,7 @@ class Installer:
             ),
             lambda: registry.set(REGISTRY_KEY, REGISTRY_VALUE, REGISTRY_DATA),
         )
+        self._registry_verified = True
 
     @staticmethod
     def _mutate_environment(data: bytes) -> bytes:
@@ -2195,7 +2208,10 @@ class Installer:
         app_id = installation.game_dir.resolve() / "steam_appid.txt"
         if not _same_file(app_id, _bytes_digest(b"773790")):
             failures.append("game app id verification failed")
-        if self._registry(installation).query(REGISTRY_KEY, REGISTRY_VALUE) != REGISTRY_DATA:
+        if not self._registry_verified and (
+            self._registry(installation).query(REGISTRY_KEY, REGISTRY_VALUE)
+            != REGISTRY_DATA
+        ):
             failures.append("registry override verification failed")
         config = installation.bottle.root.resolve() / "cxbottle.conf"
         try:
@@ -2327,8 +2343,10 @@ class Installer:
             installation.game_dir.resolve(),
             len(payload),
         )
+        self._registry_verified = False
         validate_payload(self.package_root, payload)
         logger.info("install stage=payload_validation status=OK")
+        self.progress("Installing", "checking CrossOver (may take a minute)")
         self.preflight(installation, payload)
         logger.info("install stage=preflight status=OK")
         transaction = self.transaction_for(installation)
@@ -2337,12 +2355,17 @@ class Installer:
         transaction.start("install")
         self._start_ownership()
         try:
+            self.progress("Installing", "copying graphics driver")
             self.stage_driver_files(transaction, installation, payload)
             self.write_app_id(transaction, installation, "773790")
+            self.progress("Installing", "configuring CrossOver (may take a minute)")
             self.set_native_override(transaction, installation)
             self.set_bottle_environment(transaction, installation)
+            self.progress("Installing", "applying game settings")
             self.set_safe_graphics(transaction, installation)
+            self.progress("Installing", "creating launcher")
             launcher_state = self.launcher.install(transaction, installation)
+            self.progress("Installing", "verifying (may take a minute)")
             state = self.verify(installation, payload, launcher_state)
             self.write_install_state(transaction, installation, state)
             transaction.journal.commit()
@@ -2351,6 +2374,7 @@ class Installer:
             return state
         except BaseException:
             logger.exception("install failed bottle=%s", installation.bottle.name)
+            self.progress("Installing", "undoing incomplete changes")
             transaction.rollback()
             self._cleanup_completed_journal(transaction)
             raise
@@ -4365,6 +4389,7 @@ class Installer:
             installation.bottle.name,
             installation.game_dir.resolve(),
         )
+        self.progress("Restoring", "checking previous changes")
         self._validate_settings_ancestry(
             installation, "restore.settings_path", "Restore failed."
         )
@@ -4470,20 +4495,24 @@ class Installer:
             raise
         try:
             if state is None:
+                self.progress("Restoring", "removing patch (may take a minute)")
                 self._restore_legacy(
                     transaction, installation, legacy_launcher_undo
                 )
+                self.progress("Restoring", "verifying")
                 transaction.journal.commit()
                 self._cleanup_completed_journal(transaction)
                 logger.info("restore verification status=OK mode=legacy")
                 logger.info("restore complete bottle=%s", installation.bottle.name)
                 return
 
+            self.progress("Restoring", "restoring launcher")
             transaction.step(
                 "restore launcher",
                 UndoRecord("restore_launcher", launcher_undo or {}),
                 lambda: self.launcher.restore(installation, state.launcher_artifacts),
             )
+            self.progress("Restoring", "restoring files")
             handled = set()
             for item in reversed(state.backup_files):
                 path = str(item["path"])
@@ -4521,6 +4550,7 @@ class Installer:
                     },
                     "restore_settings",
                 )
+            self.progress("Restoring", "configuring CrossOver (may take a minute)")
             registry = self._registry(installation)
             current_registry = registry.query(
                 REGISTRY_KEY, REGISTRY_VALUE, "restore.registry"
@@ -4544,6 +4574,7 @@ class Installer:
             for item in reversed(state.owned_files):
                 if str(item["path"]) not in handled:
                     self._journal_remove_owned(transaction, installation, item)
+            self.progress("Restoring", "verifying")
             self._verify_restored(installation, state)
             logger.info("restore verification status=OK mode=owned")
             finalize_restore = getattr(self.launcher, "finalize_restore", None)
@@ -4630,6 +4661,7 @@ class Installer:
             logger.info("restore complete bottle=%s", installation.bottle.name)
         except BaseException:
             logger.exception("restore failed bottle=%s", installation.bottle.name)
+            self.progress("Restoring", "undoing incomplete changes")
             transaction.rollback()
             self._cleanup_completed_journal(transaction)
             raise
