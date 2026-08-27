@@ -195,7 +195,9 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(["26.3", "26.3"], [item.version for item in apps])
 
     def test_find_crossover_apps_discovers_spotlight_path_with_spaces_and_deduplicates(self):
-        app = make_crossover(self.home / "Moved Apps", "CrossOver.app")
+        fixture_root = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(fixture_root.cleanup)
+        app = make_crossover(Path(fixture_root.name) / "Moved Apps", "CrossOver.app")
 
         class ListingRunner:
             def run(self, argv, timeout=None):
