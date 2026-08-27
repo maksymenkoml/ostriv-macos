@@ -48,6 +48,16 @@ def _git_status(*arguments: str) -> int:
     return _run(["git", *arguments]).returncode
 
 
+def _version_at(revision: str, label: str) -> str:
+    try:
+        return parse_release_version(
+            _git("show", "{}:{}".format(revision, VERSION_FILE)),
+            filename="{}:{}".format(label, VERSION_FILE),
+        )
+    except ReleaseVersionError as error:
+        raise ReleasePlanError("{} has an invalid version file".format(label)) from error
+
+
 def plan_release(release_sha: str) -> dict:
     verified_sha = _git("rev-parse", "--verify", "{}^{{commit}}".format(release_sha))
     if _git("rev-parse", "HEAD") != verified_sha:
@@ -64,6 +74,7 @@ def plan_release(release_sha: str) -> dict:
         raise ReleasePlanError("git could not inspect the release tag")
     tag_exists = tag_status == 0
     tag_sha = ""
+    target_sha = verified_sha
     if tag_exists:
         tag_sha = _git("rev-list", "-n", "1", tag)
         if tag_sha != verified_sha:
@@ -74,13 +85,7 @@ def plan_release(release_sha: str) -> dict:
                 raise ReleasePlanError("the release tag is outside verified main history")
             if ancestor_status != 0:
                 raise ReleasePlanError("git could not verify the release tag")
-        try:
-            tagged_version = parse_release_version(
-                _git("show", "{}:{}".format(tag_sha, VERSION_FILE)),
-                filename="{}:{}".format(tag, VERSION_FILE),
-            )
-        except ReleaseVersionError as error:
-            raise ReleasePlanError("{} has an invalid version file".format(tag)) from error
+        tagged_version = _version_at(tag_sha, tag)
         if tagged_version != tag[1:]:
             raise ReleasePlanError(
                 "{} does not declare {}".format(tag, tag[1:])
@@ -91,6 +96,20 @@ def plan_release(release_sha: str) -> dict:
             raise ReleasePlanError(
                 "the version file changed after {}; choose a new version".format(tag)
             )
+        target_sha = tag_sha
+    else:
+        target_sha = _git(
+            "log",
+            "--first-parent",
+            "-n",
+            "1",
+            "--format=%H",
+            verified_sha,
+            "--",
+            str(VERSION_FILE),
+        )
+        if not target_sha or _version_at(target_sha, target_sha) != tag[1:]:
+            raise ReleasePlanError("cannot locate the commit that declared {}".format(tag))
 
     repository = repository_from_environment()
     endpoint = "repos/{}/releases/tags/{}".format(repository, quote(tag, safe=""))
@@ -106,7 +125,7 @@ def plan_release(release_sha: str) -> dict:
 
     return {
         "tag": tag,
-        "release_sha": tag_sha if tag_exists else verified_sha,
+        "release_sha": target_sha,
         "tag_exists": str(tag_exists).lower(),
         "publish": str(not release_exists).lower(),
     }
@@ -118,7 +137,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         outputs = plan_release(arguments.release_sha)
-    except ReleasePlanError as error:
+    except (GitHubAPIError, ReleasePlanError) as error:
         print("release-plan: {}".format(error), file=sys.stderr)
         return 2
     for name in ("tag", "release_sha", "tag_exists", "publish"):

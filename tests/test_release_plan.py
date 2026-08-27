@@ -82,10 +82,12 @@ class ReleasePlanTests(unittest.TestCase):
         self._git("commit", "-q", "-m", message)
         return self._git("rev-parse", "HEAD")
 
-    def _run(self, release_sha, released_tag="", api_error=False):
+    def _run(self, release_sha, released_tag="", api_error=False, repository=True):
         environment = self.environment.copy()
         environment["FAKE_RELEASE_TAG"] = released_tag
         environment["FAKE_GH_ERROR"] = str(api_error).lower()
+        if not repository:
+            environment.pop("GITHUB_REPOSITORY", None)
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--release-sha", release_sha],
             cwd=self.repository,
@@ -114,6 +116,17 @@ class ReleasePlanTests(unittest.TestCase):
             },
             outputs,
         )
+
+    def test_unpublished_version_targets_the_commit_that_changed_it(self):
+        self._write_version("0.1.4")
+        version_sha = self._commit("Release 0.1.4")
+        verified_sha = self._commit("Later documentation", filename="README.md")
+
+        outputs = self._outputs(self._run(verified_sha))
+
+        self.assertEqual("v0.1.4", outputs["tag"])
+        self.assertEqual(version_sha, outputs["release_sha"])
+        self.assertEqual("true", outputs["publish"])
 
     def test_completed_release_for_the_same_commit_is_skipped_on_retry(self):
         self._write_version("0.1.4")
@@ -185,6 +198,16 @@ class ReleasePlanTests(unittest.TestCase):
         self.assertEqual(2, result.returncode)
         self.assertEqual("", result.stdout)
         self.assertIn("GitHub API request failed", result.stderr)
+
+    def test_missing_repository_context_is_one_clean_planning_error(self):
+        release_sha = self._git("rev-parse", "HEAD")
+
+        result = self._run(release_sha, repository=False)
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual(1, len(result.stderr.splitlines()))
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":
