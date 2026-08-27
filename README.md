@@ -59,6 +59,12 @@ Build and verify the no-Git player archive locally with:
 python3 scripts/build-release.py --output dist/ostriv-macos-player.zip
 ```
 
+To publish a player release, change `__version__` in `ostriv_macos/__init__.py` to the
+next `X.Y.Z` version in a pull request. After that change reaches `main` and the complete
+Test workflow passes, GitHub Actions creates the matching tag, builds the player ZIP, and
+publishes the GitHub Release. Re-run **Publish player ZIP** manually only to recover a
+failed publication; an existing release is skipped safely.
+
 To rebuild the driver itself, follow [docs/technical.md](docs/technical.md) and run
 `scripts/build-driver.sh` from the repository checkout.
 

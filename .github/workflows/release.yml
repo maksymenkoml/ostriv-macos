@@ -1,45 +1,81 @@
 name: Publish player ZIP
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: player-release
+  cancel-in-progress: false
 
 jobs:
-  verify:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          lfs: true
-          fetch-depth: 0
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.9"
-      - run: python -m unittest discover -s tests -v
-
-  release:
-    needs: verify
+  prepare:
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      tag: ${{ steps.plan.outputs.tag }}
+      tag_exists: ${{ steps.plan.outputs.tag_exists }}
+      release_sha: ${{ steps.plan.outputs.release_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
-          lfs: true
           fetch-depth: 0
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.9"
-      - run: python scripts/build-release.py --output dist/ostriv-macos-player.zip
-      - name: Publish verified player ZIP
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Plan release
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "dist/ostriv-macos-player.zip#Ostriv for macOS (Apple Silicon)" \
-            --verify-tag \
-            --generate-notes
+          python3 scripts/release_plan.py \
+            --release-sha "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          lfs: true
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+      - name: Build verified player ZIP
+        run: |
+          python scripts/build-release.py --output dist/ostriv-macos-player.zip
+          python patch.py --preflight
+      - name: Publish verified player ZIP
+        run: |
+          asset="dist/ostriv-macos-player.zip#Ostriv for macOS (Apple Silicon)"
+          if [[ "$TAG_EXISTS" == "true" ]]; then
+            gh release create "$RELEASE_TAG" "$asset" \
+              --verify-tag \
+              --generate-notes
+          else
+            gh release create "$RELEASE_TAG" "$asset" \
+              --target "$RELEASE_SHA" \
+              --generate-notes
+          fi
