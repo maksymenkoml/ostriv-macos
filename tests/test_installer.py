@@ -3144,7 +3144,7 @@ class InstallerTests(unittest.TestCase):
             state = fixture.installer().install(fixture.installation, fixture.payload)
             stored = json.loads((fixture.bottle_root / "ostriv-macos-state.json").read_text())
             self.assertEqual(1, stored["schema"])
-            self.assertEqual("0.1.2", stored["project_version"])
+            self.assertEqual("0.1.3", stored["project_version"])
             self.assertEqual(str(fixture.bottle_root.resolve()), stored["bottle_realpath"])
             self.assertEqual(str(fixture.game_dir.resolve()), stored["game_realpath"])
             self.assertTrue(stored["owned_files"])
