@@ -415,6 +415,8 @@ def _durable_rmdir(path: Path) -> None:
 
 
 _RENAME_EXCL = 0x00000004
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _RENAME_EXCLUSIVE = getattr(_LIBC, "renamex_np", None)
 if _RENAME_EXCLUSIVE is not None:
@@ -430,15 +432,34 @@ if _RENAMEAT_EXCLUSIVE is not None:
         ctypes.c_uint,
     ]
     _RENAMEAT_EXCLUSIVE.restype = ctypes.c_int
+_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+if _RENAMEAT2 is not None:
+    _RENAMEAT2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    _RENAMEAT2.restype = ctypes.c_int
 
 
 def _rename_exclusive(source: Path, destination: Path) -> None:
     """Atomically move *source* without replacing an existing destination."""
-    if _RENAME_EXCLUSIVE is None:
+    if _RENAME_EXCLUSIVE is not None:
+        result = _RENAME_EXCLUSIVE(
+            os.fsencode(source), os.fsencode(destination), _RENAME_EXCL
+        )
+    elif _RENAMEAT2 is not None:
+        result = _RENAMEAT2(
+            _AT_FDCWD,
+            os.fsencode(source),
+            _AT_FDCWD,
+            os.fsencode(destination),
+            _RENAME_NOREPLACE,
+        )
+    else:
         raise OSError(errno.ENOTSUP, "exclusive rename is unavailable")
-    result = _RENAME_EXCLUSIVE(
-        os.fsencode(source), os.fsencode(destination), _RENAME_EXCL
-    )
     if result != 0:
         error_number = ctypes.get_errno()
         raise OSError(
@@ -455,18 +476,27 @@ def _renameat_exclusive(
     destination_name: str,
 ) -> None:
     """Atomically capture a directory entry without replacing another one."""
-    if _RENAMEAT_EXCLUSIVE is None:
+    if _RENAMEAT_EXCLUSIVE is not None:
+        result = _RENAMEAT_EXCLUSIVE(
+            source_directory,
+            os.fsencode(source_name),
+            destination_directory,
+            os.fsencode(destination_name),
+            _RENAME_EXCL,
+        )
+    elif _RENAMEAT2 is not None:
+        result = _RENAMEAT2(
+            source_directory,
+            os.fsencode(source_name),
+            destination_directory,
+            os.fsencode(destination_name),
+            _RENAME_NOREPLACE,
+        )
+    else:
         raise OSError(
             errno.ENOTSUP,
             "descriptor-relative exclusive rename is unavailable",
         )
-    result = _RENAMEAT_EXCLUSIVE(
-        source_directory,
-        os.fsencode(source_name),
-        destination_directory,
-        os.fsencode(destination_name),
-        _RENAME_EXCL,
-    )
     if result != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number), destination_name)

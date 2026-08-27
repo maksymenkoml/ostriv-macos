@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import errno
 import hashlib
 import io
@@ -530,6 +531,137 @@ class FakeBottleFixture:
                 paths[relative] = ("file", path.read_bytes(), mode)
         registry = tuple(sorted((key, value, data) for (key, value), data in self.registry.items()))
         return paths, registry
+
+
+class RenameAt2Fixture:
+    """Exercise the libc boundary while keeping Linux calls portable to macOS."""
+
+    AT_FDCWD = -100
+    RENAME_NOREPLACE = 1
+
+    def __call__(
+        self,
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+        flags,
+    ):
+        if flags != self.RENAME_NOREPLACE:
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+        source_name = os.fsdecode(source_name)
+        destination_name = os.fsdecode(destination_name)
+        source_options = (
+            {}
+            if source_directory == self.AT_FDCWD
+            else {"src_dir_fd": source_directory}
+        )
+        destination_options = (
+            {}
+            if destination_directory == self.AT_FDCWD
+            else {"dst_dir_fd": destination_directory}
+        )
+        try:
+            os.stat(
+                destination_name,
+                dir_fd=None
+                if destination_directory == self.AT_FDCWD
+                else destination_directory,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            ctypes.set_errno(error.errno)
+            return -1
+        else:
+            ctypes.set_errno(errno.EEXIST)
+            return -1
+        try:
+            os.rename(
+                source_name,
+                destination_name,
+                **source_options,
+                **destination_options,
+            )
+        except OSError as error:
+            ctypes.set_errno(error.errno)
+            return -1
+        return 0
+
+
+class ExclusiveRenameTests(unittest.TestCase):
+    def test_renameat2_fallback_moves_to_an_unoccupied_path(self):
+        # Catches losing the Linux equivalent of macOS RENAME_EXCL.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"owned")
+
+            with patch.object(
+                installer_module, "_RENAME_EXCLUSIVE", None
+            ), patch.object(
+                installer_module,
+                "_RENAMEAT2",
+                RenameAt2Fixture(),
+                create=True,
+            ):
+                installer_module._rename_exclusive(source, destination)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(b"owned", destination.read_bytes())
+
+    def test_renameat2_fallback_never_replaces_an_occupied_path(self):
+        # Catches using ordinary rename, which would destroy unrelated content.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"owned")
+            destination.write_bytes(b"unrelated")
+
+            with patch.object(
+                installer_module, "_RENAME_EXCLUSIVE", None
+            ), patch.object(
+                installer_module,
+                "_RENAMEAT2",
+                RenameAt2Fixture(),
+                create=True,
+            ):
+                with self.assertRaises(OSError) as caught:
+                    installer_module._rename_exclusive(source, destination)
+
+            self.assertEqual(errno.EEXIST, caught.exception.errno)
+            self.assertEqual(b"owned", source.read_bytes())
+            self.assertEqual(b"unrelated", destination.read_bytes())
+
+    def test_descriptor_relative_rename_uses_the_renameat2_fallback(self):
+        # Catches Linux recovery failing after it opens the trusted directory.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").write_bytes(b"owned")
+            descriptor = os.open(str(root), os.O_RDONLY)
+            self.addCleanup(os.close, descriptor)
+
+            with patch.object(
+                installer_module, "_RENAMEAT_EXCLUSIVE", None
+            ), patch.object(
+                installer_module,
+                "_RENAMEAT2",
+                RenameAt2Fixture(),
+                create=True,
+            ):
+                installer_module._renameat_exclusive(
+                    descriptor,
+                    "source",
+                    descriptor,
+                    "destination",
+                )
+
+            self.assertFalse((root / "source").exists())
+            self.assertEqual(b"owned", (root / "destination").read_bytes())
 
 
 class InstallerTests(unittest.TestCase):

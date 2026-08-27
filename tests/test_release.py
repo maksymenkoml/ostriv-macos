@@ -356,6 +356,47 @@ class SafeExtractTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def _assert_ci_semantics(self, ruby):
+        result = subprocess.run(
+            [
+                "ruby",
+                "-ryaml",
+                "-e",
+                ruby,
+                str(REPOSITORY_ROOT / ".github/workflows/ci.yml"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_feature_branch_updates_run_only_the_pull_request_workflow(self):
+        # Catches duplicate push and pull_request matrices for the same PR commit.
+        self._assert_ci_semantics(
+            """
+            workflow = YAML.safe_load(File.read(ARGV.fetch(0)))
+            triggers = workflow.fetch(true)
+            abort "pull_request trigger is missing" unless triggers.key?("pull_request")
+            expected_push = {"branches" => ["main"]}
+            abort "push trigger is not limited to main" \
+              unless triggers["push"] == expected_push
+            """
+        )
+
+    def test_ci_emits_the_repository_required_lint_check(self):
+        # Catches branch protection waiting forever for a nonexistent check.
+        self._assert_ci_semantics(
+            """
+            workflow = YAML.safe_load(File.read(ARGV.fetch(0)))
+            lint = workflow.fetch("jobs").fetch("lint")
+            abort "required check is not named Lint" unless lint["name"] == "Lint"
+            commands = lint.fetch("steps").map { |step| step["run"] }.compact
+            abort "Lint does not compile Python sources" \
+              unless commands.any? { |run| run.include?("compileall") }
+            """
+        )
+
     def test_workflows_parse_and_use_the_supported_verification_matrices(self):
         # Catches malformed YAML and loss of any supported Python/OS lane.
         paths = [
