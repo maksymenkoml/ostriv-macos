@@ -346,7 +346,9 @@ def build_services(package_root: Path, logger, stdin: IO[str], output: PlayerOut
 
     runner = CommandRunner(logger=logger)
     launcher = LauncherInstaller(package_root, runner=runner)
-    installer = Installer(package_root, launcher, runner=runner)
+    installer = Installer(
+        package_root, launcher, runner=runner, progress=output.progress
+    )
     return ProductionServices(package_root, installer, runner, stdin, output)
 
 
@@ -384,6 +386,16 @@ def _player_action(error: PatchError) -> str:
         return "The selected folder is not a supported Ostriv installation. Choose the Ostriv folder in CrossOver, then try again."
     if code == "install.preflight":
         return "Installation cannot start. Check CrossOver and the selected Ostriv folder, then try again."
+    if code == "install.launcher_materialize":
+        return (
+            "The launcher could not be created. "
+            "Download the latest player ZIP and try again."
+        )
+    if code == "command.timeout":
+        return (
+            "CrossOver took too long to respond. "
+            "Quit CrossOver completely, then try again."
+        )
     if code.endswith(".state_corrupt"):
         return "The installation record is unreadable. Reinstall Ostriv in this bottle, then try again."
     if code.startswith("restore."):
@@ -470,6 +482,7 @@ def run_interactive(
     stdin: IO[str] = sys.stdin,
     stdout: IO[str] = sys.stdout,
 ) -> int:
+    output.progress("Checking package")
     try:
         payload = services.validate_package()
     except PatchError:
@@ -477,6 +490,7 @@ def run_interactive(
         raise
 
     try:
+        output.progress("Finding CrossOver and Ostriv")
         games = services.find_games(game_path)
         if not games:
             raise PatchError(
@@ -512,6 +526,7 @@ def run_interactive(
         restore = selected == 1
 
     try:
+        output.progress("Restoring" if restore else "Installing", "preparing")
         if restore:
             services.restore(installation)
         else:

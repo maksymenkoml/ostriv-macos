@@ -217,10 +217,85 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual([app.resolve()], [item.app for item in apps])
 
+    def test_find_crossover_apps_skips_launch_services_dump_when_fast_paths_work(self):
+        """A known CrossOver app must not trigger a multi-megabyte registry dump."""
+        user_app = make_crossover(self.home / "Applications")
+
+        class RecordingRunner:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, argv, timeout=None):
+                self.calls.append((argv, timeout))
+
+                class Result:
+                    stdout = ""
+
+                return Result()
+
+        runner = RecordingRunner()
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=runner,
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+
+        self.assertEqual([user_app.resolve()], [item.app for item in apps])
+        self.assertEqual(
+            ["mdfind", "mdfind"],
+            [Path(call[0][0]).name for call in runner.calls],
+        )
+
+    def test_find_crossover_apps_keeps_fallback_when_spotlight_result_is_unusable(self):
+        """A stale Spotlight hit must not hide a usable Launch Services bundle."""
+        stale = self.home / "Stale/CrossOver.app"
+        stale.mkdir(parents=True)
+        usable = make_crossover(self.home / "Registered")
+
+        class ListingRunner:
+            def run(self, argv, timeout=None):
+                class Result:
+                    stdout = ""
+
+                if Path(argv[0]).name == "mdfind":
+                    Result.stdout = str(stale) + "\n"
+                else:
+                    Result.stdout = "path: {}\n".format(usable)
+                return Result()
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=ListingRunner(),
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+
+        self.assertEqual([usable.resolve()], [item.app for item in apps])
+
     def test_find_crossover_apps_ignores_runner_timeouts(self):
         class TimeoutRunner:
             def run(self, argv, timeout=None):
                 raise subprocess.TimeoutExpired(argv, timeout)
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=TimeoutRunner(),
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+        self.assertEqual([], apps)
+
+    def test_find_crossover_apps_ignores_typed_command_timeouts(self):
+        """Optional discovery fallbacks must not turn a timeout into install failure."""
+
+        class TimeoutRunner:
+            def run(self, argv, timeout=None):
+                raise PatchError(
+                    "command.timeout",
+                    "CrossOver took too long to respond.",
+                    "timeout={}".format(timeout),
+                )
 
         apps = find_crossover_apps(
             home=self.home,

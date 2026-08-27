@@ -3144,7 +3144,7 @@ class InstallerTests(unittest.TestCase):
             state = fixture.installer().install(fixture.installation, fixture.payload)
             stored = json.loads((fixture.bottle_root / "ostriv-macos-state.json").read_text())
             self.assertEqual(1, stored["schema"])
-            self.assertEqual("0.1.0", stored["project_version"])
+            self.assertEqual("0.1.1", stored["project_version"])
             self.assertEqual(str(fixture.bottle_root.resolve()), stored["bottle_realpath"])
             self.assertEqual(str(fixture.game_dir.resolve()), stored["game_realpath"])
             self.assertTrue(stored["owned_files"])
@@ -3169,6 +3169,79 @@ class InstallerTests(unittest.TestCase):
             add_calls = [call for call, _ in fixture.runner.calls if "add" in call]
             self.assertEqual(2, len(add_calls))
             self.assertEqual("native", fixture.registry[(REGISTRY_KEY, REGISTRY_VALUE)])
+        finally:
+            fixture.cleanup()
+
+    def test_external_crossover_checks_are_bounded_and_install_reports_progress(self):
+        """Every potentially slow install boundary is named and has a finite deadline."""
+        fixture = FakeBottleFixture()
+        progress = []
+        try:
+            installer = TrackingInstaller(
+                fixture.package_root,
+                fixture.launcher,
+                runner=fixture.runner,
+                launcher_destination=fixture.launcher_artifact.parent,
+                progress=lambda label, detail: progress.append((label, detail)),
+            )
+
+            installer.install(fixture.installation, fixture.payload)
+
+            self.assertEqual(
+                [
+                    ("Installing", "checking CrossOver (may take a minute)"),
+                    ("Installing", "copying graphics driver"),
+                    ("Installing", "configuring CrossOver (may take a minute)"),
+                    ("Installing", "applying game settings"),
+                    ("Installing", "creating launcher"),
+                    ("Installing", "verifying (may take a minute)"),
+                ],
+                progress,
+            )
+            cxbottle_timeouts = [
+                timeout
+                for call, timeout in fixture.runner.calls
+                if Path(call[0]).name == "cxbottle"
+            ]
+            wine_timeouts = [
+                timeout
+                for call, timeout in fixture.runner.calls
+                if Path(call[0]).name == "wine"
+            ]
+            self.assertEqual([60.0], cxbottle_timeouts)
+            self.assertTrue(wine_timeouts)
+            self.assertEqual({90.0}, set(wine_timeouts))
+            self.assertEqual(3, len(wine_timeouts))
+        finally:
+            fixture.cleanup()
+
+    def test_restore_reports_each_slow_boundary_without_repeating_final_output(self):
+        """Restore must identify its long registry work just as clearly as install."""
+        fixture = FakeBottleFixture()
+        progress = []
+        try:
+            installer = TrackingInstaller(
+                fixture.package_root,
+                fixture.launcher,
+                runner=fixture.runner,
+                launcher_destination=fixture.launcher_artifact.parent,
+                progress=lambda label, detail: progress.append((label, detail)),
+            )
+            installer.install(fixture.installation, fixture.payload)
+            progress.clear()
+
+            installer.restore(fixture.installation)
+
+            self.assertEqual(
+                [
+                    ("Restoring", "checking previous changes"),
+                    ("Restoring", "restoring launcher"),
+                    ("Restoring", "restoring files"),
+                    ("Restoring", "configuring CrossOver (may take a minute)"),
+                    ("Restoring", "verifying"),
+                ],
+                progress,
+            )
         finally:
             fixture.cleanup()
 

@@ -79,11 +79,20 @@ def _acceptable_app_path(path: str) -> bool:
 def _runner_stdout(runner: CommandRunner, argv: Sequence[str], timeout: float) -> str:
     try:
         return runner.run(argv, timeout=timeout).stdout
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        subprocess.SubprocessError,
+        PatchError,
+    ):
         return ""
 
 
-def _spotlight_apps(runner: CommandRunner) -> Iterable[Path]:
+def _spotlight_apps(
+    runner: CommandRunner, allow_launch_services: bool = True
+) -> Iterable[Path]:
+    found = False
     for argv in (
         ["mdfind", "kMDItemCFBundleIdentifier == 'com.codeweavers.CrossOver'"],
         ["mdfind", "-name", "CrossOver.app"],
@@ -91,7 +100,12 @@ def _spotlight_apps(runner: CommandRunner) -> Iterable[Path]:
         for line in _runner_stdout(runner, argv, 5).splitlines():
             path = line.strip()
             if _acceptable_app_path(path):
-                yield Path(path)
+                candidate = Path(path)
+                found = found or _usable_app(candidate)
+                yield candidate
+
+    if found or not allow_launch_services:
+        return
 
     lsregister = (
         "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
@@ -130,7 +144,9 @@ def find_crossover_apps(
 
     if allow_subprocess:
         actual_runner = runner or CommandRunner()
-        for candidate in _spotlight_apps(actual_runner):
+        for candidate in _spotlight_apps(
+            actual_runner, allow_launch_services=not apps
+        ):
             _add_install(apps, seen, candidate)
     return apps
 

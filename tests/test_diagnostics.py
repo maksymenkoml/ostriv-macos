@@ -37,6 +37,34 @@ class DiagnosticsTests(unittest.TestCase):
         output.stage("Package", "OK")
         self.assertEqual("Ostriv for macOS\nPackage: OK\n", stream.getvalue())
 
+    def test_tty_progress_replaces_one_temporary_line_before_final_stage(self):
+        """Slow work must stay visibly active without leaving repeated status lines."""
+
+        class TtyStream(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = TtyStream()
+        output = PlayerOutput(stream)
+        output.progress("Installing", "configuring CrossOver (may take a minute)")
+        output.progress("Installing", "creating launcher")
+        output.stage("Installation", "OK")
+
+        self.assertEqual(
+            "\r\x1b[KInstalling… configuring CrossOver (may take a minute)"
+            "\r\x1b[KInstalling… creating launcher"
+            "\r\x1b[KInstallation: OK\n",
+            stream.getvalue(),
+        )
+
+    def test_non_tty_progress_does_not_add_noisy_log_lines(self):
+        """Redirected output keeps the existing concise, stable transcript."""
+        stream = io.StringIO()
+        output = PlayerOutput(stream, color=False)
+        output.progress("Installing", "configuring CrossOver")
+        output.stage("Installation", "OK")
+        self.assertEqual("Installation: OK\n", stream.getvalue())
+
     def test_success_owns_one_blank_line_outcome_and_short_log_path(self):
         stream = io.StringIO()
         output = PlayerOutput(stream, color=False)
@@ -69,6 +97,21 @@ class DiagnosticsTests(unittest.TestCase):
         run.assert_called_once_with(
             ["wine", "--check"], capture_output=True, check=False, timeout=2
         )
+
+    @patch("ostriv_macos.diagnostics.subprocess.run")
+    def test_command_timeout_is_typed_and_keeps_partial_output_private(self, run):
+        """A stalled CrossOver command needs one actionable error, not a raw traceback."""
+        run.side_effect = subprocess.TimeoutExpired(
+            ["wine", "reg", "query"], 90, output=b"partial output", stderr=b"stalled"
+        )
+
+        with self.assertRaises(PatchError) as caught:
+            CommandRunner().run(["wine", "reg", "query"], timeout=90)
+
+        self.assertEqual("command.timeout", caught.exception.code)
+        self.assertEqual("CrossOver took too long to respond.", caught.exception.player_message)
+        self.assertIn("timeout=90", caught.exception.detail)
+        self.assertIn("partial output", caught.exception.detail)
 
     @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_command_runner_logs_bounded_decoded_result_and_redacts_sensitive_data(
