@@ -217,6 +217,29 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual([app.resolve()], [item.app for item in apps])
 
+    def test_find_crossover_apps_discovers_preview_app_from_spotlight(self):
+        fixture_root = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(fixture_root.cleanup)
+        app = make_crossover(
+            Path(fixture_root.name) / "Applications", "CrossOver Preview.app"
+        )
+
+        class ListingRunner:
+            def run(self, argv, timeout=None):
+                class Result:
+                    stdout = str(app) + "\n" if argv[0] == "mdfind" else ""
+
+                return Result()
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=ListingRunner(),
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+
+        self.assertEqual([app.resolve()], [item.app for item in apps])
+
     def test_find_crossover_apps_skips_launch_services_dump_when_fast_paths_work(self):
         """A known CrossOver app must not trigger a multi-megabyte registry dump."""
         user_app = make_crossover(self.home / "Applications")

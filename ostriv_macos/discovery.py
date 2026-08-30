@@ -73,7 +73,8 @@ def _add_install(apps: List[CrossOverInstall], seen: set, candidate: Path) -> No
 
 def _acceptable_app_path(path: str) -> bool:
     junk = ("/.Trash/", "/AppTranslocation/", "/private/var/folders/", "/var/folders/")
-    return path.endswith("CrossOver.app") and not any(part in path for part in junk)
+    names = ("CrossOver.app", "CrossOver Preview.app")
+    return Path(path).name in names and not any(part in path for part in junk)
 
 
 def _runner_stdout(runner: CommandRunner, argv: Sequence[str], timeout: float) -> str:
@@ -112,7 +113,9 @@ def _spotlight_apps(
         "LaunchServices.framework/Support/lsregister"
     )
     output = _runner_stdout(runner, [lsregister, "-dump"], 10)
-    for match in re.finditer(r"(/[^\n]+?/CrossOver\.app)(?=\s|$)", output):
+    for match in re.finditer(
+        r"(/[^\n]+?/CrossOver(?: Preview)?\.app)(?=\s|$)", output
+    ):
         path = match.group(1).strip().strip('"')
         if _acceptable_app_path(path):
             yield Path(path)
