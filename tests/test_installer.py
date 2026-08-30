@@ -1194,6 +1194,87 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_reinstall_preserves_modified_safe_game_settings(self):
+        fixture = FakeBottleFixture()
+        try:
+            fixture.settings.unlink()
+            installer = fixture.installer()
+            installer.install(fixture.installation, fixture.payload)
+
+            customized = settings_bytes(
+                0, b"changed-anisotropic-and-language-settings"
+            )
+            fixture.settings.write_bytes(customized)
+
+            state = fixture.installer().install(
+                fixture.installation, fixture.payload
+            )
+
+            self.assertEqual(customized, fixture.settings.read_bytes())
+            self.assertEqual(
+                digest(customized), state.installed_settings_digest
+            )
+            settings_entry = next(
+                item
+                for item in state.owned_files
+                if item["path"] == str(fixture.settings.resolve())
+            )
+            self.assertEqual(digest(customized), settings_entry["sha256"])
+        finally:
+            fixture.cleanup()
+
+    def test_reinstall_only_disables_multisampling_in_modified_settings(self):
+        fixture = FakeBottleFixture()
+        try:
+            fixture.settings.unlink()
+            fixture.installer().install(fixture.installation, fixture.payload)
+
+            customized = settings_bytes(
+                1, b"changed-anisotropic-and-language-settings"
+            )
+            fixture.settings.write_bytes(customized)
+
+            fixture.installer().install(fixture.installation, fixture.payload)
+
+            self.assertEqual(
+                settings_bytes(
+                    0, b"changed-anisotropic-and-language-settings"
+                ),
+                fixture.settings.read_bytes(),
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_restore_removes_created_settings_edited_after_reinstall(self):
+        fixture = FakeBottleFixture()
+        try:
+            fixture.settings.unlink()
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-before"))
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-after"))
+
+            fixture.installer().restore(fixture.installation)
+
+            self.assertFalse(fixture.settings.exists())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_rolls_back_settings_edited_after_reinstall(self):
+        fixture = FakeBottleFixture()
+        try:
+            original = fixture.settings.read_bytes()
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-before"))
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-after"))
+
+            fixture.installer().restore(fixture.installation)
+
+            self.assertEqual(original, fixture.settings.read_bytes())
+        finally:
+            fixture.cleanup()
+
     def test_reinstall_with_changed_payload_keeps_genuine_restore_backup(self):
         fixture = FakeBottleFixture()
         try:

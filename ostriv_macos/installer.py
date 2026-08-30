@@ -2058,19 +2058,38 @@ class Installer:
         )
         if self._existing_state is not None:
             try:
-                existing_data, _existing_mode = _read_relative_file(bottle_root, path)
+                existing_data, existing_mode = _read_relative_file(bottle_root, path)
             except OSError:
                 existing_data = b""
-            if _bytes_digest(existing_data) != self._existing_state.installed_settings_digest:
-                raise PatchError(
-                    "install.ownership_conflict",
-                    "Installation cannot replace modified game settings.",
-                    str(path),
-                )
+                existing_mode = 0
+            desired = self._safe_settings(existing_data)
+            existing_digest = _bytes_digest(existing_data)
+            installed_digest = _bytes_digest(desired)
+            if existing_digest != self._existing_state.installed_settings_digest:
+                if desired != existing_data:
+                    snapshots = self._snapshots([path])
+                    snapshots[0]["allowed_current_sha256"] = [installed_digest]
+                    transaction.step(
+                        "refresh safe graphics settings",
+                        UndoRecord("restore_settings", {"snapshots": snapshots}),
+                        lambda: self._replace_modified_settings(
+                            installation,
+                            path,
+                            existing_data,
+                            existing_mode,
+                            existing_digest,
+                            desired,
+                        ),
+                    )
+                owned = self._owned(path)
+                if owned is not None:
+                    updated_owned = copy.deepcopy(owned)
+                    updated_owned["sha256"] = installed_digest
+                    self._upsert(self._owned_files, updated_owned)
             self._settings = {
                 "backup": self._existing_state.original_settings_backup,
                 "original_digest": self._existing_state.original_settings_digest,
-                "installed_digest": self._existing_state.installed_settings_digest,
+                "installed_digest": installed_digest,
             }
             return
         if path.is_file():
@@ -2115,8 +2134,7 @@ class Installer:
             }
             return
         template = self.package_root / "assets/settings.data"
-        desired = template.read_bytes()
-        self._safe_settings(desired)
+        desired = self._safe_settings(template.read_bytes())
         installed_digest = _bytes_digest(desired)
         owned_directories = []
         current = path.parent
@@ -2149,6 +2167,29 @@ class Installer:
             "original_digest": "",
             "installed_digest": installed_digest,
         }
+
+    @staticmethod
+    def _replace_modified_settings(
+        installation: GameInstallation,
+        path: Path,
+        original_data: bytes,
+        original_mode: int,
+        original_digest: str,
+        data: bytes,
+    ) -> None:
+        root = installation.bottle.root.resolve()
+        current, current_mode = _read_relative_file(root, path)
+        if (
+            current != original_data
+            or _bytes_digest(current) != original_digest
+            or current_mode != original_mode
+        ):
+            raise PatchError(
+                "install.ownership_conflict",
+                "Installation cannot replace modified game settings.",
+                str(path),
+            )
+        _atomic_write_relative(root, path, data, original_mode)
 
     @staticmethod
     def _backup_and_write(
@@ -2701,12 +2742,7 @@ class Installer:
                 backup_data = None
             if current is not None and _bytes_digest(current) == original and backup_data is None:
                 return
-            if (
-                current is None
-                or _bytes_digest(current) != installed
-                or backup_data is None
-                or _bytes_digest(backup_data) != original
-            ):
+            if backup_data is None or _bytes_digest(backup_data) != original:
                 return
             _replace_relative(root, backup, path)
             return
@@ -2742,12 +2778,13 @@ class Installer:
         transaction: Transaction,
         installation: GameInstallation,
         item: Mapping[str, object],
+        unconditional: bool = False,
     ) -> None:
         path = Path(str(item["path"]))
         expected = str(item.get("sha256", ""))
         snapshots = self._snapshots([path])
         def remove_owned() -> None:
-            if _same_file(path, expected):
+            if _same_file(path, expected) or (unconditional and path.is_file()):
                 _durable_unlink(path)
                 self._remove_empty_owned_directories(
                     installation, item.get("owned_directories", [])
@@ -4573,7 +4610,12 @@ class Installer:
                 )
             for item in reversed(state.owned_files):
                 if str(item["path"]) not in handled:
-                    self._journal_remove_owned(transaction, installation, item)
+                    self._journal_remove_owned(
+                        transaction,
+                        installation,
+                        item,
+                        unconditional=Path(str(item["path"])) == settings_path,
+                    )
             self.progress("Restoring", "verifying")
             self._verify_restored(installation, state)
             logger.info("restore verification status=OK mode=owned")

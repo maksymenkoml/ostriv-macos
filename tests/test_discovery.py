@@ -217,6 +217,94 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual([app.resolve()], [item.app for item in apps])
 
+    def test_find_crossover_apps_discovers_preview_app_from_spotlight(self):
+        fixture_root = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(fixture_root.cleanup)
+        app = make_crossover(
+            Path(fixture_root.name) / "Applications", "CrossOver Preview.app"
+        )
+
+        class ListingRunner:
+            def run(self, argv, timeout=None):
+                class Result:
+                    stdout = str(app) + "\n" if argv[0] == "mdfind" else ""
+
+                return Result()
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=ListingRunner(),
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+
+        self.assertEqual([app.resolve()], [item.app for item in apps])
+
+    def test_find_crossover_apps_finds_preview_in_conventional_locations(self):
+        """A Preview-only install must be found without touching Spotlight."""
+        app = make_crossover(self.home / "Applications", "CrossOver Preview.app")
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            allow_subprocess=False,
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+
+        self.assertEqual([app.resolve()], [item.app for item in apps])
+
+    def test_find_crossover_apps_finds_preview_by_name_query(self):
+        """Preview must be reachable when only the -name query can see it."""
+        fixture_root = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(fixture_root.cleanup)
+        app = make_crossover(
+            Path(fixture_root.name) / "Applications", "CrossOver Preview.app"
+        )
+
+        class ListingRunner:
+            def run(self, argv, timeout=None):
+                class Result:
+                    stdout = ""
+
+                if argv[:2] == ["mdfind", "-name"] and "Preview" in argv[2]:
+                    Result.stdout = str(app) + "\n"
+                return Result()
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=ListingRunner(),
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+
+        self.assertEqual([app.resolve()], [item.app for item in apps])
+
+    def test_find_crossover_apps_finds_preview_in_launch_services_dump(self):
+        """Preview must survive the lsregister fallback when Spotlight is blind."""
+        fixture_root = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(fixture_root.cleanup)
+        app = make_crossover(
+            Path(fixture_root.name) / "Registered", "CrossOver Preview.app"
+        )
+
+        class ListingRunner:
+            def run(self, argv, timeout=None):
+                class Result:
+                    stdout = ""
+
+                if Path(argv[0]).name == "lsregister":
+                    Result.stdout = "path: {}\n".format(app)
+                return Result()
+
+        apps = find_crossover_apps(
+            home=self.home,
+            env={},
+            runner=ListingRunner(),
+            system_app=self.home / "Missing/CrossOver.app",
+        )
+
+        self.assertEqual([app.resolve()], [item.app for item in apps])
+
     def test_find_crossover_apps_skips_launch_services_dump_when_fast_paths_work(self):
         """A known CrossOver app must not trigger a multi-megabyte registry dump."""
         user_app = make_crossover(self.home / "Applications")
@@ -243,7 +331,7 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual([user_app.resolve()], [item.app for item in apps])
         self.assertEqual(
-            ["mdfind", "mdfind"],
+            ["mdfind", "mdfind", "mdfind"],
             [Path(call[0][0]).name for call in runner.calls],
         )
 
