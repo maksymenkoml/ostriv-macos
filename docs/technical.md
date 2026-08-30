@@ -88,6 +88,15 @@ Each selected bottle stores two distinct durable records:
   registry/config/settings values, owned files, launcher artifacts, and verification metadata so
   Restore changes only project-owned content and is safe to repeat.
 
+`settings.data` is the one owned file whose content the player legitimately changes — Ostriv
+rewrites it whenever they touch the options screen. A reinstall therefore re-derives the safe
+settings from the file as it currently stands, forcing only `bMultisampling` off and keeping every
+other value, instead of refusing to install. Because that recorded digest goes stale again the
+moment the player reopens the options screen, Restore reclaims `settings.data` unconditionally:
+both the owned-file delete and the backup roll-back skip their usual digest gate for this one path.
+Every other owned file keeps the gate, so a driver DLL the player replaced with something of their
+own is never removed.
+
 The launcher is data plus packaged code, not interpolated source. Installation copies
 `launcher_runtime.py` byte-for-byte to `<bottle>/play-ostriv-patched.py`, writes the resolved
 values to `<bottle>/launcher-config.json`, verifies both and the pending app bundle, then swaps the

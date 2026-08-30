@@ -97,6 +97,7 @@ def _spotlight_apps(
     for argv in (
         ["mdfind", "kMDItemCFBundleIdentifier == 'com.codeweavers.CrossOver'"],
         ["mdfind", "-name", "CrossOver.app"],
+        ["mdfind", "-name", "CrossOver Preview.app"],
     ):
         for line in _runner_stdout(runner, argv, 5).splitlines():
             path = line.strip()
@@ -138,7 +139,14 @@ def find_crossover_apps(
     configured = actual_env.get("OSTRIV_CROSSOVER_APP")
     if configured:
         candidates.append(Path(configured).expanduser())
-    candidates.extend((actual_home / "Applications/CrossOver.app", system_app))
+    candidates.extend(
+        (
+            actual_home / "Applications/CrossOver.app",
+            system_app,
+            actual_home / "Applications/CrossOver Preview.app",
+            system_app.with_name("CrossOver Preview.app"),
+        )
+    )
 
     apps: List[CrossOverInstall] = []
     seen = set()

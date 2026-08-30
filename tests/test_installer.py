@@ -1245,6 +1245,36 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_restore_removes_created_settings_edited_after_reinstall(self):
+        fixture = FakeBottleFixture()
+        try:
+            fixture.settings.unlink()
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-before"))
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-after"))
+
+            fixture.installer().restore(fixture.installation)
+
+            self.assertFalse(fixture.settings.exists())
+        finally:
+            fixture.cleanup()
+
+    def test_restore_rolls_back_settings_edited_after_reinstall(self):
+        fixture = FakeBottleFixture()
+        try:
+            original = fixture.settings.read_bytes()
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-before"))
+            fixture.installer().install(fixture.installation, fixture.payload)
+            fixture.settings.write_bytes(settings_bytes(0, b"edit-after"))
+
+            fixture.installer().restore(fixture.installation)
+
+            self.assertEqual(original, fixture.settings.read_bytes())
+        finally:
+            fixture.cleanup()
+
     def test_reinstall_with_changed_payload_keeps_genuine_restore_backup(self):
         fixture = FakeBottleFixture()
         try:
