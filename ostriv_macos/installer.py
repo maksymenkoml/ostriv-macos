@@ -2853,6 +2853,28 @@ class Installer:
         }
         return state, self._launcher_restore_undo(installation, state)
 
+    @staticmethod
+    def _settings_restore_failure(
+        state: InstallState, settings: Path
+    ) -> Optional[str]:
+        """Report how Restore failed settings.data, or None when it owed it nothing.
+
+        An install that found the file already safe copied no backup and claimed
+        no ownership, so its content after Restore is the player's business.
+        """
+        if (
+            state.original_settings_backup is None
+            and state.original_settings_digest == state.installed_settings_digest
+        ):
+            return None
+        if state.original_settings_digest:
+            if not _same_file(settings, state.original_settings_digest):
+                return "game settings were not restored"
+            return None
+        if _same_file(settings, state.installed_settings_digest):
+            return "installed game settings remain"
+        return None
+
     def _verify_restored(
         self, installation: GameInstallation, state: InstallState
     ) -> None:
@@ -2874,12 +2896,11 @@ class Installer:
         config = installation.bottle.root.resolve() / "cxbottle.conf"
         if not _same_file(config, state.original_config_digest):
             failures.append("bottle configuration was not restored")
-        settings = self._settings_path(installation)
-        if state.original_settings_digest:
-            if not _same_file(settings, state.original_settings_digest):
-                failures.append("game settings were not restored")
-        elif _same_file(settings, state.installed_settings_digest):
-            failures.append("installed game settings remain")
+        settings_failure = self._settings_restore_failure(
+            state, self._settings_path(installation)
+        )
+        if settings_failure is not None:
+            failures.append(settings_failure)
         for artifact in self._launcher_paths(state.launcher_artifacts):
             if artifact in {
                 installation.bottle.root.resolve() / ".ostriv-launcher.lock",

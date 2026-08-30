@@ -1275,6 +1275,21 @@ class InstallerTests(unittest.TestCase):
         finally:
             fixture.cleanup()
 
+    def test_restore_succeeds_when_installed_settings_match_the_original(self):
+        """Nothing to roll back means restore must not police the file."""
+        fixture = FakeBottleFixture()
+        try:
+            fixture.settings.write_bytes(settings_bytes(0, b"player-tail"))
+            fixture.installer().install(fixture.installation, fixture.payload)
+            edited = settings_bytes(1, b"player-tail")
+            fixture.settings.write_bytes(edited)
+
+            fixture.installer().restore(fixture.installation)
+
+            self.assertEqual(edited, fixture.settings.read_bytes())
+        finally:
+            fixture.cleanup()
+
     def test_reinstall_with_changed_payload_keeps_genuine_restore_backup(self):
         fixture = FakeBottleFixture()
         try:
