@@ -28,7 +28,8 @@ LAUNCHER_NAME = "Ostriv (patched)"
 LAUNCHER_MENU = "StartMenu/" + LAUNCHER_NAME
 RUNTIME_NAME = "play-ostriv-patched.py"
 CONFIG_NAME = "launcher-config.json"
-PLIST_FIELDS = (
+SAFE_AREA_PLIST_FIELD = "NSPrefersDisplaySafeAreaCompatibilityMode"
+LEGACY_PLIST_FIELDS = (
     "CFBundleName",
     "CFBundleDisplayName",
     "CFBundleIdentifier",
@@ -36,6 +37,7 @@ PLIST_FIELDS = (
     "CXHelperAppBottleName",
     "CXHelperAppBottleTag",
 )
+PLIST_FIELDS = LEGACY_PLIST_FIELDS + (SAFE_AREA_PLIST_FIELD,)
 LEGACY_RUNTIME_NORMALIZED_SHA256 = {
     "0f1cc970c2f14861eff39d99c2494081f4615e395777021ccc7c2c8182a7b474",
     "459c38c2e8c64ea216747161fdc17f22f547e08671bda1e0af195cd28ba74193",
@@ -1114,7 +1116,8 @@ class LauncherInstaller:
         if (
             state.get("menu_entry")
             != {"name": LAUNCHER_MENU, "installed": True}
-            or state.get("plist_fields") != list(PLIST_FIELDS)
+            or state.get("plist_fields")
+            not in (list(LEGACY_PLIST_FIELDS), list(PLIST_FIELDS))
             or state.get("command") != expected_command
             or state.get("bottle_name") != installation.bottle.name
             or state.get("bottle_argument") != self._command_bottle(installation)
@@ -1815,7 +1818,7 @@ class LauncherInstaller:
         transaction: Transaction,
         installation: GameInstallation,
         pending: Path,
-        expected_fields: Mapping[str, str],
+        expected_fields: Mapping[str, object],
         icon_source: Path,
     ) -> None:
         if pending.exists():
@@ -1922,7 +1925,7 @@ class LauncherInstaller:
         config: Path,
         runtime_sha256: str,
         config_sha256: str,
-        fields: Mapping[str, str],
+        fields: Mapping[str, object],
         icon_sha256: str,
     ) -> None:
         failures = []
@@ -1935,7 +1938,8 @@ class LauncherInstaller:
             properties = {}
             failures.append("Info.plist is unreadable: {}".format(error))
         for key, value in fields.items():
-            if properties.get(key) != value:
+            actual = properties.get(key)
+            if type(actual) is not type(value) or actual != value:
                 failures.append("{} does not match".format(key))
         if not runtime.is_file() or _file_digest(runtime) != runtime_sha256:
             failures.append("launcher runtime digest does not match")
@@ -1965,7 +1969,7 @@ class LauncherInstaller:
     def _canonical_plist(
         self,
         installation: GameInstallation,
-        identity: Mapping[str, str],
+        identity: Mapping[str, object],
     ) -> Dict[str, object]:
         with tempfile.TemporaryDirectory(prefix="ostriv-launcher-plist-") as temporary:
             destination = Path(temporary) / "template"
@@ -2036,6 +2040,11 @@ class LauncherInstaller:
             plist_path = app / "Contents/Info.plist"
             actual_plist_data = plist_path.read_bytes()
             actual_plist = plistlib.loads(actual_plist_data)
+            if (
+                state.get("plist_fields") == list(PLIST_FIELDS)
+                and actual_plist.get(SAFE_AREA_PLIST_FIELD) is not True
+            ):
+                return recorded
             identity = {
                 "CFBundleName": LAUNCHER_NAME,
                 "CFBundleDisplayName": LAUNCHER_NAME,
@@ -2046,6 +2055,8 @@ class LauncherInstaller:
                 "CFBundleExecutable": "Menu Helper",
                 "CFBundleIconFile": "CrossOverHelper.icns",
             }
+            if state.get("plist_fields") == list(PLIST_FIELDS):
+                identity[SAFE_AREA_PLIST_FIELD] = True
             canonical = self._canonical_plist(installation, identity)
             if not self._is_crossover_generated_plist(actual_plist, canonical):
                 return recorded
@@ -2192,7 +2203,7 @@ class LauncherInstaller:
             stable_previous = app.with_name("." + app.name + ".ostriv-macos.previous")
             prior = self._prior_launcher_state(installation)
             if prior is not None:
-                self.verify(installation, prior)
+                self._verify_prior_launcher(installation, prior)
                 app_before_inventory = self._current_owned_app_inventory(
                     installation, prior
                 )
@@ -2258,6 +2269,7 @@ class LauncherInstaller:
                 "CXHelperAppBottleTag": bottle_tag,
                 "CFBundleExecutable": "Menu Helper",
                 "CFBundleIconFile": "CrossOverHelper.icns",
+                SAFE_AREA_PLIST_FIELD: True,
             }
             icon_source = self._find_game_icon(installation, app)
             if icon_source is None:
@@ -2524,10 +2536,38 @@ class LauncherInstaller:
                     "Legacy launcher artifact path is outside the inventory",
                 )
 
+    def _verify_prior_launcher(
+        self,
+        installation: GameInstallation,
+        launcher_state: Mapping[str, object],
+    ) -> None:
+        """Verify a persisted pre-v0.1.4 launcher only for in-place upgrade."""
+        if launcher_state.get("plist_fields") == list(LEGACY_PLIST_FIELDS):
+            self._verify_launcher(
+                installation,
+                launcher_state,
+                allow_legacy_safe_area=True,
+            )
+            return
+        self.verify(installation, launcher_state)
+
     def verify(
         self,
         installation: GameInstallation,
         launcher_state: Mapping[str, object],
+    ) -> None:
+        self._verify_launcher(
+            installation,
+            launcher_state,
+            allow_legacy_safe_area=False,
+        )
+
+    def _verify_launcher(
+        self,
+        installation: GameInstallation,
+        launcher_state: Mapping[str, object],
+        *,
+        allow_legacy_safe_area: bool,
     ) -> None:
         state = launcher_state
         try:
@@ -2554,6 +2594,11 @@ class LauncherInstaller:
                 "CFBundleExecutable": "Menu Helper",
                 "CFBundleIconFile": "CrossOverHelper.icns",
             }
+            expected_plist_fields = list(
+                LEGACY_PLIST_FIELDS if allow_legacy_safe_area else PLIST_FIELDS
+            )
+            if not allow_legacy_safe_area:
+                expected_identity[SAFE_AREA_PLIST_FIELD] = True
             identity_failures = []
             if state.get("schema") != 1:
                 identity_failures.append("launcher state schema does not match")
@@ -2572,7 +2617,7 @@ class LauncherInstaller:
             owner_token = state.get("profile_owner_token")
             if not self._valid_owner_token(owner_token):
                 identity_failures.append("launcher profile ownership token is invalid")
-            if state.get("plist_fields") != list(PLIST_FIELDS):
+            if state.get("plist_fields") != expected_plist_fields:
                 identity_failures.append("launcher plist field inventory does not match")
             if identity_failures:
                 raise PatchError(
@@ -2583,6 +2628,15 @@ class LauncherInstaller:
             actual_plist = plistlib.loads(
                 (app / "Contents/Info.plist").read_bytes()
             )
+            if (
+                not allow_legacy_safe_area
+                and actual_plist.get(SAFE_AREA_PLIST_FIELD) is not True
+            ):
+                raise PatchError(
+                    "install.launcher_verify",
+                    "Installation failed.",
+                    "{} does not match".format(SAFE_AREA_PLIST_FIELD),
+                )
             canonical_plist = self._canonical_plist(
                 installation, expected_identity
             )

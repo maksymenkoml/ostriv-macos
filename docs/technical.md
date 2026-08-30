@@ -215,6 +215,10 @@ Hard-won implementation facts:
 ## Fullscreen and winemac display state
 
 - Fullscreen = the game's own `bFullscreenBorderlessWindow=1`. Nothing else.
+- The generated launcher sets `NSPrefersDisplaySafeAreaCompatibilityMode=true`.
+  On MacBooks with a camera housing, macOS reduces the app's active display area so
+  Ostriv's top-edge UI stays below the notch; displays without a camera housing are
+  unaffected. Reinstall upgrades launchers created before this field was added.
 - **Never** force resolution with a Wine virtual desktop or `displayplacer`: winemac's
   display state corrupts (reports 1024×768 forever) and only a full CrossOver quit+reopen
   resets it (`wineserver -k` is not enough).

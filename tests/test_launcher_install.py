@@ -297,6 +297,28 @@ class LauncherFixture:
             b"menu-helper-default-icon"
         )
 
+    def downgrade_to_legacy_safe_area_state(self, state):
+        """Recreate the exact launcher/state shape written before notch support."""
+        legacy = dict(state)
+        plist_path = self.app / "Contents/Info.plist"
+        properties = plistlib.loads(plist_path.read_bytes())
+        properties.pop("NSPrefersDisplaySafeAreaCompatibilityMode", None)
+        plist_path.write_bytes(plistlib.dumps(properties))
+        plist_sha256 = digest(plist_path.read_bytes())
+        legacy["plist_fields"] = [
+            "CFBundleName",
+            "CFBundleDisplayName",
+            "CFBundleIdentifier",
+            "CrossOverHelperCommand",
+            "CXHelperAppBottleName",
+            "CXHelperAppBottleTag",
+        ]
+        legacy["plist_sha256"] = plist_sha256
+        legacy["app_inventory"] = launcher_module._inventory(self.app)
+        legacy["artifacts"] = [dict(item) for item in legacy["artifacts"]]
+        legacy["artifacts"][1]["sha256"] = plist_sha256
+        return legacy
+
     @staticmethod
     def _restore_snapshots(record):
         for snapshot in record.data.get("snapshots", []):
@@ -1133,6 +1155,7 @@ class LauncherInstallerTests(unittest.TestCase):
                 "CrossOverHelperCommand": state["command"],
                 "CXHelperAppBottleName": fixture.bottle.name,
                 "CXHelperAppBottleTag": "CrossOver-fixture-bottle-id/",
+                "NSPrefersDisplaySafeAreaCompatibilityMode": True,
             },
             {key: info[key] for key in state["plist_fields"]},
         )
@@ -1177,6 +1200,33 @@ class LauncherInstallerTests(unittest.TestCase):
         self.assertEqual("install.launcher_verify", caught.exception.code)
         self.assertIn("CXHelperAppBottleName", caught.exception.detail)
 
+    def test_verify_rejects_missing_disabled_or_malformed_safe_area_preference(self):
+        """A current launcher must not silently return to notch-obscured fullscreen."""
+        missing = object()
+        for value in (missing, False, 1, "true"):
+            with self.subTest(value=value):
+                fixture = LauncherFixture()
+                self.addCleanup(fixture.cleanup)
+                state = fixture.installer.install(
+                    fixture.transaction, fixture.installation
+                )
+                plist_path = fixture.app / "Contents/Info.plist"
+                info = plistlib.loads(plist_path.read_bytes())
+                if value is missing:
+                    info.pop("NSPrefersDisplaySafeAreaCompatibilityMode")
+                else:
+                    info["NSPrefersDisplaySafeAreaCompatibilityMode"] = value
+                plist_path.write_bytes(plistlib.dumps(info))
+
+                with self.assertRaises(PatchError) as caught:
+                    fixture.installer.verify(fixture.installation, state)
+
+                self.assertEqual("install.launcher_verify", caught.exception.code)
+                self.assertIn(
+                    "NSPrefersDisplaySafeAreaCompatibilityMode",
+                    caught.exception.detail,
+                )
+
     def test_verify_recomputes_identity_when_state_and_plist_are_tampered_together(self):
         """Persisted state cannot authenticate the plist that the same state describes."""
         fixture = LauncherFixture()
@@ -1194,6 +1244,21 @@ class LauncherInstallerTests(unittest.TestCase):
 
         self.assertEqual("install.launcher_verify", caught.exception.code)
         self.assertIn("CrossOverHelperCommand", caught.exception.detail)
+
+    def test_verify_rejects_paired_safe_area_inventory_downgrade(self):
+        """Current state cannot relabel a notch-unsafe plist as a legacy launcher."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        current = fixture.installer.install(
+            fixture.transaction, fixture.installation
+        )
+        downgraded = fixture.downgrade_to_legacy_safe_area_state(current)
+
+        with self.assertRaises(PatchError) as caught:
+            fixture.installer.verify(fixture.installation, downgraded)
+
+        self.assertEqual("install.launcher_verify", caught.exception.code)
+        self.assertIn("plist field inventory", caught.exception.detail)
 
     def test_reinstall_rejects_paired_unlisted_plist_tampering_before_mutation(self):
         """A rewritten state digest cannot authorize launch-critical template fields."""
@@ -1249,6 +1314,12 @@ class LauncherInstallerTests(unittest.TestCase):
             json.dumps({"launcher_artifacts": dict(first)}), encoding="utf-8"
         )
         fixture.apply_crossover_generated_launcher_refresh()
+        refreshed = plistlib.loads(
+            (fixture.app / "Contents/Info.plist").read_bytes()
+        )
+        self.assertIs(
+            refreshed["NSPrefersDisplaySafeAreaCompatibilityMode"], True
+        )
         second_journal = InstallJournal(fixture.bottle_root / "refresh-reinstall.json")
         second_transaction = Transaction(
             second_journal, {"restore_launcher": fixture._restore_snapshots}
@@ -1269,6 +1340,56 @@ class LauncherInstallerTests(unittest.TestCase):
             ).exists()
         )
 
+    def test_reinstall_upgrades_launcher_without_safe_area_preference(self):
+        """Pre-v0.1.4 ownership must remain valid long enough to upgrade."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        first = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.transaction.journal.commit()
+        legacy = fixture.downgrade_to_legacy_safe_area_state(first)
+        (fixture.bottle_root / "ostriv-macos-state.json").write_text(
+            json.dumps({"launcher_artifacts": legacy}), encoding="utf-8"
+        )
+        journal = InstallJournal(fixture.bottle_root / "safe-area-upgrade.json")
+        transaction = Transaction(
+            journal, {"restore_launcher": fixture._restore_snapshots}
+        )
+        transaction.start("reinstall")
+
+        upgraded = fixture.installer.install(transaction, fixture.installation)
+
+        info = plistlib.loads((fixture.app / "Contents/Info.plist").read_bytes())
+        self.assertIs(info["NSPrefersDisplaySafeAreaCompatibilityMode"], True)
+        self.assertIn(
+            "NSPrefersDisplaySafeAreaCompatibilityMode",
+            upgraded["plist_fields"],
+        )
+
+    def test_reinstall_upgrades_refreshed_launcher_without_safe_area_preference(self):
+        """CrossOver's rewrite must not strand a valid pre-v0.1.4 app."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        first = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.transaction.journal.commit()
+        legacy = fixture.downgrade_to_legacy_safe_area_state(first)
+        (fixture.bottle_root / "ostriv-macos-state.json").write_text(
+            json.dumps({"launcher_artifacts": legacy}), encoding="utf-8"
+        )
+        fixture.apply_crossover_generated_launcher_refresh()
+        journal = InstallJournal(
+            fixture.bottle_root / "refreshed-safe-area-upgrade.json"
+        )
+        transaction = Transaction(
+            journal, {"restore_launcher": fixture._restore_snapshots}
+        )
+        transaction.start("reinstall")
+
+        upgraded = fixture.installer.install(transaction, fixture.installation)
+
+        info = plistlib.loads((fixture.app / "Contents/Info.plist").read_bytes())
+        self.assertIs(info["NSPrefersDisplaySafeAreaCompatibilityMode"], True)
+        fixture.installer.verify(fixture.installation, upgraded)
+
     def test_restore_removes_exact_crossover_generated_launcher_refresh(self):
         """Restore must remove the trusted post-restart helper, not leave a dead app."""
         fixture = LauncherFixture()
@@ -1278,6 +1399,19 @@ class LauncherInstallerTests(unittest.TestCase):
         fixture.apply_crossover_generated_launcher_refresh()
 
         fixture.installer.restore(fixture.installation, state)
+
+        self.assertFalse(fixture.app.exists())
+
+    def test_restore_removes_refreshed_legacy_safe_area_launcher(self):
+        """A refreshed pre-v0.1.4 app remains owned and fully removable."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.transaction.journal.commit()
+        legacy = fixture.downgrade_to_legacy_safe_area_state(state)
+        fixture.apply_crossover_generated_launcher_refresh()
+
+        fixture.installer.restore(fixture.installation, legacy)
 
         self.assertFalse(fixture.app.exists())
 
