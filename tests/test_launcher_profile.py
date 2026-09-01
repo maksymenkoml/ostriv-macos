@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ostriv_macos.launcher_runtime import (
+    DisplayModeGuard,
     LauncherConfig,
     ProfileGuard,
     atomic_json,
@@ -55,6 +56,98 @@ class SignalDispatcher:
         handler = self.handlers[signum]
         if callable(handler):
             handler(signum, None)
+
+
+class FakeDisplayModes:
+    """Display-mode boundary fake: a notched panel exposes a 16:10 twin."""
+
+    def __init__(self, current, safe=None, set_result=True):
+        self.current = current
+        self.safe = safe
+        self.set_calls = []
+        self.set_result = set_result
+
+    def get(self):
+        return self.current
+
+    def safe_mode(self):
+        return self.safe
+
+    def set(self, mode):
+        self.set_calls.append(mode)
+        if self.set_result:
+            self.current = mode
+        return self.set_result
+
+
+NOTCHED = {"width": 3456, "height": 2234}
+SAFE = {"width": 3456, "height": 2160}
+
+
+class DisplayModeGuardTests(unittest.TestCase):
+    def test_exit_restores_exact_original_mode(self):
+        """Losing the original height would leave the Mac in the 16:10 mode."""
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "display.json"
+            backend = FakeDisplayModes(NOTCHED, SAFE)
+            guard = DisplayModeGuard(backend, marker)
+
+            guard.switch()
+            guard.restore_once()
+            guard.restore_once()
+
+            self.assertEqual([SAFE, NOTCHED], backend.set_calls)
+            self.assertFalse(marker.exists())
+
+    def test_display_without_safe_mode_is_left_alone(self):
+        """An external monitor has no camera housing and must not be touched."""
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "display.json"
+            backend = FakeDisplayModes({"width": 2560, "height": 1440}, None)
+            guard = DisplayModeGuard(backend, marker)
+
+            guard.switch()
+            guard.restore_once()
+
+            self.assertEqual([], backend.set_calls)
+            self.assertFalse(marker.exists())
+
+    def test_next_launch_recovers_mode_after_a_crash(self):
+        """Without recovery a killed launcher would strand the 16:10 mode."""
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "display.json"
+            marker.write_text(json.dumps({"original": NOTCHED}), encoding="utf-8")
+            backend = FakeDisplayModes(SAFE, None)
+
+            DisplayModeGuard(backend, marker).recover()
+
+            self.assertEqual([NOTCHED], backend.set_calls)
+            self.assertFalse(marker.exists())
+
+    def test_failed_switch_keeps_recovery_marker_for_next_launch(self):
+        """Removing the marker after a failed switch would lose the saved mode."""
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "display.json"
+            backend = FakeDisplayModes(NOTCHED, SAFE, set_result=False)
+            guard = DisplayModeGuard(backend, marker)
+
+            with self.assertRaisesRegex(RuntimeError, "Could not switch display mode"):
+                guard.switch()
+
+            self.assertTrue(marker.exists())
+            self.assertEqual({"original": NOTCHED}, json.loads(marker.read_text()))
+
+    def test_corrupt_marker_raises_without_deleting_it(self):
+        """Deleting a malformed marker would lose the only recovery state."""
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "display.json"
+            marker.write_text("not json", encoding="utf-8")
+            backend = FakeDisplayModes(SAFE, None)
+
+            with self.assertRaisesRegex(RuntimeError, "recovery marker"):
+                DisplayModeGuard(backend, marker).recover()
+
+            self.assertTrue(marker.exists())
 
 
 class ProfileGuardTests(unittest.TestCase):
