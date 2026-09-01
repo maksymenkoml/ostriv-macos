@@ -1381,6 +1381,21 @@ class FakeProfile:
         self.events.append("restore")
 
 
+class FakeDisplay:
+    """Display-guard double. The real guard drives the Mac's actual display mode."""
+
+    switched = False
+
+    def recover(self):
+        return None
+
+    def switch(self):
+        return None
+
+    def restore_once(self):
+        return None
+
+
 class FakeSteam:
     def __init__(self, events, failure=None):
         self.events = events
@@ -1457,6 +1472,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                 runner=FakeGameRunner(events, config.game_log, [b"normal exit\n"]),
                 steam=FakeSteam(events),
                 profile=FakeProfile(events),
+                display=FakeDisplay(),
                 dialog=lambda _message: self.fail("unexpected dialog"),
                 install_handlers=lambda _profile: events.append("handlers"),
             )
@@ -1494,6 +1510,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
             runner=self.fail,
             steam=self.fail,
             profile=self.fail,
+            display=FakeDisplay(),
             dialog=dialogs.append,
         )
 
@@ -1517,6 +1534,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                 runner=runner,
                 steam=FakeSteam(events),
                 profile=FakeProfile(events),
+                display=FakeDisplay(),
                 dialog=lambda _message: self.fail("unexpected dialog"),
                 install_handlers=lambda _profile: events.append("handlers"),
             )
@@ -1553,6 +1571,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     runner=self.fail,
                     steam=FakeSteam(events, failure=failure),
                     profile=FakeProfile(events),
+                    display=FakeDisplay(),
                     dialog=lambda _message: self.fail("main owns failure dialogs"),
                     install_handlers=lambda _profile: events.append("handlers"),
                 )
@@ -1590,6 +1609,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                 runner=runner,
                 steam=FakeSteam(events),
                 profile=FakeProfile(events),
+                display=FakeDisplay(),
                 dialog=lambda _message: self.fail("unexpected dialog"),
                 install_handlers=lambda _profile: None,
             )
@@ -1616,6 +1636,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     runner=runner,
                     steam=FakeSteam(events),
                     profile=FakeProfile(events),
+                    display=FakeDisplay(),
                     dialog=lambda _message: self.fail("unexpected dialog"),
                     install_handlers=lambda _profile: None,
                 )
@@ -1646,6 +1667,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                 runner=runner,
                 steam=FakeSteam(events),
                 profile=FakeProfile(events),
+                display=FakeDisplay(),
                 dialog=lambda _message: self.fail("unexpected dialog"),
                 install_handlers=lambda _profile: None,
             )
@@ -1689,6 +1711,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                         runner=runner,
                         steam=FakeSteam(events),
                         profile=FakeProfile(events),
+                        display=FakeDisplay(),
                         dialog=lambda _message: self.fail("main owns failure dialogs"),
                         install_handlers=lambda _profile: None,
                     )
@@ -1719,6 +1742,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     runner=runner,
                     steam=FakeSteam(events),
                     profile=FakeProfile(events),
+                    display=FakeDisplay(),
                     dialog=lambda _message: self.fail("main owns failure dialogs"),
                     install_handlers=lambda _profile: None,
                 )
@@ -1748,6 +1772,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                 runner=runner,
                 steam=FakeSteam(events),
                 profile=FakeProfile(events),
+                display=FakeDisplay(),
                 dialog=lambda _message: self.fail("unexpected dialog"),
                 install_handlers=lambda _profile: None,
             )
@@ -1774,6 +1799,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     runner=FailingRunner(),
                     steam=FakeSteam(events),
                     profile=FakeProfile(events),
+                    display=FakeDisplay(),
                     dialog=lambda _message: self.fail("main owns failure dialogs"),
                     install_handlers=lambda _profile: None,
                 )
@@ -1802,6 +1828,7 @@ class LauncherOrchestrationTests(unittest.TestCase):
                     runner=runner,
                     steam=FakeSteam(events),
                     profile=FakeProfile(events),
+                    display=FakeDisplay(),
                     dialog=lambda _message: self.fail("unexpected dialog"),
                     install_handlers=lambda _profile: None,
                 )
@@ -1838,6 +1865,10 @@ class LauncherMainTests(unittest.TestCase):
                 runtime,
                 "ProfileGuard",
                 side_effect=lambda *_args: FakeProfile(events),
+            ), patch.object(
+                runtime,
+                "_default_display_guard",
+                side_effect=lambda *_args: FakeDisplay(),
             ), patch.object(
                 runtime,
                 "SteamController",
@@ -1890,6 +1921,10 @@ class LauncherMainTests(unittest.TestCase):
                 runtime,
                 "ProfileGuard",
                 side_effect=lambda *_args: FakeProfile(events),
+            ), patch.object(
+                runtime,
+                "_default_display_guard",
+                side_effect=lambda *_args: FakeDisplay(),
             ), patch.object(
                 runtime, "ColorSyncProfileBackend", return_value=object()
             ), patch.object(
@@ -2049,6 +2084,10 @@ class LauncherMainTests(unittest.TestCase):
                 or FakeProfile(events),
             ), patch.object(
                 runtime,
+                "_default_display_guard",
+                side_effect=lambda *_args: FakeDisplay(),
+            ), patch.object(
+                runtime,
                 "SteamController",
                 side_effect=lambda **_kwargs: events.append("steam-adapter")
                 or FakeSteam(events),
@@ -2101,6 +2140,10 @@ class LauncherMainTests(unittest.TestCase):
                 runtime,
                 "ProfileGuard",
                 side_effect=lambda *_args: FakeProfile(events),
+            ), patch.object(
+                runtime,
+                "_default_display_guard",
+                side_effect=lambda *_args: FakeDisplay(),
             ), patch.object(
                 runtime,
                 "SteamController",
