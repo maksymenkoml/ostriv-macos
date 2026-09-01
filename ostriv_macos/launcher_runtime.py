@@ -1423,6 +1423,21 @@ class DisplayModeGuard:
                 self._restoring = False
 
 
+class InactiveDisplayGuard:
+    """Stand-in where no display can be driven, so the launch is unaffected."""
+
+    switched = False
+
+    def recover(self) -> None:
+        return None
+
+    def switch(self) -> None:
+        return None
+
+    def restore_once(self) -> None:
+        return None
+
+
 class GuardChain:
     """Restore several guards as one, newest boundary first."""
 
@@ -1465,6 +1480,17 @@ def install_signal_handlers(guard: ProfileGuard) -> None:
 
     for signum in previous:
         signal.signal(signum, cleanup_then_resignal)
+
+
+def _default_display_guard(config: LauncherConfig):
+    """Only macOS has a camera housing to avoid, and only macOS has CoreGraphics."""
+    if sys.platform != "darwin":
+        return InactiveDisplayGuard()
+    return DisplayModeGuard(
+        CoreGraphicsDisplayBackend(),
+        _display_recovery_path(config),
+        config.profile_owner_token,
+    )
 
 
 def run_game(config: LauncherConfig, runner):
@@ -1512,11 +1538,7 @@ def run_launcher(
                 config.profile_owner_token,
             )
         if actual_display is None:
-            actual_display = DisplayModeGuard(
-                CoreGraphicsDisplayBackend(),
-                _display_recovery_path(config),
-                config.profile_owner_token,
-            )
+            actual_display = _default_display_guard(config)
         actual_steam = steam or SteamController(
             config=config,
             runner=actual_runner,

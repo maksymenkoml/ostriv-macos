@@ -8,8 +8,10 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from ostriv_macos import launcher_runtime as runtime
 from ostriv_macos.launcher_runtime import (
     DisplayModeGuard,
+    InactiveDisplayGuard,
     LauncherConfig,
     ProfileGuard,
     atomic_json,
@@ -148,6 +150,31 @@ class DisplayModeGuardTests(unittest.TestCase):
                 DisplayModeGuard(backend, marker).recover()
 
             self.assertTrue(marker.exists())
+
+
+class DefaultDisplayGuardTests(unittest.TestCase):
+    def test_off_macos_the_guard_is_inactive(self):
+        """Building the CoreGraphics backend off macOS aborts the whole launch."""
+        with patch.object(runtime.sys, "platform", "linux"):
+            guard = runtime._default_display_guard(object())
+
+        self.assertIsInstance(guard, InactiveDisplayGuard)
+
+    def test_on_macos_the_real_guard_is_built(self):
+        """Losing this branch would silently drop the notch fix on every Mac."""
+        class Config:
+            launcher_log = "/tmp/ostriv-macos/Steam-test.log"
+            profile_owner_token = "token"
+
+        with patch.object(runtime.sys, "platform", "darwin"), patch.object(
+            runtime, "CoreGraphicsDisplayBackend", return_value=object()
+        ):
+            guard = runtime._default_display_guard(Config())
+
+        self.assertIsInstance(guard, DisplayModeGuard)
+        self.assertEqual(
+            Path("/tmp/ostriv-macos/Steam-test.display-recovery.json"), guard.marker
+        )
 
 
 class ProfileGuardTests(unittest.TestCase):
