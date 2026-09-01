@@ -80,9 +80,13 @@ ninja, bison, and python-mako; none of those are player dependencies.
   frame). Launcher handles it. Diagnose with `sample <pid>` of `Menu Helper`.
 - **Never make `opengl32=native` global** — breaks Steam (`vgui2_s.dll`). Scope to
   `AppDefaults\ostriv.exe`.
-- **Never force fullscreen/resolution with a virtual desktop or `displayplacer`** — corrupts
-  winemac display state (1024×768 forever); only a full CrossOver quit+reopen resets it.
-  Fullscreen = the game's own `bFullscreenBorderlessWindow=1`.
+- **Never force fullscreen/resolution with a virtual desktop or `displayplacer`, and never
+  change the display while a bottle is running** — corrupts winemac display state
+  (1024×768 forever); only a full CrossOver quit+reopen resets it. Fullscreen = the game's
+  own `bFullscreenBorderlessWindow=1`. Switching the *display mode* around a launch is the
+  one sanctioned exception: the launcher selects the panel's 16:10 twin before Wine starts
+  and restores it after Wine exits (notch fix, fix 7), which is the same ordering the sRGB
+  profile switch already uses.
 - **Never set `SteamAppId`/`SteamGameId` as bottle env** — crash-loops Steam's CEF browser. Use
   game-scoped `steam_appid.txt`.
 - **Multisampling stays off**, and `settings.data` must exist (absent = MSAA defaults = crash).

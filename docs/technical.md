@@ -224,13 +224,28 @@ Hard-won implementation facts:
 ## Fullscreen and winemac display state
 
 - Fullscreen = the game's own `bFullscreenBorderlessWindow=1`. Nothing else.
-- The generated launcher sets `NSPrefersDisplaySafeAreaCompatibilityMode=true`.
-  On MacBooks with a camera housing, macOS reduces the app's active display area so
-  Ostriv's top-edge UI stays below the notch; displays without a camera housing are
-  unaffected. Reinstall upgrades launchers created before this field was added.
-- **Never** force resolution with a Wine virtual desktop or `displayplacer`: winemac's
-  display state corrupts (reports 1024×768 forever) and only a full CrossOver quit+reopen
-  resets it (`wineserver -k` is not enough).
+- The generated launcher sets `NSPrefersDisplaySafeAreaCompatibilityMode=true`, but that
+  key is **inert for the game** and is kept only because launchers installed with 0.1.4
+  recorded it in `plist_fields`. macOS reads the key from the running process's own main
+  bundle, and the process that owns the game window has none: `lsappinfo` reports its
+  `LSBundlePath` as a bare Wine stub in `$TMPDIR/winetemp-…/ostriv.exe` with a NULL
+  `CFBundleIdentifier`. There is no `Info.plist` to carry the key, so macOS hands the game
+  the whole panel, camera housing included. winemac has no notch handling of its own
+  either — the driver binary contains no safe-area strings.
+- **The notch fix is the display mode.** Every notched panel exposes a 16:10 twin of each
+  mode, exactly the housing's height shorter (3456×2234 → 3456×2160; the active scaled
+  mode 2056×1329 → 2056×1285). `DisplayModeGuard` selects that twin for the duration of
+  the game and restores the original afterwards, mirroring `ProfileGuard`: same
+  switch/restore/recover lifecycle, same signal and atexit handlers, its own recovery
+  marker. Displays with no 16:10 twin — external monitors — are left untouched.
+  The marker lives beside the launcher log rather than in the bottle, because the display
+  mode belongs to the Mac and the bottle's leaves are a validated ownership inventory.
+- **Never** force resolution with a Wine virtual desktop or `displayplacer`, and never
+  change the display **while a bottle is running**: winemac's display state corrupts
+  (reports 1024×768 forever) and only a full CrossOver quit+reopen resets it
+  (`wineserver -k` is not enough). Switching before Wine starts and restoring after it
+  exits — the ordering `ProfileGuard` and `DisplayModeGuard` both use — is safe; the
+  corruption comes from changing the display mid-session.
 
 ## Diagnostics
 

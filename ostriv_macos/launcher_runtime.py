@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 
 SRGB_PROFILE = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+DISPLAY_RECOVERY_SUFFIX = ".display-recovery.json"
 FALLBACK_ERROR_MESSAGE = "Unable to start Ostriv."
 
 
@@ -1132,6 +1133,161 @@ class ColorSyncProfileBackend:
         )
 
 
+def _display_recovery_path(config: "LauncherConfig") -> Path:
+    """Keep display-mode recovery beside the launcher log, not inside the bottle.
+
+    The display mode is a property of the Mac rather than of the bottle, and the
+    bottle's leaves are a validated ownership inventory that this state does not
+    belong in.
+    """
+    log = Path(config.launcher_log)
+    return log.with_name(log.stem + DISPLAY_RECOVERY_SUFFIX)
+
+
+class CoreGraphicsDisplayBackend:
+    """CoreGraphics bridge for notch-safe display modes, macOS-only."""
+
+    SAFE_RATIO = 1.6
+    RATIO_TOLERANCE = 0.005
+
+    def __init__(self) -> None:
+        value = ctypes.c_void_p
+        self._cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        self._cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        for function, result, arguments in [
+            (self._cg.CGMainDisplayID, ctypes.c_uint32, []),
+            (self._cg.CGDisplayCopyAllDisplayModes, value, [ctypes.c_uint32, value]),
+            (self._cg.CGDisplayCopyDisplayMode, value, [ctypes.c_uint32]),
+            (self._cg.CGDisplayModeGetWidth, ctypes.c_size_t, [value]),
+            (self._cg.CGDisplayModeGetHeight, ctypes.c_size_t, [value]),
+            (self._cg.CGDisplayModeGetIODisplayModeID, ctypes.c_int32, [value]),
+            (self._cg.CGDisplayModeRelease, None, [value]),
+            (
+                self._cg.CGDisplaySetDisplayMode,
+                ctypes.c_int32,
+                [ctypes.c_uint32, value, value],
+            ),
+            (self._cf.CFArrayGetCount, ctypes.c_long, [value]),
+            (self._cf.CFArrayGetValueAtIndex, value, [value, ctypes.c_long]),
+            (self._cf.CFRelease, None, [value]),
+            (
+                self._cf.CFDictionaryCreate,
+                value,
+                [
+                    value,
+                    ctypes.POINTER(value),
+                    ctypes.POINTER(value),
+                    ctypes.c_long,
+                    value,
+                    value,
+                ],
+            ),
+        ]:
+            function.restype = result
+            function.argtypes = arguments
+        self._options = self._every_mode_option()
+
+    def _every_mode_option(self):
+        """Ask for scaled modes too; the active mode is usually one of them."""
+        try:
+            key = ctypes.c_void_p.in_dll(
+                self._cg, "kCGDisplayShowDuplicateLowResolutionModes"
+            )
+            true = ctypes.c_void_p.in_dll(self._cf, "kCFBooleanTrue")
+        except ValueError:
+            return None
+        keys = (ctypes.c_void_p * 1)(key)
+        values = (ctypes.c_void_p * 1)(true)
+        return self._cf.CFDictionaryCreate(None, keys, values, 1, None, None)
+
+    @staticmethod
+    def _describe(width, height, mode_id):
+        return {"width": int(width), "height": int(height), "mode_id": int(mode_id)}
+
+    def _read(self, mode):
+        return self._describe(
+            self._cg.CGDisplayModeGetWidth(mode),
+            self._cg.CGDisplayModeGetHeight(mode),
+            self._cg.CGDisplayModeGetIODisplayModeID(mode),
+        )
+
+    def get(self):
+        display = self._cg.CGMainDisplayID()
+        mode = self._cg.CGDisplayCopyDisplayMode(display)
+        if not mode:
+            return None
+        try:
+            return self._read(mode)
+        finally:
+            self._cg.CGDisplayModeRelease(mode)
+
+    def _catalogue(self):
+        display = self._cg.CGMainDisplayID()
+        array = self._cg.CGDisplayCopyAllDisplayModes(display, self._options)
+        if not array:
+            return display, array, []
+        entries = []
+        for index in range(self._cf.CFArrayGetCount(array)):
+            mode = self._cf.CFArrayGetValueAtIndex(array, index)
+            entries.append((mode, self._read(mode)))
+        return display, array, entries
+
+    def _is_safe(self, described):
+        height = described["height"]
+        if height <= 0:
+            return False
+        ratio = described["width"] / height
+        return abs(ratio - self.SAFE_RATIO) <= self.RATIO_TOLERANCE
+
+    def safe_mode(self):
+        """The 16:10 twin of the active mode, or None when there is nothing to do."""
+        current = self.get()
+        if current is None or self._is_safe(current):
+            return None
+        _display, array, entries = self._catalogue()
+        try:
+            candidates = [
+                described
+                for _mode, described in entries
+                if described["width"] == current["width"]
+                and described["height"] < current["height"]
+                and self._is_safe(described)
+            ]
+        finally:
+            if array:
+                self._cf.CFRelease(array)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda described: described["height"])
+
+    def set(self, mode):
+        if not isinstance(mode, dict):
+            return False
+        display, array, entries = self._catalogue()
+        try:
+            match = None
+            for reference, described in entries:
+                if described["mode_id"] == mode.get("mode_id"):
+                    match = reference
+                    break
+                if (
+                    match is None
+                    and described["width"] == mode.get("width")
+                    and described["height"] == mode.get("height")
+                ):
+                    match = reference
+            if match is None:
+                return False
+            return self._cg.CGDisplaySetDisplayMode(display, match, None) == 0
+        finally:
+            if array:
+                self._cf.CFRelease(array)
+
+
 class ProfileGuard:
     """Persist and restore the exact display profile around a game launch."""
 
@@ -1195,6 +1351,95 @@ class ProfileGuard:
                 self._restoring = False
 
 
+class DisplayModeGuard:
+    """Persist and restore the display mode around a game launch.
+
+    A Wine game runs from a bare executable with no application bundle, so it
+    cannot carry NSPrefersDisplaySafeAreaCompatibilityMode and macOS always hands
+    it the whole panel, camera housing included. Selecting the display's 16:10
+    mode keeps the game below the housing instead. Displays without such a mode
+    are left untouched.
+    """
+
+    def __init__(self, backend, marker: Path, owner_token: str = ""):
+        self.backend = backend
+        self.marker = Path(marker)
+        self.owner_token = owner_token
+        self.original = None
+        self.switched = False
+        self.restored = False
+        self._restoring = False
+
+    def _marker_original(self):
+        try:
+            data = json.loads(self.marker.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError) as error:
+            raise RuntimeError("Invalid display recovery marker") from error
+        if not isinstance(data, dict) or "original" not in data:
+            raise RuntimeError("Invalid display recovery marker")
+        if self.owner_token and data.get("owner") != self.owner_token:
+            raise RuntimeError("Invalid display recovery marker")
+        original = data["original"]
+        if not isinstance(original, dict):
+            raise RuntimeError("Invalid display recovery marker")
+        return original
+
+    def recover(self) -> None:
+        if not self.marker.exists():
+            return
+        original = self._marker_original()
+        if not self.backend.set(original):
+            raise RuntimeError("Could not restore display mode")
+        self.marker.unlink()
+        _fsync_directory(self.marker.parent)
+
+    def switch(self) -> None:
+        target = self.backend.safe_mode()
+        if target is None:
+            return
+        self.original = self.backend.get()
+        marker = {"original": self.original}
+        if self.owner_token:
+            marker["owner"] = self.owner_token
+        atomic_json(self.marker, marker)
+        if not self.backend.set(target):
+            raise RuntimeError("Could not switch display mode")
+        self.switched = True
+
+    def restore_once(self) -> None:
+        if self.restored or self._restoring:
+            return
+        self._restoring = True
+        try:
+            if self.switched or self.marker.exists():
+                original = self.original if self.switched else self._marker_original()
+                if not self.backend.set(original):
+                    raise RuntimeError("Could not restore display mode")
+                self.marker.unlink()
+                _fsync_directory(self.marker.parent)
+            self.restored = True
+        finally:
+            if not self.restored:
+                self._restoring = False
+
+
+class GuardChain:
+    """Restore several guards as one, newest boundary first."""
+
+    def __init__(self, *guards):
+        self.guards = [guard for guard in guards if guard is not None]
+
+    def restore_once(self) -> None:
+        failure = None
+        for guard in self.guards:
+            try:
+                guard.restore_once()
+            except Exception as error:  # keep restoring the remaining guards
+                failure = failure or error
+        if failure is not None:
+            raise failure
+
+
 def install_signal_handlers(guard: ProfileGuard) -> None:
     """Restore profiles during normal exit and preserve SIGINT/SIGTERM semantics."""
     def restore_at_exit() -> None:
@@ -1235,6 +1480,7 @@ def run_launcher(
     runner=None,
     steam=None,
     profile=None,
+    display=None,
     dialog=None,
     install_handlers=None,
 ) -> int:
@@ -1252,6 +1498,7 @@ def run_launcher(
 
     logger = None
     actual_profile = profile
+    actual_display = display
     final_state = "failed"
     try:
         actual_log_factory = log_factory or _create_launcher_log
@@ -1262,6 +1509,12 @@ def run_launcher(
                 ColorSyncProfileBackend(),
                 Path(config.recovery_marker),
                 SRGB_PROFILE,
+                config.profile_owner_token,
+            )
+        if actual_display is None:
+            actual_display = DisplayModeGuard(
+                CoreGraphicsDisplayBackend(),
+                _display_recovery_path(config),
                 config.profile_owner_token,
             )
         actual_steam = steam or SteamController(
@@ -1277,14 +1530,23 @@ def run_launcher(
         )
         logger.info("launcher boundary=recovery status=start")
         actual_profile.recover()
+        actual_display.recover()
         logger.info("launcher boundary=recovery status=OK")
         logger.info("launcher boundary=steam_readiness status=start")
         actual_steam.ensure_ready()
         logger.info("launcher boundary=steam_readiness status=OK")
-        (install_handlers or install_signal_handlers)(actual_profile)
+        (install_handlers or install_signal_handlers)(
+            GuardChain(actual_display, actual_profile)
+        )
         logger.info("launcher boundary=profile_switch status=start")
         actual_profile.switch()
         logger.info("launcher boundary=profile_switch status=OK")
+        logger.info("launcher boundary=display_switch status=start")
+        actual_display.switch()
+        logger.info(
+            "launcher boundary=display_switch status=OK switched=%s",
+            actual_display.switched,
+        )
 
         game_log = Path(config.game_log)
         generation = capture_log_generation(game_log)
@@ -1335,12 +1597,11 @@ def run_launcher(
     finally:
         try:
             try:
-                if actual_profile is not None:
-                    actual_profile.restore_once()
+                GuardChain(actual_display, actual_profile).restore_once()
             except Exception:
                 final_state = "failed"
                 if logger is not None:
-                    logger.exception("display profile restoration failed")
+                    logger.exception("display restoration failed")
                 raise
             finally:
                 if logger is not None:
