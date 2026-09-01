@@ -1174,10 +1174,21 @@ class CoreGraphicsDisplayBackend:
             (self._cf.CFArrayGetCount, ctypes.c_long, [value]),
             (self._cf.CFArrayGetValueAtIndex, value, [value, ctypes.c_long]),
             (self._cf.CFRelease, None, [value]),
+            (
+                self._cf.CFDictionaryCreate,
+                value,
+                [
+                    value,
+                    ctypes.POINTER(value),
+                    ctypes.POINTER(value),
+                    ctypes.c_long,
+                    value,
+                    value,
+                ],
+            ),
         ]:
             function.restype = result
             function.argtypes = arguments
-        self._cf.CFDictionaryCreate.restype = value
         self._options = self._every_mode_option()
 
     def _every_mode_option(self):
