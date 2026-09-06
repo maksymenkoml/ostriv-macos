@@ -1,3 +1,5 @@
+English | [Українська](technical.uk.md)
+
 # Technical notes — every bug and fix
 
 Status: **solved** — GPU-accelerated, fullscreen, 30–60 fps.

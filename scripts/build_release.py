@@ -30,8 +30,10 @@ PLAYER_PATHS = (
     Path("prebuilt/dxil.dll"),
     Path("prebuilt/libwinpthread-1.dll"),
     Path("prebuilt/README.md"),
+    Path("prebuilt/README.uk.md"),
     Path("assets/settings.data"),
     Path("README.md"),
+    Path("README.uk.md"),
     Path("LICENSE"),
 )
 _IGNORED_NAMES = {"__pycache__"}
