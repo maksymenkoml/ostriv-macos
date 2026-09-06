@@ -1,6 +1,7 @@
 import hashlib
 import io
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -18,6 +19,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_FILES = {
     "LICENSE",
     "README.md",
+    "README.uk.md",
     "assets/settings.data",
     "ostriv_macos/__init__.py",
     "ostriv_macos/cli.py",
@@ -30,6 +32,7 @@ EXPECTED_FILES = {
     "patch.py",
     "payload-manifest.json",
     "prebuilt/README.md",
+    "prebuilt/README.uk.md",
     "prebuilt/dxil.dll",
     "prebuilt/libgallium_wgl.dll",
     "prebuilt/libwinpthread-1.dll",
@@ -540,6 +543,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("actions/upload-release-asset", release)
 
 
+DOWNLOAD_LINK = (
+    "https://github.com/maksymenkoml/ostriv-macos/releases/latest/download/"
+    "ostriv-macos-player.zip"
+)
+TRANSLATED_DOCUMENTS = (
+    ("README.md", "README.uk.md"),
+    ("prebuilt/README.md", "prebuilt/README.uk.md"),
+    ("docs/technical.md", "docs/technical.uk.md"),
+)
+
+
+def _heading_levels(text):
+    return [
+        line.split(" ", 1)[0]
+        for line in text.splitlines()
+        if re.match(r"^#{2,6} ", line)
+    ]
+
+
+def _troubleshooting_rows(text):
+    return [line for line in text.splitlines() if line.startswith("| **")]
+
+
 class PlayerDocumentationTests(unittest.TestCase):
     def test_technical_launcher_sequence_puts_readiness_before_profile_switch(self):
         technical = (REPOSITORY_ROOT / "docs/technical.md").read_text(encoding="utf-8")
@@ -613,6 +639,76 @@ class PlayerDocumentationTests(unittest.TestCase):
         self.assertIn("hydrated DLLs", readme)
         self.assertIn("release asset", readme)
         self.assertIn("repository contributors only", readme)
+
+
+class TranslatedDocumentationTests(unittest.TestCase):
+    def _read(self, relative):
+        return (REPOSITORY_ROOT / relative).read_text(encoding="utf-8")
+
+    def test_each_translation_pair_switches_language_on_its_first_line(self):
+        # Catches a translation that exists but cannot be reached from its original.
+        for original, translated in TRANSLATED_DOCUMENTS:
+            original_first = self._read(original).splitlines()[0]
+            translated_first = self._read(translated).splitlines()[0]
+            self.assertIn(
+                "[Українська]({})".format(Path(translated).name), original_first, original
+            )
+            self.assertIn(
+                "[English]({})".format(Path(original).name), translated_first, translated
+            )
+
+    def test_translations_keep_the_section_outline_of_their_originals(self):
+        # Catches a section added to or removed from an original without its translation.
+        for original, translated in TRANSLATED_DOCUMENTS:
+            self.assertEqual(
+                _heading_levels(self._read(original)),
+                _heading_levels(self._read(translated)),
+                translated,
+            )
+
+    def test_documentation_links_resolve_to_files_in_the_repository(self):
+        # Catches a document linking to a counterpart that was never written or was moved.
+        for pair in TRANSLATED_DOCUMENTS:
+            for relative in pair:
+                text = self._read(relative)
+                for target in re.findall(r"\]\(([^)#:]+\.md)(?:#[^)]*)?\)", text):
+                    path = REPOSITORY_ROOT / Path(relative).parent / target
+                    self.assertTrue(path.is_file(), "{} -> {}".format(relative, target))
+
+    def test_ukrainian_readme_leads_with_the_same_ordered_player_path(self):
+        # Catches the translation reordering or burying the player steps.
+        readme = self._read("README.uk.md")
+        steps = [
+            readme.index(DOWNLOAD_LINK),
+            readme.index("`python3 patch.py`"),
+            readme.index("Ostriv (patched)"),
+        ]
+        self.assertEqual(steps, sorted(steps))
+        self.assertLess(steps[-1], 1500)
+        self.assertEqual(1, readme.count(DOWNLOAD_LINK))
+        self.assertEqual(1, readme.count("`python3 patch.py`"))
+        self.assertGreater(readme.index("git clone"), steps[-1])
+        self.assertGreater(readme.lower().index("git lfs"), steps[-1])
+        self.assertGreater(readme.index("scripts/build-driver.sh"), steps[-1])
+
+    def test_ukrainian_readme_keeps_every_troubleshooting_case_and_the_log_path(self):
+        # Catches the translated failure map dropping a case or the literal tool output.
+        english = _troubleshooting_rows(self._read("README.md"))
+        readme = self._read("README.uk.md")
+        rows = _troubleshooting_rows(readme)
+        self.assertEqual(len(english), len(rows))
+        for row in rows:
+            self.assertEqual(3, len(row.split("|")) - 1, row)
+        self.assertEqual(1, sum("Package: FAILED" in row for row in rows))
+        self.assertIn("python3 patch.py --diagnose", readme)
+        self.assertIn("~/Library/Logs/ostriv-macos/install.log", readme)
+
+    def test_ukrainian_prebuilt_readme_keeps_the_player_asset_distinction(self):
+        # Catches the translation reintroducing Git LFS into the player's path.
+        readme = self._read("prebuilt/README.uk.md")
+        self.assertIn("Git LFS", readme)
+        self.assertIn("../.gitattributes", readme)
+        self.assertIn("../scripts/build-driver.sh", readme)
 
 
 if __name__ == "__main__":

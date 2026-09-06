@@ -1234,8 +1234,17 @@ class GlobalConstraintTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         readme = (root / "README.md").read_text(encoding="utf-8")
         player = readme.split("## Development", 1)[0]
-        surfaces = (player, (root / "prebuilt/README.md").read_text(encoding="utf-8"))
+        ukrainian = (root / "README.uk.md").read_text(encoding="utf-8")
+        self.assertIn("## Розробка", ukrainian)
+        ukrainian_player = ukrainian.split("## Розробка", 1)[0]
+        surfaces = (
+            player,
+            ukrainian_player,
+            (root / "prebuilt/README.md").read_text(encoding="utf-8"),
+            (root / "prebuilt/README.uk.md").read_text(encoding="utf-8"),
+        )
         self.assertIn("Apple Silicon", player)
+        self.assertIn("Apple Silicon", ukrainian_player)
         for surface in surfaces:
             for line in surface.splitlines():
                 lowered = line.lower()
@@ -1247,7 +1256,8 @@ class GlobalConstraintTests(unittest.TestCase):
                     continue
                 self.assertRegex(
                     lowered,
-                    r"(?:not supported|unsupported|does not support|no .{0,24}support)",
+                    r"(?:not supported|unsupported|does not support|no .{0,24}support"
+                    r"|не підтрим)",
                 )
 
 

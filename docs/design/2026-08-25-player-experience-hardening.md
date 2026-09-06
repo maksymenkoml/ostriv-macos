@@ -1,6 +1,7 @@
 # Player Experience Hardening Design
 
-**Status:** Approved in conversation on 2026-08-25
+**Status:** Approved in conversation on 2026-08-25. Shipped in v0.1.0; this file records the
+approved intent, while [technical.md](../technical.md) documents the current behaviour.
 
 ## Purpose
 

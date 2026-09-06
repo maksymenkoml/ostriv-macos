@@ -1,3 +1,5 @@
+English | [Українська](README.uk.md)
+
 # Prebuilt Mesa driver (patched)
 
 Drop-in DLLs, placed next to `ostriv.exe` by `../patch.py`:

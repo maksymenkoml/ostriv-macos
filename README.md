@@ -1,3 +1,5 @@
+English | [Українська](README.uk.md)
+
 # Ostriv on Mac (Apple Silicon)
 
 [Ostriv](https://store.steampowered.com/app/773790/Ostriv/) crashes on launch under

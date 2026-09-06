@@ -56,6 +56,11 @@ the sibling `cs2-macos-patcher`, which rewrites .NET IL).
 - `tests/` — deterministic unit, fake-process integration, rollback, launcher, CLI snapshot, and
   release-artifact coverage. Tests must never launch installed CrossOver, Steam, or Ostriv.
 - `docs/technical.md` — every bug, fix, and dead end in detail.
+- `README.uk.md`, `docs/technical.uk.md`, `prebuilt/README.uk.md` — Ukrainian twins of the
+  player and technical docs. Both READMEs ship in the player ZIP. `tests/test_release.py`
+  enforces the first-line language switch, section-outline parity, and link integrity.
+- `docs/design/` — dated, ADR-style design specs for approved work (intent at the time, not
+  current behaviour). Implementation plans are never committed.
 
 ## Commands
 
@@ -100,6 +105,12 @@ ninja, bison, and python-mako; none of those are player dependencies.
   System-Settings profile picks occupy the custom-profile slot (key `"1"`) — save and re-apply on
   restore, never bare-reset (that reverts to factory, losing the user's choice).
 - **Keep the DLLs in Git LFS**; pin Mesa `26.1.3` (patch hunks assume it).
+- **Translations move with their originals**: a change to `README.md`, `docs/technical.md`, or
+  `prebuilt/README.md` lands in the same commit as the matching change to its `.uk.md` twin.
+  The parity tests catch outline and link drift only, not stale wording.
+- **Design specs go to `docs/design/<YYYY-MM-DD>-<topic>.md`**; never create
+  `docs/superpowers/` and never commit implementation plans (keep them in the scratchpad or
+  the PR description).
 - `settings.data` is a typed key-value blob (`fmt=5`); bools are 1 byte after the key name; no
   absolute resolution field — resolution is `flResolutionCoef × detected monitor`.
 
