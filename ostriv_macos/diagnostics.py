@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -11,11 +12,14 @@ from typing import IO, Mapping, Optional, Sequence
 ALLOWED_EXTERNAL_EXECUTABLES = frozenset(
     {"cxbottle", "cxmenu", "defaults", "lsregister", "mdfind", "ps", "wine"}
 )
-ALLOWED_EXTERNAL_ENVIRONMENT = frozenset({"CX_BOTTLE_PATH"})
+ALLOWED_EXTERNAL_ENVIRONMENT = frozenset({"CX_BOTTLE_PATH", "LC_ALL"})
 _SENSITIVE_OPTIONS = frozenset(
     {"--api-key", "--password", "--secret", "--token", "/d"}
 )
 _DIAGNOSTIC_LIMIT = 2048
+# ntdll prints this (never localized) when a wine process meets a wineserver from another
+# CrossOver version, typically a Steam bottle left open through an older or newer copy.
+_WINE_VERSION_MISMATCH = re.compile(r"wine client error:[0-9a-fA-F]*: version mismatch")
 
 
 class PatchError(Exception):
@@ -186,6 +190,15 @@ class CommandRunner:
             stderr,
             diagnostic,
         )
+        if result.returncode != 0 and _WINE_VERSION_MISMATCH.search(
+            "{}\n{}".format(stdout, stderr)
+        ):
+            self.logger.error("command wine version mismatch %s", diagnostic)
+            raise PatchError(
+                "command.wine_version_mismatch",
+                "Another copy of CrossOver is still running this bottle.",
+                diagnostic,
+            )
         self.logger.info("command result %s", diagnostic)
         return decoded
 

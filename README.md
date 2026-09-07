@@ -29,6 +29,7 @@ modified, and the installation is reversible.
 | **CrossOver/game not found** | Install Ostriv in a CrossOver Steam bottle, then rerun the patcher. |
 | **Steam timeout** | Quit CrossOver completely, reopen it, then rerun the patcher. |
 | **Graphics-context failure** | Quit CrossOver completely, then open the patched launcher again. |
+| **Several CrossOver copies** | Quit every copy of CrossOver and Steam, end leftover `wine`/`wineserver` processes in Activity Monitor, then open only the current CrossOver and rerun the patcher. |
 | **Unexpected failure** | Run `python3 patch.py --diagnose` and attach the installer log to the bug report. |
 
 Installer log: `~/Library/Logs/ostriv-macos/install.log`

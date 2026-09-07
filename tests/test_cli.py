@@ -400,6 +400,19 @@ class CliTests(unittest.TestCase):
                 "Installation: FAILED",
             ),
             (
+                "wine version mismatch",
+                FakeServices(
+                    operation_error=PatchError(
+                        "command.wine_version_mismatch",
+                        "Another copy of CrossOver is still running this bottle.",
+                        "wine client error:0: version mismatch 842/841",
+                    )
+                ),
+                "",
+                "Quit every copy of CrossOver and Steam completely, then try again.",
+                "Installation: FAILED",
+            ),
+            (
                 "CrossOver timeout",
                 FakeServices(
                     operation_error=PatchError(

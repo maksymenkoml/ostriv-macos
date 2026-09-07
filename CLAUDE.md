@@ -96,6 +96,11 @@ ninja, bison, and python-mako; none of those are player dependencies.
   game-scoped `steam_appid.txt`.
 - **Multisampling stays off**, and `settings.data` must exist (absent = MSAA defaults = crash).
 - **Bottle env overrides shell env** — `env VAR=… wine …` does nothing; edit `cxbottle.conf`.
+- **Every `wine … reg` call goes through `WineRegistry._run`, which forces `LC_ALL=C`** —
+  `reg.exe` localizes "unable to find" (CP866 Ukrainian on a `uk_UA` Mac) and that text is the
+  only "value absent" signal. Never parse other CrossOver output by English wording either.
+- **Never require CrossOver's own Ostriv helper app** — after a Steam install it is sometimes
+  missing; the launcher icon falls back to CrossOver's `exeIcon.icns`.
 - **cxmenu specifics**: a raw `--command` runs through `sh` (shell command, not a Windows path);
   `[` `]` in an entry name break launcher-app generation (use parentheses); cxmenu registers the
   menu but the `.app` must be materialized from CrossOver's `Menu Helper.cpbz2` template with

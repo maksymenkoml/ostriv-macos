@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from . import __version__
-from .diagnostics import CommandRunner, PatchError, command_failure_detail
+from .diagnostics import CommandResult, CommandRunner, PatchError, command_failure_detail
 from .discovery import Bottle, GameInstallation, is_supported_game_directory
 from .payload import PayloadEntry, validate_payload
 
@@ -965,11 +965,24 @@ class _RestoreRecoveryPlan:
     has_final_unlink_snapshot: bool
 
 
+# reg.exe localizes its diagnostics (CrossOver 26.3 under LANG=uk_UA prints CP866 Ukrainian),
+# and the only signal that a value is absent is that text. A wine process reads LC_ALL at
+# start, so forcing the C locale keeps the diagnostics English without touching the bottle.
+WINE_TEXT_ENVIRONMENT = {"LC_ALL": "C"}
+
+
 class WineRegistry:
     def __init__(self, wine: Path, bottle: Bottle, runner: CommandRunner):
         self.wine = wine
         self.bottle = bottle
         self.runner = runner
+
+    def _run(self, arguments: Sequence[str]) -> CommandResult:
+        return self.runner.run(
+            self._base() + list(arguments),
+            timeout=90.0,
+            environment=dict(WINE_TEXT_ENVIRONMENT),
+        )
 
     def _base(self) -> List[str]:
         return (
@@ -1001,9 +1014,7 @@ class WineRegistry:
             )
         )
         for _attempt in range(2):
-            result = self.runner.run(
-                self._base() + ["query", key, "/v", value], timeout=90.0
-            )
+            result = self._run(["query", key, "/v", value])
             if result.returncode != 0:
                 if self._missing(result):
                     return None
@@ -1024,10 +1035,7 @@ class WineRegistry:
     def set(self, key: str, value: str, data: str) -> None:
         last_detail = ""
         for _attempt in range(2):
-            result = self.runner.run(
-                self._base() + ["add", key, "/v", value, "/d", data, "/f"],
-                timeout=90.0,
-            )
+            result = self._run(["add", key, "/v", value, "/d", data, "/f"])
             last_detail = command_failure_detail(result)
             if result.returncode == 0:
                 try:
@@ -1043,10 +1051,7 @@ class WineRegistry:
     def delete(self, key: str, value: str) -> None:
         last_detail = ""
         for _attempt in range(2):
-            result = self.runner.run(
-                self._base() + ["delete", key, "/v", value, "/f"],
-                timeout=90.0,
-            )
+            result = self._run(["delete", key, "/v", value, "/f"])
             last_detail = command_failure_detail(result)
             if result.returncode == 0:
                 try:

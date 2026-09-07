@@ -871,13 +871,9 @@ class LauncherInstaller:
                     recreate_command = "exec /usr/bin/env python3 {}".format(
                         installation.bottle.root.resolve() / RUNTIME_NAME
                     )
-                menu_icon = self._find_game_icon(installation, app)
-                if menu_icon is None:
-                    raise PatchError(
-                        "restore.launcher_menu",
-                        "Restore failed.",
-                        "Verified Ostriv icon is unavailable during menu rollback",
-                    )
+                menu_icon = self._launcher_icon_source(
+                    installation, app, "restore.launcher_menu", "Restore failed."
+                )
                 result = self._run_cxmenu(
                     installation,
                     self._menu_create_command(
@@ -1695,7 +1691,9 @@ class LauncherInstaller:
                 if (
                     properties.get("CXHelperAppBottleName") != installation.bottle.name
                     or not isinstance(command, str)
-                    or not command.rstrip('"').lower().endswith(("/ostriv.lnk", "/ostriv.url"))
+                    or not command.rstrip('"').lower().endswith(
+                        ("/ostriv.lnk", "/ostriv.url", "/ostriv.exe")
+                    )
                 ):
                     continue
                 icon = candidate / "Contents/Resources/CrossOverHelper.icns"
@@ -2018,10 +2016,41 @@ class LauncherInstaller:
         return dict(actual) == expected
 
     @staticmethod
-    def _crossover_default_icon_digest(installation: GameInstallation) -> str:
-        return _file_digest(
+    def _crossover_default_icon(installation: GameInstallation) -> Path:
+        return (
             installation.bottle.crossover.app.resolve()
             / "Contents/Resources/exeIcon.icns"
+        )
+
+    @classmethod
+    def _crossover_default_icon_digest(cls, installation: GameInstallation) -> str:
+        return _file_digest(cls._crossover_default_icon(installation))
+
+    def _launcher_icon_source(
+        self,
+        installation: GameInstallation,
+        app: Path,
+        error_code: str,
+        player_message: str,
+    ) -> Path:
+        """Prefer the icon of CrossOver's own Ostriv helper; fall back to CrossOver's default.
+
+        CrossOver does not always create the regular Ostriv helper app after a Steam install,
+        and its sync already swaps launcher icons to ``exeIcon.icns``, so that default is an
+        accepted icon everywhere the launcher is verified.
+        """
+        icon = self._find_game_icon(installation, app)
+        if icon is not None:
+            return icon
+        default_icon = self._crossover_default_icon(installation)
+        if default_icon.is_file():
+            return default_icon
+        raise PatchError(
+            error_code,
+            player_message,
+            "No verified Ostriv CrossOver icon was found for {}".format(
+                installation.bottle.name
+            ),
         )
 
     def _current_owned_app_inventory(
@@ -2271,15 +2300,9 @@ class LauncherInstaller:
                 "CFBundleIconFile": "CrossOverHelper.icns",
                 SAFE_AREA_PLIST_FIELD: True,
             }
-            icon_source = self._find_game_icon(installation, app)
-            if icon_source is None:
-                raise PatchError(
-                    "install.launcher_icon",
-                    "Installation failed.",
-                    "No verified Ostriv CrossOver icon was found for {}".format(
-                        installation.bottle.name
-                    ),
-                )
+            icon_source = self._launcher_icon_source(
+                installation, app, "install.launcher_icon", "Installation failed."
+            )
 
             self._journal_file(
                 transaction,

@@ -117,6 +117,21 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(os.environ.get("PATH"), command_environment.get("PATH"))
 
     @patch("ostriv_macos.diagnostics.subprocess.run")
+    def test_command_runner_can_force_the_c_locale_for_wine_output(self, run):
+        """A localized reg.exe prints CP866 Ukrainian text the registry parser cannot read."""
+        run.return_value = subprocess.CompletedProcess(["wine"], 0, b"", b"")
+
+        CommandRunner().run(
+            ["wine", "--bottle", "Steam", "reg", "query", "HKCU"],
+            timeout=2,
+            environment={"LC_ALL": "C"},
+        )
+
+        command_environment = run.call_args.kwargs.get("env", {})
+        self.assertEqual("C", command_environment.get("LC_ALL"))
+        self.assertEqual(os.environ.get("PATH"), command_environment.get("PATH"))
+
+    @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_command_runner_rejects_unlisted_environment_overrides(self, run):
         """A generic environment escape hatch would bypass the command allowlist."""
         run.return_value = subprocess.CompletedProcess(["cxmenu"], 0, b"", b"")
@@ -140,6 +155,39 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual("CrossOver took too long to respond.", caught.exception.player_message)
         self.assertIn("timeout=90", caught.exception.detail)
         self.assertIn("partial output", caught.exception.detail)
+
+    @patch("ostriv_macos.diagnostics.subprocess.run")
+    def test_wine_version_mismatch_is_typed_with_one_player_action(self, run):
+        """Two CrossOver copies sharing a bottle fail every wine command the same way."""
+        run.return_value = subprocess.CompletedProcess(
+            ["wine", "reg", "query"],
+            1,
+            b"",
+            b"wine client error:0: version mismatch 842/841.\n"
+            b"Your wineserver binary was not upgraded correctly,\n"
+            b"or you have an older one somewhere in your PATH.\n"
+            b"Or maybe the wrong wineserver is still running?\n",
+        )
+
+        with self.assertRaises(PatchError) as caught:
+            CommandRunner().run(["wine", "reg", "query"], timeout=90)
+
+        self.assertEqual("command.wine_version_mismatch", caught.exception.code)
+        self.assertEqual(
+            "Another copy of CrossOver is still running this bottle.",
+            caught.exception.player_message,
+        )
+        self.assertIn("version mismatch 842/841", caught.exception.detail)
+
+    @patch("ostriv_macos.diagnostics.subprocess.run")
+    def test_other_wine_failures_are_returned_for_the_caller_to_retry(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            ["wine", "reg", "query"], 1, b"", b"wine: selected bottle not found\n"
+        )
+
+        result = CommandRunner().run(["wine", "reg", "query"], timeout=90)
+
+        self.assertEqual(1, result.returncode)
 
     @patch("ostriv_macos.diagnostics.subprocess.run")
     def test_command_runner_logs_bounded_decoded_result_and_redacts_sensitive_data(

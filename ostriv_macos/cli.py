@@ -393,6 +393,8 @@ def _player_action(error: PatchError) -> str:
         )
     if code == "install.crossover_running":
         return "Quit CrossOver completely, then run the patcher again."
+    if code == "command.wine_version_mismatch":
+        return "Quit every copy of CrossOver and Steam completely, then try again."
     if code == "command.timeout":
         return (
             "CrossOver took too long to respond. "
