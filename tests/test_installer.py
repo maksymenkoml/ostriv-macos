@@ -33,6 +33,13 @@ from ostriv_macos.payload import PayloadEntry
 
 REGISTRY_KEY = r"HKCU\Software\Wine\AppDefaults\ostriv.exe\DllOverrides"
 REGISTRY_VALUE = "opengl32"
+# CrossOver 26.3 under LANG=uk_UA.UTF-8 writes this CP866 line for a missing key; the
+# installer sees it after its lossy UTF-8 decode.
+LOCALIZED_REG_MISSING = (
+    "reg: Не вдалося знайти вказаний ключ реєстру\r\n".encode("cp866").decode(
+        "utf-8", errors="replace"
+    )
+)
 DRIVERS = ("opengl32.dll", "libgallium_wgl.dll", "dxil.dll", "libwinpthread-1.dll")
 
 
@@ -73,10 +80,13 @@ class FakeRunner:
         self.query_failures_after_delete = 0
         self.query_results = []
         self.status_result = CommandResult(0, "running\n", "")
+        self.localized = False
+        self.environments = []
 
     def run(self, argv, timeout=None, environment=None):
         argv = list(argv)
         self.calls.append((argv, timeout))
+        self.environments.append(environment)
         if argv[-1:] == ["--status"]:
             return self.status_result
         if "reg" not in argv:
@@ -92,6 +102,8 @@ class FakeRunner:
                 self.query_failures -= 1
                 return CommandResult(2, "", "\ufffd registry query failed")
             if identity not in self.registry:
+                if self.localized and (environment or {}).get("LC_ALL") != "C":
+                    return CommandResult(1, LOCALIZED_REG_MISSING, "")
                 return CommandResult(
                     1,
                     "",
@@ -3362,6 +3374,47 @@ class InstallerTests(unittest.TestCase):
                 fixture.bin_dir / "wine", fixture.bottle, fixture.runner
             )
             self.assertEqual("builtin", registry.query(REGISTRY_KEY, REGISTRY_VALUE))
+        finally:
+            fixture.cleanup()
+
+    def test_registry_forces_the_c_locale_so_a_localized_reg_reports_missing_values(self):
+        """Every reg call must run under LC_ALL=C; a Ukrainian reg.exe otherwise hides absence."""
+        fixture = FakeBottleFixture(prior_registry=None)
+        try:
+            fixture.runner.localized = True
+            registry = WineRegistry(
+                fixture.bin_dir / "wine", fixture.bottle, fixture.runner
+            )
+
+            self.assertIsNone(registry.query(REGISTRY_KEY, REGISTRY_VALUE))
+            registry.set(REGISTRY_KEY, REGISTRY_VALUE, "native")
+            registry.delete(REGISTRY_KEY, REGISTRY_VALUE)
+
+            reg_environments = [
+                environment
+                for (argv, _timeout), environment in zip(
+                    fixture.runner.calls, fixture.runner.environments
+                )
+                if "reg" in argv
+            ]
+            self.assertEqual(5, len(reg_environments))
+            for environment in reg_environments:
+                self.assertEqual("C", (environment or {}).get("LC_ALL"))
+        finally:
+            fixture.cleanup()
+
+    def test_install_and_restore_succeed_on_a_bottle_with_a_localized_wine(self):
+        """A fully Ukrainian macOS/CrossOver setup must not fail Install at the registry step."""
+        fixture = FakeBottleFixture(prior_registry=None)
+        try:
+            fixture.runner.localized = True
+            installer = fixture.installer()
+
+            installer.install(fixture.installation, fixture.payload)
+            self.assertEqual("native", fixture.registry[(REGISTRY_KEY, REGISTRY_VALUE)])
+
+            installer.restore(fixture.installation)
+            self.assertNotIn((REGISTRY_KEY, REGISTRY_VALUE), fixture.registry)
         finally:
             fixture.cleanup()
 

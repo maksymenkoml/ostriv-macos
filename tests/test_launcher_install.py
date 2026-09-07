@@ -1132,6 +1132,49 @@ class LauncherInstallerTests(unittest.TestCase):
             fixture.app.with_name("." + fixture.app.name + ".ostriv-macos.previous").exists()
         )
 
+    def test_install_without_a_regular_ostriv_helper_uses_crossovers_default_icon(self):
+        """CrossOver sometimes creates no Ostriv helper app; Install must still complete."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        shutil.rmtree(fixture.game_launcher)
+        default_icon = fixture.crossover_app / "Contents/Resources/exeIcon.icns"
+
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.installer.verify(fixture.installation, state)
+
+        self.assertEqual(
+            default_icon.read_bytes(),
+            (fixture.app / "Contents/Resources/CrossOverHelper.icns").read_bytes(),
+        )
+        self.assertEqual(digest(default_icon.read_bytes()), state["icon_sha256"])
+        create = next(
+            argv for argv, _timeout in fixture.runner.calls if "--create" in argv
+        )
+        self.assertEqual(str(default_icon.resolve()), create[create.index("--icon") + 1])
+
+    def test_install_accepts_a_helper_that_targets_ostriv_exe_as_icon_source(self):
+        """A player-made helper entry points at ostriv.exe rather than Steam's Ostriv.lnk."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        with (fixture.game_launcher / "Contents/Info.plist").open("wb") as stream:
+            plistlib.dump(
+                {
+                    "CXHelperAppBottleName": fixture.bottle.name,
+                    "CrossOverHelperCommand": (
+                        '"C:/Program Files (x86)/Steam/steamapps/common/Ostriv/ostriv.exe"'
+                    ),
+                },
+                stream,
+            )
+
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.installer.verify(fixture.installation, state)
+
+        self.assertEqual(
+            b"ostriv-icon",
+            (fixture.app / "Contents/Resources/CrossOverHelper.icns").read_bytes(),
+        )
+
     def test_materializes_verified_plist_runtime_config_and_icon(self):
         """A launcher with drifted identity, runtime, config, or icon is deleted or fails later."""
         fixture = LauncherFixture()
@@ -1716,6 +1759,39 @@ class LauncherInstallerTests(unittest.TestCase):
 
         self.assertEqual(before, launcher_module._captured_tree(app))
         self.assertEqual(state["runtime_sha256"], digest(fixture.runtime.read_bytes()))
+
+    def test_failed_restore_recreates_menu_with_the_default_icon_without_a_helper(self):
+        """Menu rollback must not depend on a helper app CrossOver never created."""
+        fixture = LauncherFixture()
+        self.addCleanup(fixture.cleanup)
+        shutil.rmtree(fixture.game_launcher)
+        default_icon = fixture.crossover_app / "Contents/Resources/exeIcon.icns"
+        state = fixture.installer.install(fixture.transaction, fixture.installation)
+        fixture.transaction.journal.commit()
+        journal = InstallJournal(fixture.bottle_root / "restore-failure.json")
+        handler = fixture.installer.undo_handler(
+            fixture.installation, fixture._restore_snapshots
+        )
+        transaction = Transaction(journal, {"restore_launcher": handler})
+        transaction.start("restore")
+        undo = fixture.installer.restore_undo_data(fixture.installation, state)
+
+        def fail_after_restore():
+            fixture.installer.restore(fixture.installation, state)
+            raise OSError("injected failure after restore mutation")
+
+        with self.assertRaises(OSError):
+            transaction.step(
+                "restore launcher",
+                UndoRecord("restore_launcher", undo),
+                fail_after_restore,
+            )
+
+        recreate = fixture.runner.calls[-1][0]
+        self.assertIn("--create", recreate)
+        self.assertEqual(
+            str(default_icon.resolve()), recreate[recreate.index("--icon") + 1]
+        )
 
     def test_failed_restore_recreates_installed_snapshot_and_menu(self):
         """Restore rollback must include the previous bundle and inverse menu mutation."""

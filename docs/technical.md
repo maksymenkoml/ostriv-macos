@@ -114,6 +114,19 @@ counts as ready only with the exact `--type=renderer` role. Captured command lin
 diagnostics. Global process matches and canonical-path argv substrings do not contribute readiness
 signals.
 
+Registry reads and writes run `wine … reg` under `LC_ALL=C`. `reg.exe` localizes its
+diagnostics (CrossOver 26.3 under `LANG=uk_UA.UTF-8` prints
+`reg: Не вдалося знайти вказаний ключ реєстру` in CP866), and that text is the only signal that a
+value is absent, so a fully Ukrainian Mac failed Install at its first registry query. A wine
+process reads its locale at start and rewrites `HKCU\Control Panel\International` for itself;
+the next process the player starts restores their own locale, so the forced C locale leaves no
+trace in the bottle. A wine process that meets a wineserver from another CrossOver copy fails
+with the unlocalized `wine client error: version mismatch`; the command runner types that as
+`command.wine_version_mismatch` with one player action (quit every CrossOver copy and Steam).
+The launcher icon comes from CrossOver's own Ostriv helper app (a command ending in
+`Ostriv.lnk`, `Ostriv.url`, or `ostriv.exe`) and otherwise from CrossOver's `exeIcon.icns`,
+which launcher verification already accepts because CrossOver's sync swaps icons to it.
+
 Detailed installer logs stay at `~/Library/Logs/ostriv-macos/install.log`. Launcher logs use a
 filesystem-safe bottle identity under `~/Library/Logs/ostriv-macos/`. They contain command and
 state detail locally; the terminal and dialogs receive only one concise outcome and action. The

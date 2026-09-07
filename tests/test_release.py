@@ -624,6 +624,7 @@ class PlayerDocumentationTests(unittest.TestCase):
             "CrossOver/game not found",
             "Steam timeout",
             "Graphics-context failure",
+            "Several CrossOver copies",
             "Unexpected failure",
         ]
         self.assertEqual(len(cases), len(rows))
